@@ -1,8 +1,21 @@
 # 文档目录
 
-在此放置架构设计、时序图、数据模型和运维方案。建议至少包含：
+本目录保存项目事实、架构决策、设计、运行和验收文档。文档必须与当前实现同步更新。
 
-- 系统架构图：Gateway、Worker、Channel Adapter、Storage Adapter、Plugin / Guardrail、Telemetry
-- 核心时序图：IM 消息 → Runner 执行 → Tool 调用 → Session / Memory 写入 → IM 回复
-- 数据模型与多后端适配说明
-- 风险清单
+## 已建立
+
+- [方案总稿](solution.md)：8 月 27 日提交方案的主体，包含背景、架构、重点技术、预期效果、容量、计划和风险。
+- [参赛项目背景与实现基础信息](project-foundation.md)：题目理解、项目定位、范围、角色、边界、术语、技术基线、实施阶段和完成定义。
+- [总体架构设计](architecture.md)：组件职责、控制面/数据面、Agent 生命周期、路由和部署拓扑。
+- [核心消息时序](sequence.md)：企业微信完整链路、并发、故障恢复和 HTTP 流式差异。
+- [数据模型设计](data-model.md)：Tenant、Agent、Channel、Session、Event、Memory、Summary、Audit 等核心实体。
+- [多后端、数据同步与幂等设计](storage-and-consistency.md)：后端能力、并发、一致性、幂等、迁移和降级。
+- [演示与验收计划](demo-plan.md)：从当前最小链路到最终验收的场景、步骤、预期结果和证据要求。
+- [验收矩阵](acceptance.md)：题目要求到设计、代码、测试和演示证据的映射。
+
+## 待建立
+
+- `security-and-governance.md`：身份、权限、密钥、Guardrail、预算、脱敏和审计。
+- `observability.md`：日志、指标、Trace、成本和告警规范。
+- `operations.md`：故障恢复、灰度、回滚、容量和部署方案。
+- `adr/`：影响多个模块或长期兼容性的架构决策记录。

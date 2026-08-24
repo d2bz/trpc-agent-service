@@ -147,6 +147,29 @@ cd trpc-agent-service
 ./start.sh
 ```
 
+当前最小实现会启动一个真实的 tRPC-Agent-Go `LLMAgent + Runner + InMemory Session` 链路，监听 `127.0.0.1:8080`。启动阶段使用确定性回显模型，不需要配置外部模型 API Key，便于先验证平台服务链路。
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
+
+调用 OpenAI-compatible 非流式接口：
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-ID: demo-session' \
+  -d '{"model":"deterministic-echo","messages":[{"role":"user","content":"hello platform"}]}'
+```
+
+将请求体加入 `"stream":true` 即可验证 SSE 流式响应。自定义监听地址时使用：
+
+```bash
+TRPC_SERVICE_ADDR=127.0.0.1:18080 ./start.sh
+```
+
 停止服务：
 
 ```bash
