@@ -14,13 +14,16 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
+	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
+	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 )
 
 const shutdownTimeout = 10 * time.Second
 
 func main() {
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -33,14 +36,36 @@ func main() {
 }
 
 func run(addr string) error {
-	runtime := platformagent.NewDemoRuntime()
+	repository := tenant.NewMemoryRepository()
+	if err := platformconfig.SeedDemo(context.Background(), repository); err != nil {
+		return err
+	}
+	sessionService := sessioninmemory.NewSessionService()
 	defer func() {
-		if err := runtime.Close(); err != nil {
-			log.Printf("close agent runtime: %v", err)
+		if err := sessionService.Close(); err != nil {
+			log.Printf("close session service: %v", err)
 		}
 	}()
 
-	api, err := web.NewServer(runtime)
+	resolver, err := platformagent.NewRuntimeResolver(
+		repository,
+		func(
+			_ context.Context,
+			revision tenant.AgentRevision,
+		) (*platformagent.Runtime, error) {
+			return platformagent.NewRuntimeFromRevision(revision, sessionService)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := resolver.Close(); closeErr != nil {
+			log.Printf("close runtime resolver: %v", closeErr)
+		}
+	}()
+
+	api, err := web.NewPlatformServer(repository, resolver)
 	if err != nil {
 		return err
 	}
@@ -59,7 +84,7 @@ func run(addr string) error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf(
-			"trpc-agent-service %s listening on %s; endpoint=/v1/chat/completions",
+			"trpc-agent-service %s listening on %s; chat=/v1/chat/completions admin=/admin/v1/tenants",
 			trpcservice.Version,
 			addr,
 		)

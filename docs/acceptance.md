@@ -4,7 +4,7 @@
 
 | ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
 | --- | --- | --- | --- | --- |
-| A01 | 多租户模型与配置 | [数据模型](data-model.md#31-tenant)、[总体架构](architecture.md#4-控制面) | 已实现内存 Repository、不可变 Revision、发布/路由和隔离测试；Admin API/PostgreSQL 待实现 | partial |
+| A01 | 多租户模型与配置 | [数据模型](data-model.md#31-tenant)、[总体架构](architecture.md#4-控制面) | 已实现 Admin API、内存 Repository、不可变 Revision、发布/路由和隔离测试；认证/PostgreSQL 待实现 | partial |
 | A02 | Gateway、Worker、Channel、Storage、Admin、Telemetry 节点协作 | [架构图](architecture.md#2-系统架构图) | 待实现多角色启动和 Compose | planned |
 | A03 | 多节点水平扩展与 Session 路由 | [数据面](architecture.md#5-数据面)、[节点部署](architecture.md#6-节点部署) | 待实现双 Worker 集成测试 | planned |
 | A04 | 无 sticky session 与共享 Session/Memory | [设计结论](architecture.md#1-设计结论)、[并发](storage-and-consistency.md#4-同一-session-并发) | 待实现跨 Worker 连续会话测试 | planned |
@@ -29,7 +29,7 @@
 | A23 | 密钥管理和脱敏 | [控制面配置](architecture.md#42-配置传播)、[治理](solution.md#56-治理与安全) | 待实现 Secret Resolver 和泄漏测试 | planned |
 | A24 | 节点/IM/数据库/模型/Tool 故障恢复 | [故障恢复](solution.md#58-故障恢复)、[故障降级](storage-and-consistency.md#8-故障与降级) | 待实现故障注入测试 | planned |
 | A25 | Context、goroutine、Event Channel 排空 | [并发与故障边界](architecture.md#7-并发与故障边界) | 待实现 goleak/取消/排空测试 | planned |
-| A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现默认版本切换、Session 固定版本解析和旧版本回滚；权重灰度待实现 | partial |
+| A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、固定版本解析和旧版本回滚；权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
 | D01 | 2000-4000 字架构方案 | [方案总稿](solution.md) | 提交前统计和编辑 | partial |
@@ -51,6 +51,7 @@
 | I03 | 可构建和启动 | `build.sh`、`start.sh`、`stop.sh`：构建、就绪检查、PID 生命周期 | `./build.sh` 后通过 `/healthz` 和 `/v1/chat/completions` 手工验证 | partial |
 | I04 | 多租户配置与发布 | `trpcservice/tenant/tenant.go`、`repository.go`：Tenant、App、Revision、摘要、发布、固定版本和回滚 | `go test ./trpcservice/tenant`：深拷贝不可变、租户隔离、版本路由、错误路径 | partial |
 | I05 | Runtime 解析与缓存 | `trpcservice/agent/resolver.go`：三元组缓存、singleflight、身份复核、生命周期租约 | `go test -race ./trpcservice/agent`：并发单次构建、取消隔离、关闭等待、跨租户缓存隔离 | partial |
+| I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、显式租户路由、动态协议适配和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/固定版本/回滚、跨租户、SSE、CORS | partial |
 
 ## 验收使用方式
 

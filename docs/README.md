@@ -11,6 +11,7 @@
 - [数据模型设计](data-model.md)：Tenant、Agent、Channel、Session、Event、Memory、Summary、Audit 等核心实体。
 - [多后端、数据同步与幂等设计](storage-and-consistency.md)：后端能力、并发、一致性、幂等、迁移和降级。
 - [演示与验收计划](demo-plan.md)：从当前最小链路到最终验收的场景、步骤、预期结果和证据要求。
+- [Admin API 与动态路由](admin-api.md)：Tenant/App/Revision 管理接口、发布回滚和多租户对话调用方式。
 - [验收矩阵](acceptance.md)：题目要求到设计、代码、测试和演示证据的映射。
 
 ## 待建立

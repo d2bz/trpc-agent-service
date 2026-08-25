@@ -2,7 +2,6 @@
 package web
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -33,15 +32,7 @@ func NewServer(runtime *platformagent.Runtime) (*Server, error) {
 		return nil, fmt.Errorf("web: create OpenAI-compatible server: %w", err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
+	mux.HandleFunc("/healthz", handleHealth)
 	mux.Handle("/v1/", openAI.Handler())
 	return &Server{handler: mux, openAI: openAI}, nil
 }

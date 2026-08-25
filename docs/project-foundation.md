@@ -199,3 +199,11 @@ Agent 基础运行时、内置编排、通用 Session/Memory 接口、模型适�
 - Phase 1 已有可运行的 HTTP → OpenAI-compatible Server → LLMAgent → Runner → InMemory Session 最小链路；持久化后端和取消端到端证据仍待补充。
 - Phase 2 已实现 Tenant、Agent App、不可变 Revision 的内存参考仓库，以及发布、默认路由、固定版本和回滚语义。
 - Runtime Resolver 已实现 `(tenant, app, revision)` 缓存、并发单次构建、租户身份二次校验和关闭租约；TTL/LRU 淘汰和配置变更通知仍待实现。
+
+## 15. 2026-08-25 实现进度
+
+- Admin REST API 已支持创建和读取 Tenant、Agent App、Agent Revision，以及发布新 Revision 和把旧 Revision 重新切为默认版本。
+- `/v1/chat/completions` 已要求显式 Tenant/App 路由，可按默认或指定的已发布 Revision 获取 Runtime，并继续复用上游 OpenAI-compatible 非流式和 SSE 协议。
+- 主进程已改为 `Repository → Runtime Resolver → LLMAgent/Runner` 的真实平台装配，所有 Revision 共用 App 级 Session Service；启动时只种入一个无外部依赖的 demo 配置。
+- HTTP 集成测试已覆盖多租户同名资源隔离、发布、固定版本、回滚、跨版本 Session、动态 SSE、错误响应和 CORS。
+- 当前控制面仍使用 InMemory Repository，Admin API 仍缺少身份认证；在 PostgreSQL 和授权模型完成前不作为生产接口。

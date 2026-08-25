@@ -147,7 +147,7 @@ cd trpc-agent-service
 ./start.sh
 ```
 
-当前最小实现会启动一个真实的 tRPC-Agent-Go `LLMAgent + Runner + InMemory Session` 链路，监听 `127.0.0.1:8080`。启动阶段使用确定性回显模型，不需要配置外部模型 API Key，便于先验证平台服务链路。
+当前实现会启动内存控制面，预置 `demo` Tenant、`echo` Agent App 和已发布的 `echo-v1` Revision，再通过 Runtime Resolver 懒加载真实的 tRPC-Agent-Go `LLMAgent + Runner + InMemory Session`。服务监听 `127.0.0.1:8080`，确定性回显模型不需要外部 API Key。
 
 健康检查：
 
@@ -160,11 +160,15 @@ curl http://127.0.0.1:8080/healthz
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: demo' \
+  -H 'X-Agent-App-ID: echo' \
   -H 'X-Session-ID: demo-session' \
   -d '{"model":"deterministic-echo","messages":[{"role":"user","content":"hello platform"}]}'
 ```
 
-将请求体加入 `"stream":true` 即可验证 SSE 流式响应。自定义监听地址时使用：
+将请求体加入 `"stream":true` 即可验证 SSE 流式响应。创建其他 Tenant、Agent App 和 Revision 的接口及完整调用流程见 [Admin API 与动态路由](docs/admin-api.md)。当前 Admin API 未接入认证，只适用于绑定本机地址的开发演示。
+
+自定义监听地址时使用：
 
 ```bash
 TRPC_SERVICE_ADDR=127.0.0.1:18080 ./start.sh
