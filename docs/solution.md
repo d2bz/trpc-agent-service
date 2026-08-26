@@ -1,9 +1,10 @@
 # 多租户节点化 Agent 平台方案
 
-> 方案版本：0.1
+> 方案版本：1.0-rc1
 > 启动日期：2026-08-21
 > 方案提交：2026-08-27
 > 项目验收：2026-09-11
+> 验收分支：`feature/d2bz`
 
 ## 1. 背景与目标
 
@@ -114,10 +115,10 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 | --- | --- |
 | 8/21 | 冻结项目背景、总体架构、核心时序、数据模型、存储与一致性方案 |
 | 8/22-8/23 | 完成治理、可观测性、运维、风险、验收矩阵；验证最小 Runner 链路 |
-| 8/24-8/25 | 完成方案总稿、架构图、容量与演示计划；启动 Tenant/Revision 数据结构 |
-| 8/26 | 方案评审、交叉检查、修订和提交前冻结 |
-| 8/27 | 提交方案文档；最小 HTTP → Runner → Session 链路可运行 |
-| 8/28-8/31 | Admin API、Tenant/Agent/Revision、Gateway、Runtime 缓存与共享 Session |
+| 8/24-8/25 | 完成方案总稿、架构图、容量与演示计划；完成 Tenant/Revision、Admin API、动态路由和 Runtime 缓存的内存参考实现 |
+| 8/26 | 方案评审、图表渲染、交叉检查、提交演练并冻结 `1.0-rc1` |
+| 8/27 | 提交方案文档；演示多租户 Admin → Runtime → Runner → Session 链路 |
+| 8/28-8/31 | PostgreSQL 控制面、Gateway、共享 Redis/PostgreSQL Session、Runtime 淘汰和双 Worker 验证 |
 | 9/1-9/4 | 多 Worker、并发协调、Redis/PostgreSQL、PGVector、Artifact、迁移和幂等 |
 | 9/5-9/7 | 企业微信、Telegram、媒体/限流/重试和端到端测试 |
 | 9/8-9/9 | Guardrail、权限、预算、审计、OpenTelemetry、故障恢复和 K8s |

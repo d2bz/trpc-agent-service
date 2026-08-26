@@ -12,6 +12,7 @@
 - [多后端、数据同步与幂等设计](storage-and-consistency.md)：后端能力、并发、一致性、幂等、迁移和降级。
 - [演示与验收计划](demo-plan.md)：从当前最小链路到最终验收的场景、步骤、预期结果和证据要求。
 - [Admin API 与动态路由](admin-api.md)：Tenant/App/Revision 管理接口、发布回滚和多租户对话调用方式。
+- [提交检查清单](submission-checklist.md)：8 月 27 日材料提交、验收分支、验证命令和提交证据。
 - [验收矩阵](acceptance.md)：题目要求到设计、代码、测试和演示证据的映射。
 
 ## 待建立

@@ -73,7 +73,7 @@ erDiagram
 | `agent_revisions.status` | `draft/validated/published/retired` |
 | `agent_revisions.created_by/created_at` | 审计信息 |
 
-Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 固定记录 `revision_id`，同一个 Session 的后续 Run 可以在发布或回滚后使用新 Revision。
+Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 固定记录 `revision_id`。同一个 Session 默认沿用 `pinned_revision_id`；只有创建新 Session epoch、显式解除 Pin 或紧急安全回滚使 Pin 失效后，后续 Run 才重新选择 Revision。
 
 ### 3.3 Channel Binding 与身份映射
 

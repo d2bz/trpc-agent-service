@@ -32,10 +32,10 @@
 | A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、固定版本解析和旧版本回滚；权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
-| D01 | 2000-4000 字架构方案 | [方案总稿](solution.md) | 提交前统计和编辑 | partial |
-| D02 | 系统架构图 | [架构图](architecture.md#2-系统架构图) | 待渲染检查 | partial |
-| D03 | 核心时序图 | [时序图](sequence.md#1-企业微信完整链路) | 待渲染检查 | partial |
-| D04 | 数据模型 | [数据模型](data-model.md) | 待实现迁移文件 | partial |
+| D01 | 2000-4000 字架构方案 | [方案总稿](solution.md) | 1.0-rc1 中文正文 2403 字，待 8/27 正式提交 | partial |
+| D02 | 系统架构图 | [架构图](architecture.md#2-系统架构图) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
+| D03 | 核心时序图 | [时序图](sequence.md#1-企业微信完整链路) | 两张 Mermaid 时序图由 CLI 11.12.0 渲染与视觉检查通过 | partial |
+| D04 | 数据模型 | [数据模型](data-model.md) | ER 图由 Mermaid CLI 11.12.0 渲染通过；迁移文件待实现 | partial |
 | D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | 待实现集成测试 | partial |
 | D06 | 多后端适配方案 | [后端路由与取舍](storage-and-consistency.md#1-统一后端路由) | 待实现参考 Adapter | partial |
 | D07 | 至少 8 个风险与缓解 | [风险清单](solution.md#9-主要风险) | 12 项已记录，待最终复核 | partial |
