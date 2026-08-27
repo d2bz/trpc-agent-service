@@ -30,7 +30,7 @@
 git status --short --branch
 git diff --check
 go test ./...
-go test -race ./trpcservice/config ./trpcservice/tenant ./trpcservice/agent ./trpcservice/web
+go test -race ./trpcservice/config ./trpcservice/tenant ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
 go vet ./...
 ./build.sh
 ./start.sh

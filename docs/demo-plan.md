@@ -29,8 +29,8 @@
 自动化证据：
 
 ```bash
-go test ./trpcservice/agent ./trpcservice/web
-go test -race ./trpcservice/agent ./trpcservice/web
+go test ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
+go test -race ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
 ```
 
 ### D02 Tenant、Revision 与 Runtime 路由

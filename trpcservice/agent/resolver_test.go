@@ -11,6 +11,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
+	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 )
 
 func TestRuntimeResolverUsesDefaultAndPinnedRevisionCaches(t *testing.T) {
@@ -21,7 +22,7 @@ func TestRuntimeResolverUsesDefaultAndPinnedRevisionCaches(t *testing.T) {
 		revision tenant.AgentRevision,
 	) (*Runtime, error) {
 		buildCount.Add(1)
-		return runtimeIdentity(revision), nil
+		return buildTestRuntime(revision), nil
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
@@ -36,6 +37,14 @@ func TestRuntimeResolverUsesDefaultAndPinnedRevisionCaches(t *testing.T) {
 	defer defaultAgain.Release()
 	require.Same(t, defaultRuntime.Runtime, defaultAgain.Runtime)
 
+	// Every caller of one cached revision shares the single Runtime-owned
+	// adapter, so no caller needs an adapter cache of its own.
+	firstHandler, err := defaultRuntime.Runtime.OpenAIHandler()
+	require.NoError(t, err)
+	repeatedHandler, err := defaultAgain.Runtime.OpenAIHandler()
+	require.NoError(t, err)
+	require.Same(t, firstHandler, repeatedHandler)
+
 	pinnedRuntime, err := resolver.Resolve(
 		context.Background(), scope, "assistant", "revision-1",
 	)
@@ -43,6 +52,9 @@ func TestRuntimeResolverUsesDefaultAndPinnedRevisionCaches(t *testing.T) {
 	defer pinnedRuntime.Release()
 	require.Equal(t, "revision-1", pinnedRuntime.Revision.ID)
 	require.NotSame(t, defaultRuntime.Runtime, pinnedRuntime.Runtime)
+	pinnedHandler, err := pinnedRuntime.Runtime.OpenAIHandler()
+	require.NoError(t, err)
+	require.NotSame(t, firstHandler, pinnedHandler)
 	require.Equal(t, int32(2), buildCount.Load())
 	require.Equal(t, 2, resolver.CacheSize())
 }
@@ -60,7 +72,7 @@ func TestRuntimeResolverSingleflightBuild(t *testing.T) {
 		buildCount.Add(1)
 		startedOnce.Do(func() { close(buildStarted) })
 		<-releaseBuild
-		return runtimeIdentity(revision), nil
+		return buildTestRuntime(revision), nil
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
@@ -112,7 +124,7 @@ func TestRuntimeResolverDoesNotShareAcrossTenants(t *testing.T) {
 		_ context.Context,
 		revision tenant.AgentRevision,
 	) (*Runtime, error) {
-		return runtimeIdentity(revision), nil
+		return buildTestRuntime(revision), nil
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
@@ -139,7 +151,7 @@ func TestRuntimeResolverDoesNotCacheBuildFailure(t *testing.T) {
 		if buildCount.Add(1) == 1 {
 			return nil, errors.New("temporary build failure")
 		}
-		return runtimeIdentity(revision), nil
+		return buildTestRuntime(revision), nil
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
@@ -153,13 +165,83 @@ func TestRuntimeResolverDoesNotCacheBuildFailure(t *testing.T) {
 	require.Equal(t, int32(2), buildCount.Load())
 }
 
+func TestRuntimeResolverRejectsIncompleteRuntime(t *testing.T) {
+	repository, scope := resolverRepository(t, "tenant-a", "assistant", 1)
+	resolver, err := NewRuntimeResolver(repository, func(
+		_ context.Context,
+		revision tenant.AgentRevision,
+	) (*Runtime, error) {
+		return &Runtime{
+			TenantID:   revision.TenantID,
+			AgentAppID: revision.AgentAppID,
+			RevisionID: revision.ID,
+		}, nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
+
+	_, err = resolver.Resolve(context.Background(), scope, "assistant", "")
+	require.ErrorContains(t, err, "runtime execution unit is incomplete")
+	require.Zero(t, resolver.CacheSize())
+}
+
+func TestRuntimeResolverClosesIdentityMismatchedRuntime(t *testing.T) {
+	repository, scope := resolverRepository(t, "tenant-a", "assistant", 1)
+	recorder := &closeRecorder{}
+	resolver, err := NewRuntimeResolver(repository, func(
+		_ context.Context,
+		revision tenant.AgentRevision,
+	) (*Runtime, error) {
+		mismatched := recordingRuntime(recorder, nil, nil, nil)
+		mismatched.TenantID = "tenant-b"
+		mismatched.AgentAppID = revision.AgentAppID
+		mismatched.RevisionID = revision.ID
+		return mismatched, nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
+
+	_, err = resolver.Resolve(context.Background(), scope, "assistant", "")
+	require.ErrorContains(t, err, "does not match revision")
+	require.Zero(t, resolver.CacheSize())
+	require.Equal(t, []string{"adapter", "runner", "session"}, recorder.order())
+}
+
+func TestRuntimeResolverCloseReleasesCachedRuntimeResources(t *testing.T) {
+	repository, scope := resolverRepository(t, "tenant-a", "assistant", 1)
+	recorder := &closeRecorder{}
+	resolver, err := NewRuntimeResolver(repository, func(
+		_ context.Context,
+		revision tenant.AgentRevision,
+	) (*Runtime, error) {
+		runtime := recordingRuntime(recorder, nil, nil, nil)
+		runtime.TenantID = revision.TenantID
+		runtime.AgentAppID = revision.AgentAppID
+		runtime.RevisionID = revision.ID
+		return runtime, nil
+	})
+	require.NoError(t, err)
+
+	resolved, err := resolver.Resolve(context.Background(), scope, "assistant", "")
+	require.NoError(t, err)
+	require.Empty(t, recorder.order())
+	resolved.Release()
+
+	require.NoError(t, resolver.Close())
+	require.Equal(t, []string{"adapter", "runner", "session"}, recorder.order())
+	require.Zero(t, resolver.CacheSize())
+
+	require.NoError(t, resolver.Close())
+	require.Equal(t, []string{"adapter", "runner", "session"}, recorder.order())
+}
+
 func TestRuntimeResolverClose(t *testing.T) {
 	repository, scope := resolverRepository(t, "tenant-a", "assistant", 1)
 	resolver, err := NewRuntimeResolver(repository, func(
 		_ context.Context,
 		revision tenant.AgentRevision,
 	) (*Runtime, error) {
-		return runtimeIdentity(revision), nil
+		return buildTestRuntime(revision), nil
 	})
 	require.NoError(t, err)
 	resolved, err := resolver.Resolve(context.Background(), scope, "assistant", "")
@@ -186,7 +268,7 @@ func TestRuntimeResolverRequestCancellationDoesNotCancelSharedBuild(t *testing.T
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-releaseBuild:
-			return runtimeIdentity(revision), nil
+			return buildTestRuntime(revision), nil
 		}
 	})
 	require.NoError(t, err)
@@ -233,7 +315,7 @@ func TestRuntimeResolverCloseWaitsForLease(t *testing.T) {
 		_ context.Context,
 		revision tenant.AgentRevision,
 	) (*Runtime, error) {
-		return runtimeIdentity(revision), nil
+		return buildTestRuntime(revision), nil
 	})
 	require.NoError(t, err)
 	resolved, err := resolver.Resolve(context.Background(), scope, "assistant", "")
@@ -334,12 +416,16 @@ func seedResolverTenant(
 	return scope
 }
 
-func runtimeIdentity(revision tenant.AgentRevision) *Runtime {
-	return &Runtime{
-		TenantID:   revision.TenantID,
-		AgentAppID: revision.AgentAppID,
-		RevisionID: revision.ID,
+// buildTestRuntime builds a complete Runtime that owns its Session service, so
+// the resolver is the only owner of every resource it caches.
+func buildTestRuntime(revision tenant.AgentRevision) *Runtime {
+	sessionService := sessioninmemory.NewSessionService()
+	runtime, err := newRuntimeFromRevision(revision, sessionService, true)
+	if err != nil {
+		_ = sessionService.Close()
+		panic(err)
 	}
+	return runtime
 }
 
 type revisionSourceFunc func(

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -160,9 +163,100 @@ func TestPlatformDynamicStreaming(t *testing.T) {
 	require.Contains(t, response.Body.String(), "data: [DONE]")
 }
 
+// The runtime lease must cover the whole SSE handler, otherwise the resolver
+// could close the Runner and its adapter while chunks are still being written.
+func TestPlatformStreamingHoldsRuntimeLeaseUntilHandlerReturns(t *testing.T) {
+	server, _, resolver, _ := newPlatformTestServer(t)
+	handler := server.Handler()
+	seedTenantAppRevision(t, handler, "tenant-a", "assistant", "revision-1", 1, "echo-v1")
+
+	writer := newBlockingResponseWriter()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"echo-v1","stream":true,"messages":[{"role":"user","content":"stream"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(HeaderTenantID, "tenant-a")
+	request.Header.Set(HeaderAgentAppID, "assistant")
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		handler.ServeHTTP(writer, request)
+	}()
+	// Every failure below must still unblock the handler: while it is parked in
+	// Write it holds a lease, and the resolver.Close from the server cleanup
+	// would wait for that lease forever instead of reporting the failure.
+	t.Cleanup(func() {
+		writer.release()
+		<-served
+	})
+
+	select {
+	case <-writer.started:
+	case <-served:
+		t.Fatalf("handler returned without streaming: %s", writer.bodyString())
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- resolver.Close() }()
+	scope := tenant.TenantContext{TenantID: "tenant-a"}
+	require.Eventually(t, func() bool {
+		// Close marks the resolver asynchronously, so a probe can still win the
+		// race and take a real lease. Returning it keeps closeAll from waiting on
+		// a lease this test would otherwise never release.
+		resolved, resolveErr := resolver.Resolve(context.Background(), scope, "assistant", "")
+		if resolveErr == nil {
+			resolved.Release()
+			return false
+		}
+		return errors.Is(resolveErr, platformagent.ErrResolverClosed)
+	}, time.Second, time.Millisecond)
+	select {
+	case <-closeResult:
+		t.Fatal("resolver closed while a streaming handler still held the lease")
+	default:
+	}
+
+	writer.release()
+	<-served
+	require.NoError(t, <-closeResult)
+	require.Equal(t, "text/event-stream", writer.Header().Get("Content-Type"))
+	require.Contains(t, writer.bodyString(), "data: [DONE]")
+
+	// The platform keeps no runtime state of its own, so traffic stops as soon
+	// as the resolver is closed.
+	unavailable := requireStatus(t, handler, http.MethodPost, "/v1/chat/completions", `{
+		"model":"echo-v1","messages":[{"role":"user","content":"after close"}]
+	}`, map[string]string{
+		HeaderTenantID: "tenant-a", HeaderAgentAppID: "assistant",
+	}, http.StatusServiceUnavailable)
+	require.Contains(t, unavailable.Body.String(), `"code":"runtime_unavailable"`)
+}
+
+func TestPlatformRejectsRuntimeWithoutOpenAIHandler(t *testing.T) {
+	repository := tenant.NewMemoryRepository()
+	server, err := NewPlatformServer(repository, resolverFunc(func(
+		context.Context,
+		tenant.TenantContext,
+		string,
+		string,
+	) (platformagent.ResolvedRuntime, error) {
+		return platformagent.ResolvedRuntime{Runtime: &platformagent.Runtime{}}, nil
+	}))
+	require.NoError(t, err)
+
+	response := requireStatus(t, server.Handler(), http.MethodPost, "/v1/chat/completions", `{
+		"model":"echo-v1","messages":[{"role":"user","content":"broken"}]
+	}`, map[string]string{
+		HeaderTenantID: "tenant-a", HeaderAgentAppID: "assistant",
+	}, http.StatusInternalServerError)
+	require.Contains(t, response.Body.String(), `"code":"internal_error"`)
+}
+
 func TestPlatformHTTPMethodAndCORS(t *testing.T) {
 	server, _, _, _ := newPlatformTestServer(t)
 	handler := server.Handler()
+	health := requireStatus(t, handler, http.MethodGet, "/healthz", "", nil, http.StatusOK)
+	require.JSONEq(t, `{"status":"ok"}`, health.Body.String())
 
 	wrongMethod := requireStatus(
 		t, handler, http.MethodGet, "/admin/v1/tenants", "", nil,
@@ -198,8 +292,96 @@ func newPlatformTestServer(
 	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
 	server, err := NewPlatformServer(repository, resolver)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, server.Close()) })
 	return server, repository, resolver, sessionService
+}
+
+func seedTenantAppRevision(
+	t *testing.T,
+	handler http.Handler,
+	tenantID string,
+	appID string,
+	revisionID string,
+	revisionNo uint64,
+	modelName string,
+) {
+	t.Helper()
+	requireStatus(t, handler, http.MethodPost, "/admin/v1/tenants", fmt.Sprintf(`{
+		"id":%q,"slug":%q,"name":%q
+	}`, tenantID, tenantID, "Tenant "+tenantID), nil, http.StatusCreated)
+	requireStatus(
+		t, handler, http.MethodPost, "/admin/v1/tenants/"+tenantID+"/apps",
+		fmt.Sprintf(`{"id":%q,"name":"Assistant"}`, appID), nil, http.StatusCreated,
+	)
+	createRevisionThroughAPI(t, handler, tenantID, appID, revisionID, revisionNo, modelName)
+	publishRevisionThroughAPI(t, handler, tenantID, appID, revisionID)
+}
+
+type resolverFunc func(
+	context.Context,
+	tenant.TenantContext,
+	string,
+	string,
+) (platformagent.ResolvedRuntime, error)
+
+func (f resolverFunc) Resolve(
+	ctx context.Context,
+	scope tenant.TenantContext,
+	appID string,
+	pinnedRevisionID string,
+) (platformagent.ResolvedRuntime, error) {
+	return f(ctx, scope, appID, pinnedRevisionID)
+}
+
+// blockingResponseWriter holds the handler inside its first write so the test
+// can observe the lease while the SSE response is still in flight.
+type blockingResponseWriter struct {
+	header      http.Header
+	started     chan struct{}
+	released    chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+
+	mu     sync.Mutex
+	body   bytes.Buffer
+	status int
+}
+
+func newBlockingResponseWriter() *blockingResponseWriter {
+	return &blockingResponseWriter{
+		header:   make(http.Header),
+		started:  make(chan struct{}),
+		released: make(chan struct{}),
+	}
+}
+
+func (w *blockingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *blockingResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.status = status
+}
+
+func (w *blockingResponseWriter) Write(chunk []byte) (int, error) {
+	w.startedOnce.Do(func() { close(w.started) })
+	<-w.released
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(chunk)
+}
+
+func (w *blockingResponseWriter) Flush() {}
+
+func (w *blockingResponseWriter) release() {
+	w.releaseOnce.Do(func() { close(w.released) })
+}
+
+func (w *blockingResponseWriter) bodyString() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.String()
 }
 
 func createRevisionThroughAPI(

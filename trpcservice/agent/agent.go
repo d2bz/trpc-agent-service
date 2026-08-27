@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -12,6 +13,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
+	openaiserver "trpc.group/trpc-go/trpc-agent-go/server/openai"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 )
@@ -22,8 +24,13 @@ const (
 	DemoModelName = "deterministic-echo"
 )
 
-// Runtime owns the process-local Agent and Runner objects for one immutable
-// agent revision. Conversation state remains in SessionService.
+type runtimeHTTPAdapter interface {
+	Handler() http.Handler
+	Close() error
+}
+
+// Runtime owns the process-local Agent, Runner and protocol adapter objects for
+// one immutable agent revision. Conversation state remains in SessionService.
 type Runtime struct {
 	TenantID       string
 	AgentAppID     string
@@ -34,7 +41,10 @@ type Runtime struct {
 	Runner         runner.Runner
 	SessionService session.Service
 
+	openAI             runtimeHTTPAdapter
+	openAIHandler      http.Handler
 	closeOnce          sync.Once
+	closeErr           error
 	ownsSessionService bool
 }
 
@@ -117,7 +127,7 @@ func newRuntimeFromRevision(
 		ag,
 		runner.WithSessionService(sessionService),
 	)
-	return &Runtime{
+	runtime := &Runtime{
 		TenantID:           revision.TenantID,
 		AgentAppID:         revision.AgentAppID,
 		RevisionID:         revision.ID,
@@ -127,24 +137,95 @@ func newRuntimeFromRevision(
 		Runner:             r,
 		SessionService:     sessionService,
 		ownsSessionService: ownsSessionService,
-	}, nil
+	}
+	openAI, err := openaiserver.New(
+		openaiserver.WithRunner(runtime.Runner),
+		openaiserver.WithSessionService(runtime.SessionService),
+		openaiserver.WithAppName(runtime.AppName),
+		openaiserver.WithModelName(runtime.ModelName),
+		openaiserver.WithBasePath("/v1"),
+	)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("agent: create OpenAI adapter for revision %q: %w", revision.ID, err),
+			runtime.Close(),
+		)
+	}
+	runtime.openAI = openAI
+	runtime.openAIHandler = openAI.Handler()
+	if runtime.openAIHandler == nil {
+		return nil, errors.Join(
+			fmt.Errorf("agent: OpenAI adapter for revision %q has no handler", revision.ID),
+			runtime.Close(),
+		)
+	}
+	return runtime, nil
 }
 
-// Close releases the Runner and any Session service owned by this Runtime.
+// OpenAIHandler returns the single protocol handler owned by this Runtime. It
+// is resolved once at build time, so callers must not cache adapters per
+// Runtime pointer.
+func (r *Runtime) OpenAIHandler() (http.Handler, error) {
+	if err := r.validate(); err != nil {
+		return nil, err
+	}
+	return r.openAIHandler, nil
+}
+
+func (r *Runtime) validate() error {
+	if r == nil {
+		return fmt.Errorf("agent: runtime is nil")
+	}
+	if r.TenantID == "" || r.AgentAppID == "" || r.RevisionID == "" {
+		return fmt.Errorf("agent: runtime identity is incomplete")
+	}
+	if r.AppName == "" || r.ModelName == "" || r.Agent == nil || r.Runner == nil ||
+		r.SessionService == nil || r.openAI == nil || r.openAIHandler == nil {
+		return fmt.Errorf("agent: runtime execution unit is incomplete")
+	}
+	return nil
+}
+
+func (r *Runtime) validateFor(revision tenant.AgentRevision) error {
+	if err := r.validate(); err != nil {
+		return err
+	}
+	if r.TenantID != revision.TenantID || r.AgentAppID != revision.AgentAppID ||
+		r.RevisionID != revision.ID {
+		return fmt.Errorf(
+			"agent: runtime identity %q/%q/%q does not match revision %q/%q/%q",
+			r.TenantID,
+			r.AgentAppID,
+			r.RevisionID,
+			revision.TenantID,
+			revision.AgentAppID,
+			revision.ID,
+		)
+	}
+	return nil
+}
+
+// Close releases the protocol adapter, the Runner, and any Session service
+// owned by this Runtime, in that order. It is safe for concurrent use and
+// idempotent: every call returns the error produced by the first close.
 func (r *Runtime) Close() error {
 	if r == nil {
 		return nil
 	}
-	var closeErr error
 	r.closeOnce.Do(func() {
+		var closeErr error
+		if r.openAI != nil {
+			closeErr = errors.Join(closeErr, r.openAI.Close())
+		}
 		if r.Runner != nil {
 			closeErr = errors.Join(closeErr, r.Runner.Close())
 		}
 		if r.ownsSessionService && r.SessionService != nil {
 			closeErr = errors.Join(closeErr, r.SessionService.Close())
 		}
+		r.closeErr = closeErr
 	})
-	return closeErr
+	return r.closeErr
 }
 
 type deterministicModel struct {

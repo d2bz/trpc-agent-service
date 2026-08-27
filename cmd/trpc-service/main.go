@@ -69,11 +69,6 @@ func run(addr string) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := api.Close(); err != nil {
-			log.Printf("close HTTP adapter: %v", err)
-		}
-	}()
 
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -98,15 +93,41 @@ func run(addr string) error {
 	)
 	defer stop()
 
+	return waitForStop(signalCtx, errCh, httpServer, shutdownTimeout)
+}
+
+type httpServerLifecycle interface {
+	Shutdown(context.Context) error
+	Close() error
+}
+
+// waitForStop blocks until the process is signalled or the server stops serving.
+// Both paths must leave no connection open: an active SSE response still holds a
+// runtime lease, and RuntimeResolver.Close waits for every lease to be released.
+func waitForStop(
+	signalCtx context.Context,
+	serveErrCh <-chan error,
+	server httpServerLifecycle,
+	timeout time.Duration,
+) error {
 	select {
 	case <-signalCtx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		return httpServer.Shutdown(shutdownCtx)
-	case err := <-errCh:
+		return shutdownHTTPServer(shutdownCtx, server)
+	case err := <-serveErrCh:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
-		return err
+		return errors.Join(err, server.Close())
 	}
+}
+
+// shutdownHTTPServer drains in-flight requests and forces the remaining
+// connections closed when the graceful deadline expires or Shutdown fails.
+func shutdownHTTPServer(ctx context.Context, server httpServerLifecycle) error {
+	if err := server.Shutdown(ctx); err != nil {
+		return errors.Join(err, server.Close())
+	}
+	return nil
 }

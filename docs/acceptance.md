@@ -46,12 +46,12 @@
 
 | ID | 能力 | 代码证据 | 自动化证据 | 状态 |
 | --- | --- | --- | --- | --- |
-| I01 | 最小 Agent Runtime | `trpcservice/agent/agent.go`：真实 `LLMAgent`、`Runner`、InMemory Session、确定性模型 | `go test ./trpcservice/agent`：多轮 Session 与幂等关闭 | partial |
-| I02 | OpenAI-compatible HTTP 服务 | `trpcservice/web/web.go`、`cmd/trpc-service/main.go`：健康检查、非流式/SSE、优雅退出 | `go test ./trpcservice/web`：健康、普通对话、SSE `[DONE]` | partial |
+| I01 | 最小 Agent Runtime | `trpcservice/agent/agent.go`：真实 `LLMAgent`、`Runner`、InMemory Session、确定性模型，并由 Runtime 自有唯一 OpenAI Adapter | `go test -race ./trpcservice/agent`：多轮 Session、Adapter→Runner→自有 Session 关闭顺序、并发幂等关闭与错误保留、共享 Session 不被关闭 | partial |
+| I02 | OpenAI-compatible HTTP 服务 | `trpcservice/agent/agent.go`、`trpcservice/web/platform.go`、`cmd/trpc-service/main.go`：健康检查、非流式/SSE、优雅退出与超时后强制 `Close` | `go test ./trpcservice/web ./cmd/trpc-service`：健康、普通对话、SSE `[DONE]`、SSE 期间租约保持、Shutdown 失败后强制关闭 | partial |
 | I03 | 可构建和启动 | `build.sh`、`start.sh`、`stop.sh`：构建、就绪检查、PID 生命周期 | `./build.sh` 后通过 `/healthz` 和 `/v1/chat/completions` 手工验证 | partial |
 | I04 | 多租户配置与发布 | `trpcservice/tenant/tenant.go`、`repository.go`：Tenant、App、Revision、摘要、发布、固定版本和回滚 | `go test ./trpcservice/tenant`：深拷贝不可变、租户隔离、版本路由、错误路径 | partial |
-| I05 | Runtime 解析与缓存 | `trpcservice/agent/resolver.go`：三元组缓存、singleflight、身份复核、生命周期租约 | `go test -race ./trpcservice/agent`：并发单次构建、取消隔离、关闭等待、跨租户缓存隔离 | partial |
-| I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、显式租户路由、动态协议适配和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/固定版本/回滚、跨租户、SSE、CORS | partial |
+| I05 | Runtime 解析与缓存 | `trpcservice/agent/resolver.go`：三元组缓存、singleflight、入缓存前的完整性与身份复核、生命周期租约，Resolver 是 Runtime 及其 Adapter 的唯一所有者 | `go test -race ./trpcservice/agent`：并发单次构建、取消隔离、关闭等待、跨租户缓存隔离、半成品/身份不符 Runtime 被关闭且不入缓存、关闭时释放缓存内资源 | partial |
+| I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、显式租户路由、请求期内路由到 Runtime 自有协议适配器和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/固定版本/回滚、跨租户、SSE、CORS、SSE 全程持有租约、Resolver 关闭后返回 `runtime_unavailable` | partial |
 
 ## 验收使用方式
 

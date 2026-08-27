@@ -2,14 +2,11 @@ package web
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
-	openaiserver "trpc.group/trpc-go/trpc-agent-go/server/openai"
 )
 
 const (
@@ -32,12 +29,6 @@ type PlatformServer struct {
 	repository tenant.Repository
 	resolver   runtimeResolver
 	handler    http.Handler
-
-	adaptersMu sync.Mutex
-	adapters   map[*platformagent.Runtime]*openaiserver.Server
-	closed     bool
-	closeOnce  sync.Once
-	closeErr   error
 }
 
 func NewPlatformServer(
@@ -53,7 +44,6 @@ func NewPlatformServer(
 	server := &PlatformServer{
 		repository: repository,
 		resolver:   resolver,
-		adapters:   make(map[*platformagent.Runtime]*openaiserver.Server),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
@@ -66,26 +56,6 @@ func NewPlatformServer(
 
 func (s *PlatformServer) Handler() http.Handler {
 	return s.handler
-}
-
-func (s *PlatformServer) Close() error {
-	if s == nil {
-		return nil
-	}
-	s.closeOnce.Do(func() {
-		s.adaptersMu.Lock()
-		s.closed = true
-		adapters := make([]*openaiserver.Server, 0, len(s.adapters))
-		for runtime, adapter := range s.adapters {
-			adapters = append(adapters, adapter)
-			delete(s.adapters, runtime)
-		}
-		s.adaptersMu.Unlock()
-		for _, adapter := range adapters {
-			s.closeErr = errors.Join(s.closeErr, adapter.Close())
-		}
-	})
-	return s.closeErr
 }
 
 func (s *PlatformServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -127,37 +97,10 @@ func (s *PlatformServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 	defer resolved.Release()
 
-	adapter, err := s.adapterFor(resolved.Runtime)
+	handler, err := resolved.Runtime.OpenAIHandler()
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
-	adapter.Handler().ServeHTTP(w, r)
-}
-
-func (s *PlatformServer) adapterFor(runtime *platformagent.Runtime) (*openaiserver.Server, error) {
-	if runtime == nil || runtime.Runner == nil || runtime.SessionService == nil ||
-		runtime.AppName == "" || runtime.ModelName == "" {
-		return nil, fmt.Errorf("web: incomplete resolved runtime")
-	}
-	s.adaptersMu.Lock()
-	defer s.adaptersMu.Unlock()
-	if s.closed {
-		return nil, fmt.Errorf("web: platform server is closed")
-	}
-	if adapter := s.adapters[runtime]; adapter != nil {
-		return adapter, nil
-	}
-	adapter, err := openaiserver.New(
-		openaiserver.WithRunner(runtime.Runner),
-		openaiserver.WithSessionService(runtime.SessionService),
-		openaiserver.WithAppName(runtime.AppName),
-		openaiserver.WithModelName(runtime.ModelName),
-		openaiserver.WithBasePath("/v1"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("web: create runtime OpenAI adapter: %w", err)
-	}
-	s.adapters[runtime] = adapter
-	return adapter, nil
+	handler.ServeHTTP(w, r)
 }

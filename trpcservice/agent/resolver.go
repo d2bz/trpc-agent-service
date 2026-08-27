@@ -146,7 +146,7 @@ func (r *RuntimeResolver) Resolve(
 		if runtime == nil {
 			return nil, fmt.Errorf("agent: builder returned nil runtime for revision %q", revision.ID)
 		}
-		return r.storeBuilt(key, runtime)
+		return r.storeBuilt(key, revision, runtime)
 	})
 
 	select {
@@ -273,7 +273,18 @@ func (r *RuntimeResolver) beginBuild() bool {
 	return true
 }
 
-func (r *RuntimeResolver) storeBuilt(key runtimeKey, runtime *Runtime) (*Runtime, error) {
+func (r *RuntimeResolver) storeBuilt(
+	key runtimeKey,
+	revision tenant.AgentRevision,
+	runtime *Runtime,
+) (*Runtime, error) {
+	if err := runtime.validateFor(revision); err != nil {
+		closeErr := runtime.Close()
+		return nil, errors.Join(
+			fmt.Errorf("agent: invalid runtime for revision %q: %w", revision.ID, err),
+			closeErr,
+		)
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
