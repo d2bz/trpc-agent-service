@@ -17,7 +17,7 @@
 | A11 | Redis 到 SQL 迁移 | [Session 迁移](storage-and-consistency.md#71-sessionredis-到-sql) | 待实现迁移 Job 与校验测试 | planned |
 | A12 | 本地到远端向量库迁移 | [向量迁移](storage-and-consistency.md#72-向量库迁移) | 待实现索引重建与切换测试 | planned |
 | A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | 待实现三次投递单 Run 测试 | planned |
-| A14 | 至少两类 IM，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 待实现企业微信和 Telegram Adapter/E2E | planned |
+| A14 | 至少两类 IM，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 待实现企业微信和飞书 Adapter/E2E | planned |
 | A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | 待实现 InboundEnvelope/Outbox 测试 | planned |
 | A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#33-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 待实现验签向量与身份测试 | planned |
 | A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 待实现键生成与隔离测试 | planned |
@@ -32,13 +32,13 @@
 | A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、固定版本解析和旧版本回滚；权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
-| D01 | 2000-4000 字架构方案 | [方案总稿](solution.md) | 1.0-rc1 中文正文 2403 字，待 8/27 正式提交 | partial |
-| D02 | 系统架构图 | [架构图](architecture.md#2-系统架构图) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
-| D03 | 核心时序图 | [时序图](sequence.md#1-企业微信完整链路) | 两张 Mermaid 时序图由 CLI 11.12.0 渲染与视觉检查通过 | partial |
+| D01 | 2000-4000 字架构方案 | [正式提交方案](submission-2026-08-27.md) | 1.0 中文正文 3288 字，已完成提交前检查 | partial |
+| D02 | 系统架构图 | [正式架构图](submission-2026-08-27.md#3-总体架构) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
+| D03 | 核心时序图 | [正式时序图](submission-2026-08-27.md#4-核心消息链路) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
 | D04 | 数据模型 | [数据模型](data-model.md) | ER 图由 Mermaid CLI 11.12.0 渲染通过；迁移文件待实现 | partial |
 | D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | 待实现集成测试 | partial |
 | D06 | 多后端适配方案 | [后端路由与取舍](storage-and-consistency.md#1-统一后端路由) | 待实现参考 Adapter | partial |
-| D07 | 至少 8 个风险与缓解 | [风险清单](solution.md#9-主要风险) | 12 项已记录，待最终复核 | partial |
+| D07 | 至少 8 个风险与缓解 | [风险清单](submission-2026-08-27.md#8-主要风险与应对) | 12 项已记录并完成复核 | partial |
 | D08 | GitHub 实现代码 | 当前仓库 | 已有最小可运行链路，完整平台功能待实现 | partial |
 | F01 | 明确上游复用与平台新增 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) | 已固定上游依赖并验证 LLMAgent、Runner、Session、OpenAI Server；平台模块待继续实现 | partial |
 

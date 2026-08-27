@@ -55,7 +55,7 @@ go test -race ./trpcservice/tenant ./trpcservice/agent
 | E01 多租户控制面 | 通过 Admin API 创建两个 Tenant、App、Revision、Backend 和 Channel Binding | 跨租户读取返回 404/拒绝；发布、灰度、固定版本和回滚可追踪 | A01、A05、A26 |
 | E02 双 Worker 会话 | 两轮消息分别命中不同 Worker，并同时向同一 Session 发送消息 | 无 sticky session 仍保留上下文；并发按租约和 fencing token 串行提交 | A03、A04、A08、A09、A10 |
 | E03 多后端与迁移 | Tenant A 使用 Redis，Tenant B 使用 PostgreSQL；迁移一个 Session 和一套向量索引 | 路由隔离；校验和一致；切换失败可回滚，成功后读写指向新后端 | A06、A07、A11、A12 |
-| E04 IM 幂等链路 | 企业微信和 Telegram 各发送消息，并重复投递同一外部事件三次 | 每个外部事件只产生一个 Run；回复经 Outbox 限流、重试并只产生一次业务副作用 | A13-A18 |
+| E04 IM 幂等链路 | 企业微信和飞书各发送消息，并重复投递同一外部事件三次 | 每个外部事件只产生一个 Run；回复经 Outbox 限流、重试并只产生一次业务副作用 | A13-A18 |
 | E05 治理与审计 | 触发允许 Tool、禁止 Tool、预算超限、敏感信息和危险操作审批 | Guardrail 决策正确；密钥不进入日志；审计字段、token 和成本完整 | A19、A20、A22、A23 |
 | E06 Trace 与故障恢复 | 注入模型超时、Tool 失败、数据库短暂中断和 Worker 退出 | Trace 串起入站到回复；Context 取消和 Event 排空；重试不重复副作用 | A21、A24、A25 |
 | E07 部署与容量 | Compose 最小部署、Kubernetes 多节点部署和分级压测 | 扩缩容可用；P95、错误率、后端 QPS、token 和成本数据能支撑容量结论 | A27、A28 |

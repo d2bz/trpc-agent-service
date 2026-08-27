@@ -82,7 +82,7 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 | 字段 | 说明 |
 | --- | --- |
 | `id/tenant_id/agent_app_id` | 所属租户和目标 App |
-| `channel_type` | `wecom/telegram/http/...` |
+| `channel_type` | `wecom/feishu/http/...` |
 | `external_account_id` | 企业应用、公众号或 Bot 标识的哈希/非敏感 ID |
 | `verify_secret_ref/crypto_secret_ref` | 验签和解密密钥引用 |
 | `config` | 长度限制、回调模式、限速、群聊策略 |

@@ -13,7 +13,7 @@
 | 项目定位 | 基于 tRPC-Agent-Go 的多租户、节点化 Agent 部署与运行平台 |
 | 题目源仓库 | <https://github.com/liuzengh/trpc-agent-service> |
 | 参赛实现仓库 | <https://github.com/d2bz/trpc-agent-service> |
-| 验收分支 | `feature/d2bz` |
+| 当前工作分支 | `feature/d2bz`（验收名称待组织者确认） |
 | 上游框架 | <https://github.com/trpc-group/trpc-agent-go> |
 | 上游模块 | `trpc.group/trpc-go/trpc-agent-go` |
 | 初始上游基线 | `v1.11.2` |
@@ -211,7 +211,7 @@ Agent 基础运行时、内置编排、通用 Session/Memory 接口、模型适�
 
 ## 16. 2026-08-26 提交冻结
 
-- 组织者要求最终验收分支采用 `feature/{your_name}`；当前 Git 提交身份和 GitHub 用户名均为 `d2bz`，因此个人 Fork 已建立并跟踪 `feature/d2bz`。
-- 当前账号对题目源仓库只有读取权限，因此开发分支暂存于 `d2bz/trpc-agent-service`。最终从 `d2bz:feature/d2bz` 发起 PR；若组织者后续授予写权限，可将同名分支直接推到题目源仓库。
-- 方案总稿冻结为 `1.0-rc1`，中文正文 2403 字，满足 2000–4000 字要求。
+- 组织者要求最终验收分支采用 `feature/{your_name}`，但 `your_name` 的具体口径尚待确认；当前个人 Fork 暂时使用并跟踪 `feature/d2bz`，确认后可以无损重命名。
+- 当前账号对题目源仓库只有读取权限，因此开发提交先推送至 `d2bz/trpc-agent-service`；若最终分支必须位于题目源仓库，需要组织者先授予写权限。
+- 正式提交方案版本为 `1.0`，中文正文 3288 字，满足 2000–4000 字要求。
 - 本次冻结只表示 8 月 27 日方案材料和当前可运行基线通过检查，不表示 A01-A28 已全部实现；未完成项继续以[验收矩阵](acceptance.md)为准。

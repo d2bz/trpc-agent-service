@@ -20,7 +20,7 @@
 flowchart TB
     subgraph Client[外部入口]
         WeCom[企业微信]
-        Telegram[Telegram]
+        Feishu[飞书]
         HTTP[HTTP / SSE 客户端]
         Operator[平台与租户管理员]
     end
@@ -67,7 +67,7 @@ flowchart TB
     Scheduler --> PG
 
     WeCom --> Channel
-    Telegram --> Channel
+    Feishu --> Channel
     HTTP --> Gateway
     Channel --> Gateway
     Gateway --> Inbox
@@ -90,7 +90,7 @@ flowchart TB
     Worker --> Outbox
     Outbox --> Channel
     Channel --> WeCom
-    Channel --> Telegram
+    Channel --> Feishu
 
     Gateway -. trace_id .-> OTel
     Worker -. trace_id .-> OTel

@@ -4,7 +4,6 @@
 > 启动日期：2026-08-21
 > 方案提交：2026-08-27
 > 项目验收：2026-09-11
-> 验收分支：`feature/d2bz`
 
 ## 1. 背景与目标
 
@@ -12,12 +11,12 @@
 
 本项目基于 tRPC-Agent-Go `v1.11.2` 建设统一运行平台。业务 Agent 专注 Prompt、工作流、Tool、Skill 和 Knowledge；平台负责租户识别、发布路由、共享状态、多后端适配、IM 接入、安全治理、可观测性和故障恢复。它不是重新实现 Agent 框架，也不是只转发请求的普通网关，而是完整的 Agent 控制面和运行数据面。
 
-最终效果是：多个租户可以在同一平台创建和发布相互隔离的 Agent，绑定企业微信或 Telegram，选择各自的存储后端，并由多个无状态 Worker 水平扩展运行。
+最终效果是：多个租户可以在同一平台创建和发布相互隔离的 Agent，绑定企业微信或飞书，选择各自的存储后端，并由多个无状态 Worker 水平扩展运行。
 
 ## 2. 场景示例
 
 - 租户 A 发布订单客服 Agent，绑定企业微信，使用 Redis Session、PGVector 商品知识库和订单查询 Tool。
-- 租户 B 发布运维 Agent，绑定 Telegram，使用 PostgreSQL Session、运维知识库和服务状态 Tool。
+- 租户 B 发布运维 Agent，绑定飞书，使用 PostgreSQL Session、运维知识库和服务状态 Tool。
 - 两个租户即使外部用户名、群 ID 或 Session ID 相同，配置、数据、工具、密钥、日志和成本仍完全隔离。
 - Worker 重启后重新加载不可变 Agent Revision，并从共享后端恢复 Session，不丢失已提交对话。
 
@@ -60,14 +59,14 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 
 ### 5.5 IM 接入差异
 
-| 能力 | 企业微信 | Telegram |
+| 能力 | 企业微信 | 飞书 |
 | --- | --- | --- |
-| 入站方式 | HTTPS Webhook 回调 | Webhook 或 Long Polling |
-| 安全 | `msg_signature` 验签、AES 解密 | Bot Token、Webhook Secret Token |
-| 回调时限 | 需快速确认，长任务主动回复 | Update 拉取/回调后可调用 Send API |
-| 会话 | 企业成员、外部联系人、群聊 | Chat、User、Topic |
-| 富消息 | 文本、图片、文件、模板/应用消息 | 文本、Markdown、媒体、按钮 |
-| 限流处理 | 按企业/应用接口限制退避 | 处理 429 与 `retry_after` |
+| 入站方式 | HTTPS Webhook 回调 | 事件订阅 Webhook 或 WebSocket 长连接 |
+| 安全 | `msg_signature` 验签、AES 解密 | Verification Token、Encrypt Key、请求签名 |
+| 回调时限 | 需快速确认，长任务主动回复 | 事件快速确认，长任务调用 Bot 消息 API |
+| 会话 | 企业成员、外部联系人、群聊 | Chat、User、Thread |
+| 富消息 | 文本、图片、文件、模板/应用消息 | 文本、富文本、图片、文件、交互卡片 |
+| 限流处理 | 按企业/应用接口限制退避 | 按应用与群维度限频并退避重试 |
 | 参考用途 | 满足微信体系验收并验证企业身份 | 低成本真实联调和第二通道差异 |
 
 两个 Adapter 共享统一 InboundEnvelope 和 Outbox，平台差异只留在验签、身份提取、消息转换、限流与发送实现中。重复投递由 Redis 快路径和 PostgreSQL 唯一约束共同去重。
@@ -102,7 +101,7 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 ## 7. 预期效果
 
 1. 两个以上租户可以创建、发布和隔离运行各自 Agent。
-2. 企业微信与 Telegram 完成从入站到回复的全链路演示。
+2. 企业微信与飞书完成从入站到回复的全链路演示。
 3. 两个 Worker 无需 sticky session 即可继续同一持久化会话。
 4. Redis、PostgreSQL、PGVector 和对象存储职责清楚，并演示 Session/索引迁移。
 5. 重复 IM 消息只产生一个 Run 和一次 Tool 副作用。
@@ -120,7 +119,7 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 | 8/27 | 提交方案文档；演示多租户 Admin → Runtime → Runner → Session 链路 |
 | 8/28-8/31 | PostgreSQL 控制面、Gateway、共享 Redis/PostgreSQL Session、Runtime 淘汰和双 Worker 验证 |
 | 9/1-9/4 | 多 Worker、并发协调、Redis/PostgreSQL、PGVector、Artifact、迁移和幂等 |
-| 9/5-9/7 | 企业微信、Telegram、媒体/限流/重试和端到端测试 |
+| 9/5-9/7 | 企业微信、飞书、媒体/限流/重试和端到端测试 |
 | 9/8-9/9 | Guardrail、权限、预算、审计、OpenTelemetry、故障恢复和 K8s |
 | 9/10 | 全量回归、容量测试、演示脚本和缺陷修复 |
 | 9/11 | 正式验收 |
