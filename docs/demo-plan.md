@@ -21,24 +21,25 @@
 ### D01 最小 HTTP Agent 链路
 
 1. 执行 `./build.sh && ./start.sh`，确认脚本只在 `/healthz` 就绪后返回。
-2. 请求 `/v1/chat/completions`，验证确定性模型返回 `echo: <input>`。
-3. 使用相同 `X-Session-ID` 连续请求两轮，验证 Session Event 数量持续增加。
-4. 加入 `"stream": true`，验证 SSE 分片并以 `data: [DONE]` 结束。
-5. 执行 `./stop.sh`，确认进程收到信号后退出且 PID 文件被清理。
+2. 带 `Authorization: Bearer` 请求 `/v1/chat/completions`，验证确定性模型返回 `echo: <input>`；去掉该请求头验证返回 `401 unauthenticated`。
+3. 不带 `X-Session-ID` 请求一次，从响应头取回平台生成的 Session ID，用它连续请求两轮，验证 Session Event 数量持续增加。
+4. 在请求体中把 `user` 改成任意他人身份，验证会话仍写在 `u/{principal_id}` 名下。
+5. 加入 `"stream": true`，验证 SSE 分片并以 `data: [DONE]` 结束，且响应头仍带回 Session 与 Revision。
+6. 执行 `./stop.sh`，确认进程收到信号后退出且 PID 文件被清理。
 
 自动化证据：
 
 ```bash
-go test ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
-go test -race ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
+go test ./trpcservice/identity ./trpcservice/sessiondir ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
+go test -race ./trpcservice/identity ./trpcservice/sessiondir ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
 ```
 
 ### D02 Tenant、Revision 与 Runtime 路由
 
 1. 创建两个 Tenant，并在两个租户内创建相同 ID 的 Agent App 和 Revision。
 2. 分别发布 Revision，验证默认路由只能返回本租户配置。
-3. 发布第二版本后验证新 Session 使用新默认版本，固定到旧版本的 Session 仍解析旧版本。
-4. 把旧版本重新切为默认版本，验证 `routing_version` 递增且历史 Revision 配置摘要不变。
+3. 发布第二版本后验证新 Session 使用新默认版本，首轮已经开始的 Session 仍留在旧版本；对已 Pin 的 Session 传入不同 `X-Agent-Revision-ID` 验证返回 `409 pin_conflict`。
+4. 把旧版本重新切为默认版本，验证 `routing_version` 递增、历史 Revision 配置摘要不变，且两个已有 Session 的 Pin 都没有变化。
 5. 并发解析同一三元组，验证只构建一个 Runtime；关闭 Resolver 时验证其等待活动租约释放。
 
 自动化证据：

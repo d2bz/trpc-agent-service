@@ -215,3 +215,11 @@ Agent 基础运行时、内置编排、通用 Session/Memory 接口、模型适�
 - 当前账号对题目源仓库只有读取权限，因此开发提交先推送至 `d2bz/trpc-agent-service`；若最终分支必须位于题目源仓库，需要组织者先授予写权限。
 - 正式提交方案版本为 `1.0`，中文正文 3288 字，满足 2000–4000 字要求。
 - 本次冻结只表示 8 月 27 日方案材料和当前可运行基线通过检查，不表示 A01-A28 已全部实现；未完成项继续以[验收矩阵](acceptance.md)为准。
+
+## 17. 2026-08-28 可信身份与 Session Pin
+
+- `/v1/chat/completions` 的租户、主体和可用 App 改为由 Bearer 凭据推导。上游 OpenAI Server 从请求体 `user` 和 `X-Session-ID` 取身份，因此平台在注入 Runner 的位置加了一层包装器：协议层传入的 `userID`/`sessionID` 被丢弃，实际执行使用 `u/{principal_id}` 和平台确定的 Session；请求上下文中没有可信作用域时直接失败，不猜测身份。
+- 新增 `trpcservice/identity` 与 `trpcservice/sessiondir` 两个包。静态 API Key 只保存 token 的 SHA-256 摘要，长期 map 中不留明文；Session Directory 以 `{tenant, app, principal, session, epoch}` 为键，`EnsurePin` 的首次写入是线性化点。
+- Session 在首轮原子钉住当时的 Revision。这反转了上一版行为：发布新版本后，已经开始的会话不再切到新版本，回滚也不改变已有 Pin。`X-Agent-Revision-ID` 退化为新会话首轮的开发用提示，对已 Pin 会话给出不同值返回 `409 pin_conflict`。
+- `Key.Epoch` 已在结构中预留但恒为 0；显式 Retire/Unpin、跨进程 Pin、共享 Session 和按 Principal 的配额限流都未实现，已在[验收矩阵](acceptance.md#已知限制)中记录为已知限制。
+- Admin API 依然完全未认证。对话面的认证不改变"进程只能绑定本机地址"这一边界。

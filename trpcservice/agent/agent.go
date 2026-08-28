@@ -31,6 +31,8 @@ type runtimeHTTPAdapter interface {
 
 // Runtime owns the process-local Agent, Runner and protocol adapter objects for
 // one immutable agent revision. Conversation state remains in SessionService.
+// Runner is the real Runner and the only one Close releases; protocol adapters
+// receive a wrapper that supplies the authenticated identity instead.
 type Runtime struct {
 	TenantID       string
 	AgentAppID     string
@@ -43,6 +45,7 @@ type Runtime struct {
 
 	openAI             runtimeHTTPAdapter
 	openAIHandler      http.Handler
+	protocolRunner     runner.Runner
 	closeOnce          sync.Once
 	closeErr           error
 	ownsSessionService bool
@@ -138,8 +141,16 @@ func newRuntimeFromRevision(
 		SessionService:     sessionService,
 		ownsSessionService: ownsSessionService,
 	}
+	// The adapter reads userID and sessionID from the request payload, so it
+	// receives the identity-enforcing wrapper instead of the real Runner.
+	runtime.protocolRunner = &contextRunner{
+		inner:      runtime.Runner,
+		tenantID:   revision.TenantID,
+		appID:      revision.AgentAppID,
+		revisionID: revision.ID,
+	}
 	openAI, err := openaiserver.New(
-		openaiserver.WithRunner(runtime.Runner),
+		openaiserver.WithRunner(runtime.protocolRunner),
 		openaiserver.WithSessionService(runtime.SessionService),
 		openaiserver.WithAppName(runtime.AppName),
 		openaiserver.WithModelName(runtime.ModelName),

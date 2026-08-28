@@ -4,11 +4,11 @@
 
 | ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
 | --- | --- | --- | --- | --- |
-| A01 | 多租户模型与配置 | [数据模型](data-model.md#31-tenant)、[总体架构](architecture.md#4-控制面) | 已实现 Admin API、内存 Repository、不可变 Revision、发布/路由和隔离测试；认证/PostgreSQL 待实现 | partial |
+| A01 | 多租户模型与配置 | [数据模型](data-model.md#31-tenant)、[总体架构](architecture.md#4-控制面) | 已实现 Admin API、内存 Repository、不可变 Revision、发布/路由和隔离测试；对话面已有静态 API Key 认证，Admin 认证和 PostgreSQL 待实现 | partial |
 | A02 | Gateway、Worker、Channel、Storage、Admin、Telemetry 节点协作 | [架构图](architecture.md#2-系统架构图) | 待实现多角色启动和 Compose | planned |
 | A03 | 多节点水平扩展与 Session 路由 | [数据面](architecture.md#5-数据面)、[节点部署](architecture.md#6-节点部署) | 待实现双 Worker 集成测试 | planned |
 | A04 | 无 sticky session 与共享 Session/Memory | [设计结论](architecture.md#1-设计结论)、[并发](storage-and-consistency.md#4-同一-session-并发) | 待实现跨 Worker 连续会话测试 | planned |
-| A05 | 配置、数据、工具、日志、密钥隔离 | [设计原则](project-foundation.md#9-不可破坏的设计原则)、[治理](solution.md#56-治理与安全) | 已实现配置仓库与 Runtime 缓存租户隔离；数据、工具、日志、密钥待实现 | partial |
+| A05 | 配置、数据、工具、日志、密钥隔离 | [设计原则](project-foundation.md#9-不可破坏的设计原则)、[治理](solution.md#56-治理与安全) | 已实现配置仓库与 Runtime 缓存租户隔离；对话面租户与 Session 归属由凭据推导，静态 API Key 只保留 SHA-256 摘要；工具、日志脱敏、Secret Resolver 待实现 | partial |
 | A06 | 多租户选择多种后端 | [统一路由](storage-and-consistency.md#1-统一后端路由)、[数据放置](storage-and-consistency.md#2-数据放置) | 待实现 InMemory/Redis/PostgreSQL Bundle | planned |
 | A07 | Session/Memory/Summary/Artifact/Knowledge/Audit 存储 | [核心实体](data-model.md#3-核心实体)、[数据放置](storage-and-consistency.md#2-数据放置) | 待实现 Repository 与 Adapter 测试 | planned |
 | A08 | 同 Session 多节点并发一致性 | [并发方案](storage-and-consistency.md#4-同一-session-并发)、[并发时序](sequence.md#3-同一-session-同时收到两条消息) | 待实现租约、队列、CAS 测试 | planned |
@@ -29,7 +29,7 @@
 | A23 | 密钥管理和脱敏 | [控制面配置](architecture.md#42-配置传播)、[治理](solution.md#56-治理与安全) | 待实现 Secret Resolver 和泄漏测试 | planned |
 | A24 | 节点/IM/数据库/模型/Tool 故障恢复 | [故障恢复](solution.md#58-故障恢复)、[故障降级](storage-and-consistency.md#8-故障与降级) | 待实现故障注入测试 | planned |
 | A25 | Context、goroutine、Event Channel 排空 | [并发与故障边界](architecture.md#7-并发与故障边界) | 待实现 goleak/取消/排空测试 | planned |
-| A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、固定版本解析和旧版本回滚；权重灰度待实现 | partial |
+| A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及进程内 Session Revision Pin：发布和回滚都不会改变已开始的会话；权重灰度和跨进程 Pin 待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
 | D01 | 2000-4000 字架构方案 | [正式提交方案](submission-2026-08-27.md) | 1.0 中文正文 3288 字，已完成提交前检查 | partial |
@@ -51,7 +51,19 @@
 | I03 | 可构建和启动 | `build.sh`、`start.sh`、`stop.sh`：构建、就绪检查、PID 生命周期 | `./build.sh` 后通过 `/healthz` 和 `/v1/chat/completions` 手工验证 | partial |
 | I04 | 多租户配置与发布 | `trpcservice/tenant/tenant.go`、`repository.go`：Tenant、App、Revision、摘要、发布、固定版本和回滚 | `go test ./trpcservice/tenant`：深拷贝不可变、租户隔离、版本路由、错误路径 | partial |
 | I05 | Runtime 解析与缓存 | `trpcservice/agent/resolver.go`：三元组缓存、singleflight、入缓存前的完整性与身份复核、生命周期租约，Resolver 是 Runtime 及其 Adapter 的唯一所有者 | `go test -race ./trpcservice/agent`：并发单次构建、取消隔离、关闭等待、跨租户缓存隔离、半成品/身份不符 Runtime 被关闭且不入缓存、关闭时释放缓存内资源 | partial |
-| I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、显式租户路由、请求期内路由到 Runtime 自有协议适配器和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/固定版本/回滚、跨租户、SSE、CORS、SSE 全程持有租约、Resolver 关闭后返回 `runtime_unavailable` | partial |
+| I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、凭据驱动的对话路由、请求期内路由到 Runtime 自有协议适配器和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/回滚、跨租户、SSE、CORS、SSE 全程持有租约、Resolver 关闭后返回 `runtime_unavailable` | partial |
+| I07 | 可信 Chat 身份 | `trpcservice/identity/`：Identity/Authenticator、静态 API Key 只存 SHA-256 摘要、`RunContext` 经不可导出 context key 传递；`trpcservice/agent/contextrunner.go`：协议层 `userID`/`sessionID` 被丢弃，作用域与 Runtime 不符则 fail closed | `go test -race ./trpcservice/identity ./trpcservice/agent ./trpcservice/web`：摘要映射与拷贝隔离、未知凭据 fail closed、无 RunContext 拒绝执行、包装器 `Close` 不关闭真实 Runner、认证矩阵 401/403、请求体 `user` 无法进入 Session 键空间 | partial |
+| I08 | Session Revision Pin | `trpcservice/sessiondir/`：`{tenant, app, principal, session, epoch}` 键、单锁 `EnsurePin` 首写即线性化点；`trpcservice/web/platform.go`：查 Pin → 解析候选 → EnsurePin → 落败方释放租约后改用胜出版本 | `go test -race ./trpcservice/sessiondir ./trpcservice/web`：32 并发候选唯一胜出、租户/主体隔离、发布与回滚不改旧 Pin、相同 hint 放行且不同 hint `409`、屏障化并发首轮两侧同版本且 `resolver.Close` 能完成（证明落败租约已释放） | partial |
+
+## 已知限制
+
+这些限制是当前切片有意接受的，不能在验收中被当作已解决：
+
+- **合法凭据可以制造无界内存 Session。** Session 目录与 Session Service 都在进程内存中，没有配额、TTL 或 LRU，一个有效 key 可以用无限多的 `X-Session-ID` 耗尽内存。
+- **首轮 OpenAI 历史可以伪造。** 平台只决定会话归属，不校验请求体 `messages`；新 Session 的第一轮可以注入编造的"历史对话"。
+- **Adapter 拒绝的请求也会建立 Pin。** Session 与 Revision 在调用上游 Adapter 之前确定，格式错误的首轮同样会钉住该 Session。
+- **Pin 只在单进程内存中**，多节点部署会各自 Pin 到各自看到的默认版本。
+- **对话面认证不等于平台生产安全。** Admin API 仍完全未认证，进程只能绑定本机地址。
 
 ## 验收使用方式
 

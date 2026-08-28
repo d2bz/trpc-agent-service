@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -66,7 +67,7 @@ func TestRuntimeOwnsExactlyOneOpenAIHandler(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, handler, again)
 
-	response := serveChatCompletion(handler, `{
+	response := serveChatCompletion(t, runtime, `{
 		"model":"deterministic-echo","messages":[{"role":"user","content":"hello"}]
 	}`)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -145,9 +146,9 @@ func TestRuntimeCloseKeepsSharedSessionService(t *testing.T) {
 
 	require.NoError(t, first.Close())
 
-	handler, err := second.OpenAIHandler()
-	require.NoError(t, err)
-	response := serveChatCompletion(handler, `{
+	// The body user is attacker-controlled input, so the surviving Runtime must
+	// still write the conversation under the authenticated principal.
+	response := serveChatCompletion(t, second, `{
 		"model":"echo-v2","user":"user-1","messages":[{"role":"user","content":"after close"}]
 	}`)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -155,7 +156,7 @@ func TestRuntimeCloseKeepsSharedSessionService(t *testing.T) {
 
 	sess, err := shared.GetSession(context.Background(), session.Key{
 		AppName:   second.AppName,
-		UserID:    "user-1",
+		UserID:    "u/principal-1",
 		SessionID: "shared-session",
 	})
 	require.NoError(t, err)
@@ -177,14 +178,41 @@ func publishedRevision(revisionID string, modelName string) tenant.AgentRevision
 	}
 }
 
-func serveChatCompletion(handler http.Handler, body string) *httptest.ResponseRecorder {
+// serveChatCompletion calls a Runtime adapter the way the platform does: with
+// the trusted scope already attached to the request context.
+func serveChatCompletion(
+	t *testing.T,
+	runtime *Runtime,
+	body string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	handler, err := runtime.OpenAIHandler()
+	require.NoError(t, err)
+	ctx, err := identity.WithRunContext(context.Background(), identity.RunContext{
+		TenantID:    runtime.TenantID,
+		AppID:       runtime.AgentAppID,
+		PrincipalID: "principal-1",
+		SessionID:   "shared-session",
+		RevisionID:  runtime.RevisionID,
+	})
+	require.NoError(t, err)
+	return serveChatCompletionWithContext(t, ctx, handler, body)
+}
+
+func serveChatCompletionWithContext(
+	t *testing.T,
+	ctx context.Context,
+	handler http.Handler,
+	body string,
+) *httptest.ResponseRecorder {
+	t.Helper()
 	request := httptest.NewRequest(
 		http.MethodPost, "/v1/chat/completions", strings.NewReader(body),
 	)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Session-ID", "shared-session")
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
+	handler.ServeHTTP(response, request.WithContext(ctx))
 	return response
 }
 

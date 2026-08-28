@@ -7,8 +7,93 @@ import (
 	"testing"
 	"time"
 
+	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/stretchr/testify/require"
 )
+
+// The demo credential is the whole chat authorisation of the local process, so
+// it must grant exactly one tenant, one principal and one agent app.
+func TestDemoAuthenticatorGrantsOnlyTheDemoScope(t *testing.T) {
+	t.Setenv(apiKeyEnvVar, "")
+	authenticator, err := demoAuthenticator()
+	require.NoError(t, err)
+
+	granted, err := authenticator.Authenticate(context.Background(), developmentAPIKey)
+	require.NoError(t, err)
+	require.Equal(t, platformconfig.DemoTenantID, granted.TenantID)
+	require.Equal(t, platformconfig.DemoPrincipalID, granted.PrincipalID)
+	require.Equal(t, []string{platformconfig.DemoAgentAppID}, granted.AllowedAppIDs)
+	require.True(t, granted.AllowsApp(platformconfig.DemoAgentAppID))
+	require.False(t, granted.AllowsApp("another-app"))
+
+	_, err = authenticator.Authenticate(context.Background(), "not-the-development-key")
+	require.ErrorIs(t, err, identity.ErrUnauthenticated)
+}
+
+// A configured key replaces the published one instead of being accepted next to
+// it, otherwise the documented placeholder would stay a valid credential.
+func TestDemoAuthenticatorPrefersTheConfiguredKey(t *testing.T) {
+	const configured = "configured-local-key-0123456789"
+	t.Setenv(apiKeyEnvVar, configured)
+	authenticator, err := demoAuthenticator()
+	require.NoError(t, err)
+
+	granted, err := authenticator.Authenticate(context.Background(), configured)
+	require.NoError(t, err)
+	require.Equal(t, platformconfig.DemoTenantID, granted.TenantID)
+
+	_, err = authenticator.Authenticate(context.Background(), developmentAPIKey)
+	require.ErrorIs(t, err, identity.ErrUnauthenticated)
+}
+
+// The Admin API is unauthenticated, so the loopback bind is the only thing
+// keeping the control plane off the network. It has to be enforced, not just
+// documented and defaulted.
+func TestValidateListenAddrAcceptsLoopbackOnly(t *testing.T) {
+	for _, addr := range []string{
+		"127.0.0.1:8080",
+		"127.0.0.1:0",
+		"127.9.9.9:8080",
+		"localhost:8080",
+		"LocalHost:8080",
+		"[::1]:8080",
+	} {
+		t.Run("accepts "+addr, func(t *testing.T) {
+			require.NoError(t, validateListenAddr(addr))
+		})
+	}
+
+	for _, addr := range []string{
+		":8080",             // wildcard, the easiest accidental exposure
+		"0.0.0.0:8080",      // explicit IPv4 wildcard
+		"[::]:8080",         // explicit IPv6 wildcard
+		"192.168.1.10:8080", // routable on the local network
+		"203.0.113.5:8080",  // routable on the internet
+		"example.com:8080",  // a name that is not loopback
+		"127.0.0.1",         // no port at all
+		"",
+	} {
+		t.Run("rejects "+addr, func(t *testing.T) {
+			require.Error(t, validateListenAddr(addr))
+		})
+	}
+
+	// The refusal has to name the address and say what is allowed instead.
+	err := validateListenAddr("0.0.0.0:8080")
+	require.ErrorContains(t, err, "0.0.0.0:8080")
+	require.ErrorContains(t, err, "127.0.0.1:8080")
+}
+
+// run must refuse before it binds anything, so a non-loopback address never
+// reaches http.Server. The address is TEST-NET-1, which is assigned to no local
+// interface: if the guard is ever removed, this test fails on the bind error
+// instead of publishing the unauthenticated control plane from a test run.
+func TestRunRefusesNonLoopbackAddr(t *testing.T) {
+	err := run("192.0.2.1:8080")
+	require.ErrorContains(t, err, "refusing to listen")
+	require.ErrorContains(t, err, "192.0.2.1:8080")
+}
 
 func TestShutdownHTTPServerGraceful(t *testing.T) {
 	server := &fakeHTTPServerLifecycle{}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -257,6 +258,10 @@ func decodeAdminJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 
 func writeDomainError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, identity.ErrUnauthenticated):
+		writeUnauthenticated(w, "the credential is not valid")
+	case errors.Is(err, identity.ErrForbidden):
+		writeAPIError(w, http.StatusForbidden, "forbidden", "this credential is not allowed")
 	case errors.Is(err, tenant.ErrInvalidArgument):
 		writeAPIError(w, http.StatusBadRequest, "invalid_argument", err.Error())
 	case errors.Is(err, tenant.ErrTenantScope), errors.Is(err, tenant.ErrNotFound):

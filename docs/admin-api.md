@@ -4,6 +4,8 @@
 
 当前接口用于本地开发和验收最小闭环。控制面使用 InMemory Repository，进程重启后只恢复内置 demo 配置；Admin API 尚未接入身份认证，因此服务默认绑定 `127.0.0.1`，不能直接暴露到公网。后续 PostgreSQL Repository 和管理员授权会保持本文的资源语义，但可能增加认证头、分页和审计字段。
 
+对话面已经要求 Bearer 凭据（见第 4 节），Admin 面没有。两者的安全边界不同：**Admin 未认证这一条决定了整个进程仍然只能跑在本机**，对话面的认证不改变这个结论。
+
 平台启动时预置：
 
 | 资源 | ID |
@@ -73,24 +75,31 @@ Revision 配置在创建时计算 SHA-256 `config_digest`，之后没有修改�
 
 ## 4. 动态对话路由
 
-对话路径仍为上游兼容的 `/v1/chat/completions`，平台路由使用以下请求头：
+对话路径仍为上游兼容的 `/v1/chat/completions`。租户、主体和 Session 归属全部由服务端从凭据推导，请求体中的 `user` 字段被忽略。
 
 | Header | 必填 | 说明 |
 | --- | --- | --- |
-| `X-Tenant-ID` | 是 | 明确的 Tenant ID，不存在公共默认租户 |
-| `X-Agent-App-ID` | 是 | Tenant 内的稳定 Agent App ID |
-| `X-Agent-Revision-ID` | 否 | 指定已发布 Revision；当前用于固定版本和验收测试 |
-| `X-Session-ID` | 否 | 客户端会话 ID；未提供时由上游服务生成 |
+| `Authorization` | 是 | `Bearer {api_key}`；平台由此确定 Tenant、Principal 和可用 App |
+| `X-Agent-App-ID` | 是 | Tenant 内的稳定 Agent App ID，必须在凭据授权范围内 |
+| `X-Tenant-ID` | 否 | 只是客户端对自己凭据的断言；与认证结果不一致返回 `403` |
+| `X-Agent-Revision-ID` | 否 | 仅对**新 Session 的首轮**生效的开发用指定版本；对已 Pin 的 Session 只能重复相同值 |
+| `X-Session-ID` | 否 | 客户端会话 ID；缺失时由平台生成 UUID 并在响应头回传 |
+
+响应头（成功和 Adapter 返回的 `400`/`500` 都会带上）：
+
+| Header | 说明 |
+| --- | --- |
+| `X-Session-ID` | 本次实际使用的 Session ID，客户端用它续接同一段对话 |
+| `X-Agent-Revision-ID` | 本次实际执行的 Revision，即该 Session 的 Pin |
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl -i http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-Tenant-ID: team-a' \
-  -H 'X-Agent-App-ID: assistant' \
+  -H 'Authorization: Bearer local-development-key-not-a-secret' \
+  -H 'X-Agent-App-ID: echo' \
   -H 'X-Session-ID: conversation-1' \
   -d '{
-    "model":"team-echo-v1",
-    "user":"user-1",
+    "model":"deterministic-echo",
     "messages":[{"role":"user","content":"hello"}]
   }'
 ```
@@ -98,20 +107,50 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 路由顺序为：
 
 ```text
-Tenant Header + App Header
-→ Repository 解析默认/指定的 published Revision
-→ Runtime Resolver 按 (tenant, app, revision) 加载或复用 Runtime
+OPTIONS 预检直接返回（不认证）
+→ 解析 Bearer 并认证，得到 {tenant_id, principal_id, allowed_app_ids}
+→ 校验 X-Tenant-ID 断言（不一致 403）
+→ 校验 X-Agent-App-ID 并检查授权（越权 403）
+→ 校验或生成 X-Session-ID
+→ Session Directory 查 Pin；没有 Pin 则解析候选 Revision 并原子 EnsurePin
+→ Runtime Resolver 按 (tenant, app, pinned revision) 加载或复用 Runtime
+→ 写入响应头，注入可信 RunContext
 → OpenAI-compatible Adapter
-→ Runner.Run
+→ contextRunner（丢弃协议层 userID/sessionID）
+→ Runner.Run(userID = u/{principal_id}, sessionID = 已 Pin 的 Session)
 → App 级共享 Session Service
 ```
 
-Runtime 的框架 `AppName` 为 `t/{tenant_id}/a/{app_id}`，不包含 Revision。因此发布或回滚后，同一 Tenant、App、User 和 Session 仍读取同一段会话历史。不同 Tenant 即使使用完全相同的 App、Revision、User 和 Session ID，也会进入不同的 Session 命名空间和 Runtime 缓存键。
+错误语义：
+
+| 情况 | 状态码 | `code` |
+| --- | --- | --- |
+| 缺少或错误的 Bearer 凭据 | `401`（带 `WWW-Authenticate: Bearer`） | `unauthenticated` |
+| `X-Tenant-ID` 断言不符，或 App 不在凭据授权内 | `403` | `forbidden` |
+| 缺少或非法 `X-Agent-App-ID` | `400` | `missing_route` |
+| 非法 `X-Session-ID` | `400` | `invalid_session_id` |
+| 已 Pin 的 Session 收到不同的 `X-Agent-Revision-ID` | `409` | `pin_conflict` |
+| Resolver 已关闭 | `503` | `runtime_unavailable` |
+
+Session 的 Revision Pin 在首轮请求中原子写入，键为 `{tenant_id, app_id, principal_id, session_id}`。因此：发布新版本不会改变已经开始的 Session，回滚同样不会；新 Session 才会采用当前默认版本。并发首轮只有一个候选能成为 Pin，落败的请求会释放自己的 Runtime 租约并改用胜出的 Revision。
+
+Runtime 的框架 `AppName` 为 `t/{tenant_id}/a/{app_id}`，不包含 Revision。因此发布或回滚后，同一 Tenant、App、Principal 和 Session 仍读取同一段会话历史。不同 Tenant 即使使用完全相同的 App、Revision、Principal 和 Session ID，也会进入不同的 Session 命名空间和 Runtime 缓存键。
+
+CORS 预检允许 `Authorization`、`X-Tenant-ID`、`X-Agent-App-ID`、`X-Agent-Revision-ID`、`X-Session-ID`，并向浏览器暴露 `X-Session-ID` 和 `X-Agent-Revision-ID`。预检本身不认证，因为浏览器不会在预检请求上附带凭据。
 
 ## 5. 尚未完成
 
 - Admin 身份认证、租户管理员授权和管理操作审计。
 - PostgreSQL Repository、事务、分页和跨节点配置通知。
-- Session 目录及服务端自动 Revision Pin；当前可选 Revision Header 只用于开发和验收。
+- 跨进程 Session 目录：当前 Pin 只在单进程内存中，多节点部署会各自 Pin。
+- 主体间共享 Session、显式 Retire/Unpin（`Key.Epoch` 已预留但恒为 0）、Redis 租约。
+- 静态 API Key 之外的凭据体系：轮转、过期、撤销、按 Principal 的配额与限流。
 - 权重灰度、白名单路由、Runtime TTL/LRU 淘汰和配置失效通知。
 - 生产模型 Provider、Secret Resolver、Tool/Knowledge/Policy 组装。
+
+## 6. 已知限制
+
+- **合法凭据可以制造无界内存 Session。** Session 目录和 Session Service 都在内存中，且没有配额或 TTL，一个持有有效 key 的调用方可以用无限多的 `X-Session-ID` 撑爆进程内存。
+- **首轮 OpenAI 历史可以伪造。** 平台只决定 Session 归属，不校验请求体里的 `messages`。新 Session 的第一轮里，调用方可以自行编造一段"历史对话"送进模型上下文。后续轮次会与服务端存储的 Session 事件合并，但首轮注入无法阻止。
+- **Adapter 拒绝的请求也会建立 Pin。** Session ID 和 Revision 在调用上游 Adapter 之前就已确定并写入响应头，因此一个 JSON 格式错误的首轮请求同样会把该 Session 钉在当时的 Revision 上。
+- 对话面认证只覆盖 `/v1/chat/completions`。**不能据此认为平台整体达到生产安全标准。**

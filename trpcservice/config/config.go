@@ -13,6 +13,9 @@ const (
 	DemoTenantID   = "demo"
 	DemoAgentAppID = "echo"
 	DemoRevisionID = "echo-v1"
+	// DemoPrincipalID is the only chat principal the local demo credential
+	// authenticates as. Sessions are keyed by it, never by a request body.
+	DemoPrincipalID = "demo-user"
 )
 
 // SeedDemo creates an idempotent local configuration with no external API key.

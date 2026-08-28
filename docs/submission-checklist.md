@@ -30,7 +30,7 @@
 git status --short --branch
 git diff --check
 go test ./...
-go test -race ./trpcservice/config ./trpcservice/tenant ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
+go test -race ./trpcservice/config ./trpcservice/tenant ./trpcservice/identity ./trpcservice/sessiondir ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
 go vet ./...
 ./build.sh
 ./start.sh
@@ -39,10 +39,11 @@ go vet ./...
 启动后至少验证：
 
 1. `GET /healthz` 返回 `200`。
-2. 预置 `demo/echo` 可以通过 `/v1/chat/completions` 对话。
-3. Admin API 可以创建 Tenant、App、Revision 并发布。
-4. 新 Tenant 的对话命中对应模型和 Runtime。
-5. `./stop.sh` 正常停止服务并清理 PID 文件。
+2. 预置 `demo/echo` 可以带 `Authorization: Bearer` 通过 `/v1/chat/completions` 对话；缺少该请求头返回 `401`。
+3. 响应头带回 `X-Session-ID` 和 `X-Agent-Revision-ID`，用回传的 Session ID 可续接同一段对话。
+4. Admin API 可以创建 Tenant、App、Revision 并发布。
+5. 发布新 Revision 后，已开始的 Session 仍返回旧版本，新建 Session 才用新版本。
+6. `./stop.sh` 正常停止服务并清理 PID 文件。
 
 ## 4. Git 检查
 
@@ -54,4 +55,4 @@ go vet ./...
 
 ## 5. 当前实现边界
 
-截至方案 `1.0`，已实现最小 Runner 链路、Tenant/App/Revision 内存控制面、Admin API、动态 Runtime 路由、版本发布/回滚和多租户隔离测试。PostgreSQL、Redis 共享 Session、双 Worker、IM Adapter、治理、Telemetry 和生产部署仍在后续计划中。方案提交不改变这些功能的 `planned/partial` 状态。
+截至方案 `1.0`，已实现最小 Runner 链路、Tenant/App/Revision 内存控制面、Admin API、动态 Runtime 路由、版本发布/回滚和多租户隔离测试。此后追加了对话面的静态 API Key 认证、服务端决定的会话归属和进程内 Session Revision Pin。PostgreSQL、Redis 共享 Session、跨进程 Pin、Admin 认证、双 Worker、IM Adapter、治理、Telemetry 和生产部署仍在后续计划中，已知限制见[验收矩阵](acceptance.md#已知限制)。方案提交不改变这些功能的 `planned/partial` 状态。

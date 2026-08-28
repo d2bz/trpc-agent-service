@@ -155,18 +155,32 @@ cd trpc-agent-service
 curl http://127.0.0.1:8080/healthz
 ```
 
-调用 OpenAI-compatible 非流式接口：
+调用 OpenAI-compatible 非流式接口。对话面需要 Bearer 凭据，平台由凭据决定租户和会话归属：
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl -i http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-Tenant-ID: demo' \
+  -H 'Authorization: Bearer local-development-key-not-a-secret' \
   -H 'X-Agent-App-ID: echo' \
   -H 'X-Session-ID: demo-session' \
   -d '{"model":"deterministic-echo","messages":[{"role":"user","content":"hello platform"}]}'
 ```
 
-将请求体加入 `"stream":true` 即可验证 SSE 流式响应。创建其他 Tenant、Agent App 和 Revision 的接口及完整调用流程见 [Admin API 与动态路由](docs/admin-api.md)。当前 Admin API 未接入认证，只适用于绑定本机地址的开发演示。
+本地开发 key 通过环境变量覆盖，未设置时使用上面这个公开的、明确命名为非密钥的占位值。key 至少需要 16 个字符，否则进程启动即失败：
+
+```bash
+TRPC_SERVICE_API_KEY=replace-with-your-own-local-key ./start.sh
+```
+
+关于这条链路需要知道的几件事：
+
+- **请求体中的 `user` 字段被忽略。** 会话归属只来自认证结果，写入的 Session 用户是 `u/{principal_id}`，客户端无法指定别人的身份。
+- **`X-Session-ID` 可以不传**，平台会生成一个并通过响应头 `X-Session-ID` 回传，续接对话时原样带回即可；`-i` 就是为了看到这个响应头。
+- **响应头 `X-Agent-Revision-ID`** 是本次实际执行的版本。每个 Session 在首轮就被钉在当时的 Revision 上，之后发布新版本或回滚都不会改变它，新建 Session 才会用上新版本。
+
+将请求体加入 `"stream":true` 即可验证 SSE 流式响应，响应头同样带回上述两个字段。创建其他 Tenant、Agent App 和 Revision 的接口、完整路由顺序和错误码见 [Admin API 与动态路由](docs/admin-api.md)。
+
+**Admin API 仍未接入任何认证**，任何能访问该端口的人都可以创建租户和发布版本，因此服务只允许绑定回环地址：`127.0.0.1`、`localhost`、`[::1]` 之外的监听地址（包括 `:8080`、`0.0.0.0:8080` 这类通配形式）会在启动时直接拒绝，且没有绕过开关。对话面的认证不改变这个边界，等 Admin 认证落地后才会放开。
 
 自定义监听地址时使用：
 
