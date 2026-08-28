@@ -30,11 +30,31 @@
 git status --short --branch
 git diff --check
 go test ./...
-go test -race ./trpcservice/config ./trpcservice/tenant ./trpcservice/identity ./trpcservice/sessiondir ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
+go test -race ./trpcservice/config ./trpcservice/tenant ./trpcservice/identity ./trpcservice/sessiondir ./trpcservice/sessionbackend ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
 go vet ./...
 ./build.sh
 ./start.sh
 ```
+
+上述命令在没有 PostgreSQL、Redis 和网络的机器上必须全部通过。构建工具链下限为 **Go 1.24.1**，由依赖 `storage/redis@v0.0.3` 的 go directive 传递强制，理由见 [Session 后端 Spike](session-backend.md#21-go-directive-被抬到-1241)。
+
+### 持久化 Session 后端 Spike（可选，需 Docker）
+
+该 Spike 不改变服务默认行为（仍为 InMemory Session），只验证上游 PostgreSQL/Redis Session 子模块。跳过它不影响上面的验收。
+
+```bash
+docker compose -f deploy/docker-compose.session.yml config
+docker compose -f deploy/docker-compose.session.yml up -d --wait
+
+TRPC_SERVICE_SESSION_INTEGRATION=1 \
+TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_session?sslmode=disable' \
+TRPC_SERVICE_REDIS_URL='redis://:trpc-local-dev@127.0.0.1:56379/0' \
+go test -race -timeout 120s ./trpcservice/sessionbackend/...
+
+docker compose -f deploy/docker-compose.session.yml down -v
+```
+
+集成测试可重复执行，两次运行互不干扰。Compose 里的口令是本地开发占位值，服务只绑定 `127.0.0.1`，不是生产 secret。语义差异与未实现边界见 [Session 后端 Spike](session-backend.md)。
 
 启动后至少验证：
 
@@ -55,4 +75,4 @@ go vet ./...
 
 ## 5. 当前实现边界
 
-截至方案 `1.0`，已实现最小 Runner 链路、Tenant/App/Revision 内存控制面、Admin API、动态 Runtime 路由、版本发布/回滚和多租户隔离测试。此后追加了对话面的静态 API Key 认证、服务端决定的会话归属和进程内 Session Revision Pin。PostgreSQL、Redis 共享 Session、跨进程 Pin、Admin 认证、双 Worker、IM Adapter、治理、Telemetry 和生产部署仍在后续计划中，已知限制见[验收矩阵](acceptance.md#已知限制)。方案提交不改变这些功能的 `planned/partial` 状态。
+截至方案 `1.0`，已实现最小 Runner 链路、Tenant/App/Revision 内存控制面、Admin API、动态 Runtime 路由、版本发布/回滚和多租户隔离测试。此后追加了对话面的静态 API Key 认证、服务端决定的会话归属和进程内 Session Revision Pin。另有一次持久化 Session 后端 Spike：`trpcservice/sessionbackend` 能构造 PostgreSQL/Redis 的 `session.Service` 并通过集成测试，但**默认后端仍是 InMemory，进程中没有任何代码使用持久化后端**。共享 Session、跨进程 Pin、Admin 认证、双 Worker、IM Adapter、治理、Telemetry 和生产部署仍在后续计划中，已知限制见[验收矩阵](acceptance.md#已知限制)。方案提交不改变这些功能的 `planned/partial` 状态。

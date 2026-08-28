@@ -54,6 +54,7 @@
 | I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、凭据驱动的对话路由、请求期内路由到 Runtime 自有协议适配器和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/回滚、跨租户、SSE、CORS、SSE 全程持有租约、Resolver 关闭后返回 `runtime_unavailable` | partial |
 | I07 | 可信 Chat 身份 | `trpcservice/identity/`：Identity/Authenticator、静态 API Key 只存 SHA-256 摘要、`RunContext` 经不可导出 context key 传递；`trpcservice/agent/contextrunner.go`：协议层 `userID`/`sessionID` 被丢弃，作用域与 Runtime 不符则 fail closed | `go test -race ./trpcservice/identity ./trpcservice/agent ./trpcservice/web`：摘要映射与拷贝隔离、未知凭据 fail closed、无 RunContext 拒绝执行、包装器 `Close` 不关闭真实 Runner、认证矩阵 401/403、请求体 `user` 无法进入 Session 键空间 | partial |
 | I08 | Session Revision Pin | `trpcservice/sessiondir/`：`{tenant, app, principal, session, epoch}` 键、单锁 `EnsurePin` 首写即线性化点；`trpcservice/web/platform.go`：查 Pin → 解析候选 → EnsurePin → 落败方释放租约后改用胜出版本 | `go test -race ./trpcservice/sessiondir ./trpcservice/web`：32 并发候选唯一胜出、租户/主体隔离、发布与回滚不改旧 Pin、相同 hint 放行且不同 hint `409`、屏障化并发首轮两侧同版本且 `resolver.Close` 能完成（证明落败租约已释放） | partial |
+| I09 | 持久化 Session 后端 Spike | `trpcservice/sessionbackend/sessionbackend.go`：`New(Config)` 构造 InMemory/PostgreSQL/Redis 三种 `session.Service`，校验先于会 panic 的上游选项、拒绝会静默回退到 localhost 的空 DSN、对自产错误脱敏连接串口令；`deploy/docker-compose.session.yml` 提供仅监听 `127.0.0.1` 的本地依赖。默认后端仍是 InMemory，`cmd/trpc-service` 启动路径未改动 | `go test -race ./trpcservice/sessionbackend`（默认不触网）；`TRPC_SERVICE_SESSION_INTEGRATION=1` 下对真实 PostgreSQL 16/Redis 7 验证往返、`GetSession` 缺失返回 `(nil,nil)`、`CreateSession` 二次调用的后端分歧、Delete 后从读路径消失、`Close` 幂等、Redis key 前缀隔离，命令见 [Session 后端 Spike](session-backend.md#7-集成测试的运行方式) | partial |
 
 ## 已知限制
 
@@ -63,6 +64,7 @@
 - **首轮 OpenAI 历史可以伪造。** 平台只决定会话归属，不校验请求体 `messages`；新 Session 的第一轮可以注入编造的"历史对话"。
 - **Adapter 拒绝的请求也会建立 Pin。** Session 与 Revision 在调用上游 Adapter 之前确定，格式错误的首轮同样会钉住该 Session。
 - **Pin 只在单进程内存中**，多节点部署会各自 Pin 到各自看到的默认版本。
+- **持久 Session 会打破 Pin 的重启不变量。** Session 目录在进程内存中，而 [Session 后端 Spike](session-backend.md) 验证过的 PostgreSQL/Redis 后端会让会话数据跨重启存活：重启后 Session 数据还在、Pin 已丢失，旧会话下一轮会被重新 Pin 到当前默认版本，用户无感知地换了 Agent 版本。当前 Session 仍是内存实现，会话与 Pin 一起消失，语义是自洽的；因此在跨进程 Session Directory 落地之前，不得把默认 Session 后端切到持久化实现。
 - **对话面认证不等于平台生产安全。** Admin API 仍完全未认证，进程只能绑定本机地址。
 
 ## 验收使用方式
