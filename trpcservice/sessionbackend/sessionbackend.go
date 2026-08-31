@@ -278,7 +278,7 @@ func newPostgres(cfg PostgresConfig) (session.Service, error) {
 	}
 	service, err := sessionpostgres.NewService(opts...)
 	if err != nil {
-		return nil, scrub(
+		return nil, Scrub(
 			fmt.Errorf("sessionbackend: create postgres session service: %w", err),
 			cfg.DSN,
 		)
@@ -293,7 +293,7 @@ func newRedis(cfg RedisConfig) (session.Service, error) {
 	}
 	service, err := sessionredis.NewService(opts...)
 	if err != nil {
-		return nil, scrub(
+		return nil, Scrub(
 			fmt.Errorf("sessionbackend: create redis session service: %w", err),
 			cfg.URL,
 		)
@@ -301,29 +301,108 @@ func newRedis(cfg RedisConfig) (session.Service, error) {
 	return service, nil
 }
 
-// scrub replaces every secret of connString wherever it appears in err.
-// Drivers echo the string they failed to parse or dial, so an unscrubbed error
-// puts the password into whatever log the caller writes it to.
+// Scrub replaces every password of connectionString wherever it appears in
+// err, and returns the result.
 //
-// A scrubbed error is a fresh error: it deliberately does not wrap the
-// original, because an Unwrap chain would hand the secret straight back.
-func scrub(err error, connString string) error {
+// Drivers echo the string they failed to parse or dial, so an unscrubbed error
+// puts the password into whatever log the caller writes it to. pgx does redact
+// its own ParseConfigError, but only the copy of the connection string it
+// keeps: the error it wraps is a parse failure reported against the original,
+// and one of those failures quotes the password back verbatim (see
+// urlPasswords). So every error built from a connection string has to pass
+// through here, not only the ones this package produces.
+//
+// It understands both shapes the upstream backends accept: a URL with userinfo
+// ("postgres://user:password@host/db"), including the percent-encoded spelling
+// a driver echoes back, and libpq keyword form ("host=... password='p@ss
+// w0rd'").
+//
+// The scope of the guarantee, which must not be overstated:
+//
+//   - Only passwords are removed. The user, host and database name stay,
+//     because an operator needs them to know which connection failed.
+//   - A redacted error is a fresh error carrying the redacted text only. It
+//     deliberately does not wrap the original, because an Unwrap chain would
+//     hand the secret straight back — so errors.Is and errors.As no longer
+//     match once redaction has happened. That is the price of the guarantee.
+//   - An error that contained no password is returned exactly as it came in,
+//     chain included, and a nil error stays nil.
+//   - Redaction is decided on the rendered message. A value hidden in a struct
+//     field of some error type, rather than in its Error text, is out of reach,
+//     as is anything a driver writes to its own logs, traces or stderr.
+//   - Matching is by substring, so a password a driver reshapes before printing
+//     is only removed where the reshaped text is one this package knows about.
+//     The one such text pgx is known to produce is handled; see
+//     quotedPortPattern.
+//
+// Scrub is safe to apply twice: the second pass finds nothing left to replace
+// and returns its input unchanged.
+func Scrub(err error, connectionString string) error {
 	if err == nil {
 		return nil
 	}
 	original := err.Error()
 	scrubbed := original
-	secrets := secretsOf(connString)
+	secrets := secretsOf(connectionString)
 	// Longest first, so redacting a short secret cannot leave a fragment of a
 	// longer one that happens to contain it.
 	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
 	for _, secret := range secrets {
+		if len(secret) < minGlobalRedaction {
+			// Too short to blank everywhere: a one-character secret occurs
+			// inside ordinary words, and replacing every occurrence would
+			// destroy the message while telling the operator nothing. It is
+			// still removed from the one position a parser is known to quote it
+			// into, immediately below.
+			continue
+		}
 		scrubbed = strings.ReplaceAll(scrubbed, secret, redacted)
 	}
+	scrubbed = redactQuotedPort(scrubbed, secrets)
 	if scrubbed == original {
 		return err
 	}
 	return errors.New(scrubbed)
+}
+
+// quotedPortPattern matches the only error text observed to quote a password
+// back in a shape that substring replacement cannot reach. url.Parse ends the
+// authority at the first authorityDelimiters rune, so a password containing one
+// unencoded is re-read as "host:port", and the parser quotes the text before
+// that separator as the offending port. pgx renders that error verbatim:
+//
+//	postgres://user:p/secret@host:notaport/db
+//	  -> cannot parse `postgres://user:xxxxxx@host:notaport/db`:
+//	     failed to parse as URL (invalid port ":p" after host)
+//
+// The fragment is bounded only by the password, so it can be a single character
+// — which is exactly why it needs a targeted rule rather than a global one.
+var quotedPortPattern = regexp.MustCompile(`invalid port ":([^"]*)" after host`)
+
+// redactQuotedPort replaces the port quoted by quotedPortPattern, and only that
+// port, when it is part of one of the connection string's secrets.
+//
+// The containment test is what keeps an ordinary diagnostic intact: a genuine
+// port typo is not part of the password, so `invalid port ":notaport"` survives
+// and still tells the operator what was wrong. It is also what makes the
+// function idempotent, since the redaction marker is part of no secret.
+func redactQuotedPort(message string, secrets []string) string {
+	return quotedPortPattern.ReplaceAllStringFunc(message, func(match string) string {
+		fragment := quotedPortPattern.FindStringSubmatch(match)[1]
+		if fragment == "" || !partOfAnySecret(fragment, secrets) {
+			return match
+		}
+		return `invalid port ":` + redacted + `" after host`
+	})
+}
+
+func partOfAnySecret(fragment string, secrets []string) bool {
+	for _, secret := range secrets {
+		if strings.Contains(secret, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 // secretsOf returns the substrings of a connection string that must never be
@@ -332,14 +411,15 @@ func scrub(err error, connString string) error {
 // ("host=... password=...").
 func secretsOf(connString string) []string {
 	var secrets []string
-	if parsed, err := url.Parse(connString); err == nil && parsed.User != nil {
-		if password, ok := parsed.User.Password(); ok && password != "" {
-			secrets = append(secrets, password)
-			// Password decodes percent escapes, but a driver echoes the DSN
-			// as it was written, so the encoded spelling has to go too.
-			if _, encoded, found := strings.Cut(parsed.User.String(), ":"); found && encoded != password {
-				secrets = append(secrets, encoded)
-			}
+	for _, password := range urlPasswords(connString) {
+		// The spelling as written first: a driver echoes the string as it was
+		// given to it.
+		secrets = append(secrets, password)
+		// And the decoded one, because a driver that unescapes the userinfo
+		// before reporting it prints something the written form does not match.
+		// An invalid escape sequence simply has no decoded spelling.
+		if decoded, err := url.PathUnescape(password); err == nil && decoded != password && decoded != "" {
+			secrets = append(secrets, decoded)
 		}
 	}
 	for _, field := range keywordFields(connString) {
@@ -348,6 +428,105 @@ func secretsOf(connString string) []string {
 		}
 	}
 	return secrets
+}
+
+// authorityDelimiters end the authority of a URL. A password containing one
+// unencoded is therefore not inside the userinfo as far as any parser is
+// concerned, which is what urlPasswords has to work around.
+const authorityDelimiters = "/?#"
+
+// minGlobalRedaction is the shortest secret Scrub will blank everywhere in a
+// message. Below it, a blind replacement costs more than it buys: "p" occurs
+// inside "parse", "port" and "host", so replacing every occurrence would leave
+// an unreadable error. Shorter secrets are not conceded — they are redacted by
+// position instead, in redactQuotedPort.
+const minGlobalRedaction = 3
+
+// urlPasswords returns every spelling of the password of a URL-form connection
+// string that an error might contain, or nil when there is none.
+//
+// A parseable URL has two that matter: the one written in the string, which is
+// what a driver echoing the DSN prints, and the percent-decoded one, which is
+// what the driver authenticates with.
+//
+// An unparseable URL is the case that matters more, because it is the one that
+// leaks. The authority ends at the first authorityDelimiters rune, so a password
+// containing one unencoded puts the "@" that would delimit the userinfo out of
+// scope before it is ever looked for — for url.Parse and for authorityPassword
+// alike. pgx then reports the text before that separator as the port:
+//
+//	postgres://user:s3cret/x@host:5432/db
+//	  -> cannot parse `postgres://user:xxxxxx@host:5432/db`:
+//	     failed to parse as URL (invalid port ":s3cret" after host)
+//
+// pgx redacted its own copy of the userinfo and printed the password anyway, so
+// this function cannot rely on a parser to find it. When the grammar's bounds
+// yield no password it guesses instead, from the whole span between the first
+// ":" and the last "@", plus each delimiter-free fragment of that span, since a
+// re-parse is what quotes a fragment back.
+//
+// Fragments are returned whatever their length. Scrub decides which of them are
+// safe to blank everywhere and which have to be redacted by position instead.
+func urlPasswords(connString string) []string {
+	_, afterScheme, found := strings.Cut(connString, "://")
+	if !found {
+		return nil
+	}
+	var passwords []string
+	if parsed, err := url.Parse(connString); err == nil && parsed.User != nil {
+		if password, ok := parsed.User.Password(); ok {
+			passwords = append(passwords, password)
+		}
+	}
+	// For a URL that parses, this always finds the written spelling, so the
+	// guessing below is reached only when the grammar itself locates nothing.
+	if written := authorityPassword(afterScheme); written != "" {
+		return append(passwords, written)
+	}
+	at := strings.LastIndex(afterScheme, "@")
+	if at < 0 {
+		return passwords
+	}
+	_, span, found := strings.Cut(afterScheme[:at], ":")
+	if !found || span == "" {
+		return passwords
+	}
+	passwords = append(passwords, span)
+	for _, fragment := range strings.FieldsFunc(span, isAuthorityDelimiter) {
+		if fragment != span {
+			passwords = append(passwords, fragment)
+		}
+	}
+	return passwords
+}
+
+// authorityPassword returns the password written in the authority of a
+// post-scheme connection string, by the URL grammar's own bounds: the authority
+// ends at the first authorityDelimiters rune, the userinfo ends at the last "@"
+// within it (so an unencoded "@" inside a password is still found), and the
+// password is whatever follows the first ":".
+//
+// An empty result is a signal rather than an answer: for a string url.Parse
+// accepts it means there is genuinely no password, and for one it rejects it
+// means the password is in the shape that leaks.
+func authorityPassword(afterScheme string) string {
+	authority := afterScheme
+	if end := strings.IndexAny(afterScheme, authorityDelimiters); end >= 0 {
+		authority = afterScheme[:end]
+	}
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return ""
+	}
+	_, password, found := strings.Cut(authority[:at], ":")
+	if !found {
+		return ""
+	}
+	return password
+}
+
+func isAuthorityDelimiter(r rune) bool {
+	return strings.ContainsRune(authorityDelimiters, r)
 }
 
 // keywordFields splits a libpq keyword connection string into its key=value

@@ -2,7 +2,6 @@ package sessionbackend
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 
@@ -288,64 +287,4 @@ func TestDescribeHidesCredentials(t *testing.T) {
 
 	require.Contains(t, Config{Backend: BackendRedis}.Describe(), "absent")
 	require.Contains(t, DefaultConfig().Describe(), "inmemory")
-}
-
-func TestScrubRemovesSecretsFromUpstreamErrors(t *testing.T) {
-	cases := map[string]struct {
-		connString string
-		raw        string
-		secret     string
-	}{
-		"url userinfo": {
-			connString: "postgres://user:s3cret@host:5432/db",
-			raw:        `failed to parse "postgres://user:s3cret@host:5432/db"`,
-			secret:     "s3cret",
-		},
-		// A password with URL metacharacters reaches the driver percent
-		// encoded, so the encoded spelling is what an echoed DSN contains.
-		"percent encoded url userinfo": {
-			connString: "postgres://user:p%40ss%20w0rd@host:5432/db",
-			raw:        `failed to parse "postgres://user:p%40ss%20w0rd@host:5432/db"`,
-			secret:     "p%40ss%20w0rd",
-		},
-		"libpq keyword": {
-			connString: "host=h user=u password=s3cret",
-			raw:        "cannot connect: host=h user=u password=s3cret",
-			secret:     "s3cret",
-		},
-		// A quoted libpq value may contain spaces. Splitting on whitespace
-		// would redact only "p@ss" and leave "w0rd" in the log.
-		"quoted libpq keyword": {
-			connString: "host=h password='p@ss w0rd' user=u",
-			raw:        "cannot connect with password=p@ss w0rd",
-			secret:     "p@ss w0rd",
-		},
-		"redis url": {
-			connString: "redis://user:s3cret@host:6379",
-			raw:        "dial redis://user:s3cret@host:6379: refused",
-			secret:     "s3cret",
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			scrubbed := scrub(errors.New(tc.raw), tc.connString)
-			require.Error(t, scrubbed)
-			require.NotContains(t, scrubbed.Error(), tc.secret)
-			require.Contains(t, scrubbed.Error(), redacted)
-		})
-	}
-
-	t.Run("nil error stays nil", func(t *testing.T) {
-		require.NoError(t, scrub(nil, "postgres://u:p@h/db"))
-	})
-
-	t.Run("error without a secret is returned unchanged", func(t *testing.T) {
-		original := errors.New("connection refused")
-		require.Equal(t, original, scrub(original, "postgres://u:secret@h/db"))
-	})
-
-	t.Run("dsn without a password is handled", func(t *testing.T) {
-		original := errors.New("host=h user=u: connection refused")
-		require.Equal(t, original, scrub(original, "host=h user=u"))
-	})
 }

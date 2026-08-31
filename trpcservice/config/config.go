@@ -55,6 +55,40 @@ func SeedDemo(ctx context.Context, repository tenant.Repository) error {
 	if err != nil && !errors.Is(err, tenant.ErrAlreadyExists) {
 		return fmt.Errorf("config: create demo revision: %w", err)
 	}
+	// Publishing is the one step that is not naturally idempotent, so it is the
+	// one step that has to ask first.
+	//
+	// Every create above tolerates ErrAlreadyExists, which used to make the
+	// whole function safe to re-run: with an in-memory repository a restart
+	// started from an empty store, so re-publishing echo-v1 only restated what
+	// the previous boot had done. Against a persistent repository that is no
+	// longer true. An operator who publishes echo-v2 and then restarts the
+	// process would find the default silently moved back to echo-v1 — a
+	// bootstrap helper undoing a deliberate deployment, on nothing more than a
+	// process lifecycle event.
+	//
+	// So the app's current routing decides: seed publishes only when there is
+	// none. A first boot, or a boot that resumes after a crash between creating
+	// the revision and publishing it, still ends with echo-v1 serving; every
+	// later boot leaves whatever is published alone.
+	//
+	// Concurrent boots are safe. Each one tolerates the others' creates, and
+	// only reaches this point once the revision exists, so the worst case is
+	// two processes publishing the same echo-v1 — the same write twice, not a
+	// conflict. What this does not close is an operator publishing echo-v2 in
+	// the window between the read below and the publish that follows: this
+	// reads and writes in two steps, and the Repository has no
+	// publish-if-unpublished primitive to make it one. That window is a few
+	// milliseconds during startup, against a manual action, and closing it
+	// would mean a new control-plane operation for the benefit of a bootstrap
+	// helper.
+	app, err := repository.GetAgentApp(ctx, scope, DemoAgentAppID)
+	if err != nil {
+		return fmt.Errorf("config: read demo app routing: %w", err)
+	}
+	if app.RoutingPolicy.DefaultRevisionID != "" {
+		return nil
+	}
 	if _, _, err = repository.PublishRevision(
 		ctx, scope, DemoAgentAppID, DemoRevisionID,
 	); err != nil {

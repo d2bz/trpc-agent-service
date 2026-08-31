@@ -2,7 +2,9 @@
 
 本文记录 `trpcservice/sessionbackend` 这一次 Spike 的验证结论。目的只有一个：在写共享 Session 之前，先把上游 PostgreSQL 与 Redis Session 实现的真实行为测出来，把它们与内存实现的语义差异写成事实，而不是等到平台层依赖了某个假设才发现。
 
-**当前状态是 `partial`。** 这次 Spike 只交付一个构造函数和它的测试，不改变服务的默认行为：`cmd/trpc-service` 仍然启动 InMemory Session，进程里没有任何代码调用 PostgreSQL 或 Redis 后端。本文所有"支持"的说法都指"工厂能构造出来并通过集成测试"，不指"平台已经在用"。
+**当前状态是 `partial`。** Spike 本身只交付了一个构造函数和它的测试。之后 `cmd/trpc-service` 接了一个进程级存储 profile：默认（不设 `TRPC_SERVICE_STORAGE_PROFILE`，或设为 `inmemory`）仍然启动 InMemory Session，进程不建立任何连接；设为 `postgres` 时，控制面、Session Directory 和上游 Session 存储会一起切到同一个 PostgreSQL 的同一个 schema。见 [§8 进程存储 Profile](#8-进程存储-profile)。
+
+Redis 后端仍然只有工厂能构造，没有任何进程配置能启用它——本文第 4 节以后关于 Redis 的"支持"指的是"工厂能构造出来并通过集成测试"，不指"平台已经在用"。
 
 ## 1. 交付范围
 
@@ -133,12 +135,29 @@ session_summaries  app_states  user_states
 
 `New` 返回错误前，会把连接串里的密码替换成 `[REDACTED]`——驱动经常把解析失败或拨号失败的连接串原样回显，未处理的错误会把密码写进调用方的日志。实现同时覆盖 URL userinfo 形式（含 percent-encoded 拼写）和 libpq keyword 形式（含单引号包裹的带空格值）。
 
+这段逻辑以 `Scrub(err error, connectionString string) error` 导出，因为拿着 DSN 的不只是本包：`cmd/trpc-service` 建连接池、Ping、跑迁移和关闭资源时产生的错误，全部经过同一个 `Scrub`。它是幂等的，重复调用不会二次改写。
+
+**pgx 自己的脱敏不够，这一点是这个函数存在的直接原因。** `pgconn.ParseConfigError.Error()` 只脱敏它自己保存的那份连接串副本，而它包着的解析错误是拿原始连接串去解析失败得到的，里面可能带着从原串里切出来的片段。（当前 pinned 的 pgx **不会**把整条原始 DSN 拼进消息——它把 `url.Parse` 的 `*url.Error` 拆到只剩裸消息；早前文档里"回显原文"的说法据此更正。`Scrub` 作为公开 API 仍然覆盖"驱动整条回显 DSN"这种情况，但那是通用契约，不是当前 pgx 的行为。）实测下来真正会漏的是这一条：密码里带一个未编码的 `/`，authority 就在那里截断，本该分隔 userinfo 的 `@` 根本轮不到被看见，解析器把 `/` 之前的那段当成端口原样引用出来——
+
+```
+postgres://user:s3cret/x@host:5432/db
+  -> cannot parse `postgres://user:xxxxxx@host:5432/db`:
+     failed to parse as URL (invalid port ":s3cret" after host)
+```
+
+注意 host 和 port 本身完全合法，是密码让这个串不可解析的，所以「DSN 其它部分写对了」并不构成保护；pgx 把自己那份 userinfo 改写成了 `xxxxxx`，密码照样印了出来。
+
+于是密码不能只靠 `url.Parse` 提取，因为泄漏恰好发生在解析失败的时候。`urlPasswords` 分两条路：能解析的 URL 取 `url.URL.User.Password()`（驱动真正拿去认证的解码后拼写）加上串里写的原始拼写；解析不了、且按 URL 语法的边界（authority 止于第一个 `/`、`?`、`#`，userinfo 止于其中最后一个 `@`）也切不出密码时，才退回保守猜测：取第一个 `:` 到最后一个 `@` 之间的整段，再加上这段里每个不含分隔符的片段——因为被回显的正是重新解析切出来的片段。
+
+**被引用出来的片段可以只有一个字符，所以脱敏分两遍。** 密码是 `p/secret` 时，pgx 报的就是 `invalid port ":p" after host`：全局替换单个 `p` 会把 `parse`、`port`、`host` 一起打烂，但把它留在原地就是凭据片段泄漏，两者都不能接受。所以长度 ≥ 3 的密码走全局子串替换，短于 3 的**按位置**替换——只在 `quotedPortPattern`（`invalid port ":<片段>" after host`，即目前唯一实测会回显密码片段的错误结构）命中的那个位置动手，且只在该片段确实属于本连接串的密码时才动。因此真正的端口笔误（`invalid port ":notaport"`）原样保留，仍然是可用的诊断信息；这条判断由 `TestScrubKeepsAQuotedPortThatIsNotPartOfThePassword` 钉住。
+
 **这个保证的范围必须说清楚，不能夸大：**
 
-- 只覆盖 **本包生成并返回的 error**。
+- 只覆盖 **交给 `Scrub` 的 error**，且只按渲染出来的文本判断——藏在某个 error 结构体字段里、不出现在 `Error()` 文本中的值，够不着。
 - **不覆盖** 上游或驱动自己写到日志、metrics、trace span 或 stderr 的内容——本包看不到那些路径。
 - 脱敏后的 error 是一个全新 error，**故意不 wrap 原错误**，否则 `errors.Unwrap` 会把密码原样交回去。代价是上游的错误类型无法用 `errors.As` 取出；这是有意的取舍。
 - 只处理密码。用户名、主机、库名照常出现在错误里。
+- 按子串匹配。驱动若把密码改写成本包不认识的形状再打印，只有已知的那一种改写（`quotedPortPattern`）会被按位置脱敏；出现新的改写形状时，需要补一条同样有实验依据的定向规则。
 - `Config.Describe()` 用于日志，只报告连接串"存在/不存在"，从不输出内容。
 
 ### 5.5 Close 所有权
@@ -176,7 +195,7 @@ session_summaries  app_states  user_states
 
 **换句话说，Session 持久化会把 Pin 的不变量从"重启即全丢，语义一致"降级为"数据在但 Pin 不在，语义破裂"。** 现在 Session 在内存里，重启后会话和 Pin 一起消失，反而是自洽的；单独把 Session 持久化会打破这个自洽。
 
-因此：**在跨进程 Session Directory 落地之前，不得把默认 Session 后端切换到持久化实现。** 该限制已登记在[验收矩阵](acceptance.md#已知限制)。
+**这一格已经由 §8 的进程存储 profile 关掉——只关掉了这一格。** profile 不提供"只持久化 Session"这个选项：三者绑在同一个 DSN 和同一个 schema 上，要么一起在内存里，要么一起在 PostgreSQL 里，上表右列因此无法被配置出来。它没有解决的，仍然一条都没解决：双 Worker 的写并发、租约与 fencing、租户级路由、Redis profile。多个进程指向同一个 schema 时，控制面与 Pin 是一致的，但对同一个会话的并发写入依然没有任何互斥。该限制的当前表述见[验收矩阵](acceptance.md#已知限制)。
 
 ## 7. 集成测试的运行方式
 
@@ -216,3 +235,71 @@ Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis）�
 > Compose 文件里的 `trpc-local-dev` 是**本地开发占位口令**，为了让 Spike 在空机器上可复现才写进仓库。它不是生产 secret，也不得被当作生产 secret：两个服务都只绑定 `127.0.0.1`，主机之外无法访问。真实部署必须自行通过环境变量提供凭据，绝不能继承这里的默认值。
 
 健康检查两处细节值得留意，都会影响 `up --wait` 的正确性：`pg_isready` 必须带 `-h 127.0.0.1`，因为首次 initdb 期间入口脚本会先起一个只监听 unix socket 的临时服务，走 socket 的探测会过早报告就绪；`redis-cli ping` 必须匹配 `PONG` 而不是只看退出码，因为数据集加载中的 `LOADING` 回复退出码同样是 0。
+
+## 8. 进程存储 Profile
+
+`cmd/trpc-service` 用一个进程级 profile 决定自己把状态放在哪里。实现在 `cmd/trpc-service/storage.go`。
+
+### 8.1 一个 profile，不是三个开关
+
+进程要存的三样东西——控制面（租户 / 应用 / Revision）、Session→Revision 的 Pin、会话历史——是一组，不是三个独立选择。§6.1 那张表就是拆开配置的后果：Pin 活过重启但它指向的 Revision 随内存控制面一起没了，等于没有 Pin；反过来 Pin 丢了而会话还在，会话会被静默重新 Pin 到当前默认 Revision。因此 profile 只有一个，三者一起动。
+
+**Redis 不是一个 profile。** 工厂能构造 Redis Session 服务，但仓库里没有 Redis 的控制面 Repository，也没有 Redis 的 Session Directory；把它开出来，开出来的恰好就是上面那个已知会坏的组合。
+
+### 8.2 环境变量
+
+| 变量 | 取值 | 说明 |
+| --- | --- | --- |
+| `TRPC_SERVICE_STORAGE_PROFILE` | 空 / 未设 / `inmemory` / `postgres` | 大小写敏感，不做 trim。`Postgres`、`pg`、`redis`、带空格的值一律拒绝启动，并在错误里列出合法值 |
+| `TRPC_SERVICE_POSTGRES_DSN` | 连接串 | 当且仅当 profile 为 `postgres` 时必需且不得为空白。**从不写日志**，所有相关错误经 `Scrub` 脱敏 |
+| `TRPC_SERVICE_POSTGRES_SCHEMA` | 标识符 | 可选，规则复用 `sessionbackend` 的校验（`^[A-Za-z_][A-Za-z0-9_]*$`，最长 32）。schema **必须事先存在**，进程只建表不建 schema |
+
+两条刻意的选择：
+
+- **`inmemory` 完全不读 PostgreSQL 变量。** 环境里遗留的 DSN 不会改变 inmemory 进程的行为，更不会把进程"升级"成持久化——DSN 的存在**永远不能**选择 profile。要写共享数据库，必须显式点名。
+- **拼错就拒绝启动，不静默回退。** 回退到内存的进程看起来是健康的，直到重启丢掉全部会话才被发现。
+
+启动日志只打印 profile、DSN 存在与否、schema 名，从不打印连接串内容。
+
+### 8.3 启动与关闭顺序
+
+顺序本身就是实现的主要内容，逐条都有原因：
+
+1. 先校验监听地址。Admin API 无鉴权，这条守卫必须排在任何可能连数据库的动作之前。
+2. 读取并整体校验存储配置，此时还没有创建任何资源；schema 拼错在这一步就失败，而不是迁移跑到一半才失败。
+3. 解析 pgx 连接池配置，把校验过的 schema 写进 `search_path`（写在 pool config 上而不是 checkout 后 `SET`，这样连接池后来新开的连接也带同一个 `search_path`）。
+4. 建池，**并立即登记关闭动作**——之后任何一步失败都不会漏掉这个池。
+5. 在带超时的上下文里 `Ping`。`pgxpool.NewWithConfig` 不拨号，而上游 Session 构造函数建表时用的是它自己的、**不可取消**的 background 上下文；不可达的库必须在进入上游之前、在调用方的 deadline 还有效时暴露出来。
+6. 依次跑 `tenantpostgres.Migrate` 和 `sessiondirpostgres.Migrate`（都持咨询锁、都是 `IF NOT EXISTS`，每个 worker 每次启动都跑是安全的）。
+7. 构造 Repository 与 Directory（共用同一个池，两者都只借用、都不关闭）；再构造上游 Session 服务（它自己持有并拥有另一个池）。
+8. 最后才 `SeedDemo`——它要写控制面，必须在迁移之后。
+
+关闭顺序是它的严格逆序：HTTP 优雅关闭（在 `waitForStop` 里）→ Resolver（等待在途 runtime 交还租约）→ Session 服务 → 共享连接池。启动中途失败时只关闭已经建成的那些资源，同样逆序；**关闭错误用 `errors.Join` 合并进进程退出错误，不再是打条日志就丢掉**——一个"关闭时没刷完"的 Session 服务，一周后表现为"每段会话最后一轮不见了"。
+
+### 8.4 快速开始
+
+```bash
+docker compose -f deploy/docker-compose.session.yml up -d --wait
+
+# schema 必须先存在；进程只建表。
+psql 'postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_session' \
+  -c 'CREATE SCHEMA IF NOT EXISTS trpc_service'
+
+TRPC_SERVICE_STORAGE_PROFILE=postgres \
+TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_session?sslmode=disable' \
+TRPC_SERVICE_POSTGRES_SCHEMA=trpc_service \
+./bin/trpc-service -addr 127.0.0.1:8080
+```
+
+不设 `TRPC_SERVICE_STORAGE_PROFILE` 时行为与以前完全一致：空机器、无网络也能启动。
+
+### 8.5 这一层的测试
+
+- `cmd/trpc-service/storage_test.go`：不触网。覆盖默认 profile、`inmemory` 忽略遗留 DSN、缺失/空白 DSN、非法 profile、非法与超长 schema、连接串解析错误不泄漏密码（含 percent-encoded 拼写）、以及启动中途失败时按逆序关闭且关闭错误不被吞掉——失败注入用的是一个只有五个函数的 seam，不是 mock 框架。
+- `cmd/trpc-service/integration_test.go`：默认跳过，门控与 §7 相同（`TRPC_SERVICE_SESSION_INTEGRATION=1` 加 `TRPC_SERVICE_POSTGRES_DSN`）。每个用例建一个一次性 schema 并在结束时 `DROP ... CASCADE`（上游只建表不删表，这是唯一会回收那 6 张表的地方）。断言走真实的 profile 构造路径：两族迁移和上游 6 张表都在、Pin 与真实会话历史跨"重启"存活、重启后的 `SeedDemo` 不会把已发布的 `echo-v2` 改回 `echo-v1`。
+
+```bash
+TRPC_SERVICE_SESSION_INTEGRATION=1 \
+TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_session?sslmode=disable' \
+go test -race -count=1 -timeout 300s ./cmd/trpc-service/...
+```

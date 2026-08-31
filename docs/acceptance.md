@@ -4,7 +4,7 @@
 
 | ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
 | --- | --- | --- | --- | --- |
-| A01 | 多租户模型与配置 | [数据模型](data-model.md#31-tenant)、[总体架构](architecture.md#4-控制面) | 已实现 Admin API、内存 Repository、不可变 Revision、发布/路由和隔离测试；对话面已有静态 API Key 认证，Admin 认证和 PostgreSQL 待实现 | partial |
+| A01 | 多租户模型与配置 | [数据模型](data-model.md#31-tenant)、[总体架构](architecture.md#4-控制面) | 已实现 Admin API、不可变 Revision、发布/路由和隔离测试；Repository 有内存与 PostgreSQL 两套实现，由 I10 的进程存储 profile 选择；对话面已有静态 API Key 认证，Admin 认证待实现 | partial |
 | A02 | Gateway、Worker、Channel、Storage、Admin、Telemetry 节点协作 | [架构图](architecture.md#2-系统架构图) | 待实现多角色启动和 Compose | planned |
 | A03 | 多节点水平扩展与 Session 路由 | [数据面](architecture.md#5-数据面)、[节点部署](architecture.md#6-节点部署) | 待实现双 Worker 集成测试 | planned |
 | A04 | 无 sticky session 与共享 Session/Memory | [设计结论](architecture.md#1-设计结论)、[并发](storage-and-consistency.md#4-同一-session-并发) | 待实现跨 Worker 连续会话测试 | planned |
@@ -29,7 +29,7 @@
 | A23 | 密钥管理和脱敏 | [控制面配置](architecture.md#42-配置传播)、[治理](solution.md#56-治理与安全) | 待实现 Secret Resolver 和泄漏测试 | planned |
 | A24 | 节点/IM/数据库/模型/Tool 故障恢复 | [故障恢复](solution.md#58-故障恢复)、[故障降级](storage-and-consistency.md#8-故障与降级) | 待实现故障注入测试 | planned |
 | A25 | Context、goroutine、Event Channel 排空 | [并发与故障边界](architecture.md#7-并发与故障边界) | 待实现 goleak/取消/排空测试 | planned |
-| A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及进程内 Session Revision Pin：发布和回滚都不会改变已开始的会话；权重灰度和跨进程 Pin 待实现 | partial |
+| A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及 Session Revision Pin：发布和回滚都不会改变已开始的会话；`postgres` profile 下 Pin 与控制面同库，重启和多进程都能读到同一个 Pin（见 I10），权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
 | D01 | 2000-4000 字架构方案 | [正式提交方案](submission-2026-08-27.md) | 1.0 中文正文 3288 字，已完成提交前检查 | partial |
@@ -54,17 +54,19 @@
 | I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、凭据驱动的对话路由、请求期内路由到 Runtime 自有协议适配器和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/回滚、跨租户、SSE、CORS、SSE 全程持有租约、Resolver 关闭后返回 `runtime_unavailable` | partial |
 | I07 | 可信 Chat 身份 | `trpcservice/identity/`：Identity/Authenticator、静态 API Key 只存 SHA-256 摘要、`RunContext` 经不可导出 context key 传递；`trpcservice/agent/contextrunner.go`：协议层 `userID`/`sessionID` 被丢弃，作用域与 Runtime 不符则 fail closed | `go test -race ./trpcservice/identity ./trpcservice/agent ./trpcservice/web`：摘要映射与拷贝隔离、未知凭据 fail closed、无 RunContext 拒绝执行、包装器 `Close` 不关闭真实 Runner、认证矩阵 401/403、请求体 `user` 无法进入 Session 键空间 | partial |
 | I08 | Session Revision Pin | `trpcservice/sessiondir/`：`{tenant, app, principal, session, epoch}` 键、单锁 `EnsurePin` 首写即线性化点；`trpcservice/web/platform.go`：查 Pin → 解析候选 → EnsurePin → 落败方释放租约后改用胜出版本 | `go test -race ./trpcservice/sessiondir ./trpcservice/web`：32 并发候选唯一胜出、租户/主体隔离、发布与回滚不改旧 Pin、相同 hint 放行且不同 hint `409`、屏障化并发首轮两侧同版本且 `resolver.Close` 能完成（证明落败租约已释放） | partial |
-| I09 | 持久化 Session 后端 Spike | `trpcservice/sessionbackend/sessionbackend.go`：`New(Config)` 构造 InMemory/PostgreSQL/Redis 三种 `session.Service`，校验先于会 panic 的上游选项、拒绝会静默回退到 localhost 的空 DSN、对自产错误脱敏连接串口令；`deploy/docker-compose.session.yml` 提供仅监听 `127.0.0.1` 的本地依赖。默认后端仍是 InMemory，`cmd/trpc-service` 启动路径未改动 | `go test -race ./trpcservice/sessionbackend`（默认不触网）；`TRPC_SERVICE_SESSION_INTEGRATION=1` 下对真实 PostgreSQL 16/Redis 7 验证往返、`GetSession` 缺失返回 `(nil,nil)`、`CreateSession` 二次调用的后端分歧、Delete 后从读路径消失、`Close` 幂等、Redis key 前缀隔离，命令见 [Session 后端 Spike](session-backend.md#7-集成测试的运行方式) | partial |
+| I09 | 持久化 Session 后端 Spike | `trpcservice/sessionbackend/sessionbackend.go`：`New(Config)` 构造 InMemory/PostgreSQL/Redis 三种 `session.Service`，校验先于会 panic 的上游选项、拒绝会静默回退到 localhost 的空 DSN、对自产错误脱敏连接串口令；`deploy/docker-compose.session.yml` 提供仅监听 `127.0.0.1` 的本地依赖。脱敏逻辑现已导出为 `Scrub(error, string) error`，供 I10 的连接池与迁移错误路径复用。工厂本身不选择后端，进程用哪一个由 I10 决定 | `go test -race ./trpcservice/sessionbackend`（默认不触网）；`TRPC_SERVICE_SESSION_INTEGRATION=1` 下对真实 PostgreSQL 16/Redis 7 验证往返、`GetSession` 缺失返回 `(nil,nil)`、`CreateSession` 二次调用的后端分歧、Delete 后从读路径消失、`Close` 幂等、Redis key 前缀隔离；`Scrub` 的公开测试覆盖 URL userinfo、percent-encoded 拼写、libpq 引号形式、**连接串本身解析失败**（密码含未编码 `/` 时 authority 提前截断，pgx 把 `/` 之前那段当端口原样引用出来的那条路径，已用真实 pgx 输出固定；含单字符片段的按位置脱敏与端口笔误不被误伤两条断言）以及脱敏后不保留 unwrap 链，命令见 [Session 后端 Spike](session-backend.md#7-集成测试的运行方式) | partial |
+| I10 | 进程存储 Profile | `cmd/trpc-service/storage.go`、`main.go`：`TRPC_SERVICE_STORAGE_PROFILE` 一次决定三者去向——`inmemory`（默认，零依赖、不触网）或 `postgres`（`tenant/postgres` Repository + `sessiondir/postgres` Directory 共享一个调用方持有的 pgxpool，上游 `sessionbackend` PostgreSQL Session 服务自持另一个池，同一 DSN 与 schema）。整份配置先校验后建资源；顺序为校验监听地址 → 校验存储配置 → 建池并即刻登记关闭 → 有界 `Ping` → 两族 `Migrate` → 构造组件 → `SeedDemo`；关闭严格逆序并用 `errors.Join` 合并关闭错误。DSN 从不写日志，相关错误全部经 `sessionbackend.Scrub`。`SeedDemo` 改为仅在应用尚无默认 Revision 时发布，重启不再回退已发布版本 | `go test -race ./cmd/trpc-service ./trpcservice/config`（默认不触网）：默认与显式 `inmemory` 均忽略环境里遗留的 DSN/schema、未知 profile（`redis`/`Postgres`/`pg`/带空格）被拒并列出合法值、`postgres` 缺失或空白 DSN 在任何构造器之前失败、非法与超长 schema 同样前置失败、连接串解析错误不泄漏明文或 percent-encoded 口令、启动中途失败按逆序关闭且关闭错误不被吞掉、监听地址拒绝仍先于存储；`TRPC_SERVICE_SESSION_INTEGRATION=1` 下对真实 PostgreSQL 走完整 profile 构造路径：两族迁移表与上游 6 张 Session 表齐备、Pin 与真实会话历史跨"重启"存活且 Pin 指向的 Revision 仍可解析、重启后的 `SeedDemo` 不把已发布的 `echo-v2` 改回 `echo-v1`，命令见 [进程存储 Profile](session-backend.md#8-进程存储-profile) | partial |
 
 ## 已知限制
 
 这些限制是当前切片有意接受的，不能在验收中被当作已解决：
 
-- **合法凭据可以制造无界内存 Session。** Session 目录与 Session Service 都在进程内存中，没有配额、TTL 或 LRU，一个有效 key 可以用无限多的 `X-Session-ID` 耗尽内存。
+- **合法凭据可以制造无界 Session。** Session 目录与 Session Service 都没有配额、TTL 或 LRU，一个有效 key 可以用无限多的 `X-Session-ID` 无限增长。默认 profile 下耗的是进程内存；`postgres` profile 下耗的是磁盘，且上游默认软删、不回收，只是把失败从 OOM 换成了库涨满。
 - **首轮 OpenAI 历史可以伪造。** 平台只决定会话归属，不校验请求体 `messages`；新 Session 的第一轮可以注入编造的"历史对话"。
 - **Adapter 拒绝的请求也会建立 Pin。** Session 与 Revision 在调用上游 Adapter 之前确定，格式错误的首轮同样会钉住该 Session。
-- **Pin 只在单进程内存中**，多节点部署会各自 Pin 到各自看到的默认版本。
-- **持久 Session 会打破 Pin 的重启不变量。** Session 目录在进程内存中，而 [Session 后端 Spike](session-backend.md) 验证过的 PostgreSQL/Redis 后端会让会话数据跨重启存活：重启后 Session 数据还在、Pin 已丢失，旧会话下一轮会被重新 Pin 到当前默认版本，用户无感知地换了 Agent 版本。当前 Session 仍是内存实现，会话与 Pin 一起消失，语义是自洽的；因此在跨进程 Session Directory 落地之前，不得把默认 Session 后端切到持久化实现。
+- **默认 profile 的 Pin 只在单进程内存中**，多节点部署会各自 Pin 到各自看到的默认版本。`postgres` profile 下 Pin 落库，这一条才不成立。
+- **`postgres` profile 只关掉了一个已知会坏的组合，不解决并发。** 它不允许"只持久化 Session"：控制面、Pin、会话历史绑在同一个 DSN 与 schema 上，[Session 后端 Spike](session-backend.md#61-持久-session-与进程内-pin-的重启不变量破裂) 记录的"Session 还在、Pin 丢了、旧会话被静默换版本"因此无法被配置出来。**没有**解决的仍然一条都没解决：多个 Worker 对同一 Session 的写并发没有任何互斥，没有租约、没有 fencing、没有租户级路由，也没有 Redis profile。上游 hook 与后端写入之间不是原子的，因此也无法在这一层补出单写者语义。
+- **`SeedDemo` 的"不覆盖已发布版本"存在一个已记录的窗口。** 它先读应用当前默认 Revision、再决定是否发布，两步之间不是原子的；Repository 没有"仅在未发布时发布"的原语。并发启动是安全的（各自要么不发布，要么发布同一个 `echo-v1`），但操作员恰好在这两步之间发布新版本时，该次发布可能被启动流程覆盖。
 - **对话面认证不等于平台生产安全。** Admin API 仍完全未认证，进程只能绑定本机地址。
 
 ## 验收使用方式

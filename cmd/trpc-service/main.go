@@ -18,13 +18,18 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
-	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 )
 
 const shutdownTimeout = 10 * time.Second
+
+// startupTimeout bounds everything between the first connection attempt and a
+// serving process. It has to allow for a migration waiting on the advisory lock
+// another booting worker is holding, and it exists so an unreachable database
+// fails the process instead of hanging it. The inmemory profile never reaches
+// it, having nothing to wait for.
+const startupTimeout = 30 * time.Second
 
 const (
 	// apiKeyEnvVar overrides the chat credential of the local process.
@@ -48,48 +53,79 @@ func main() {
 	}
 }
 
-func run(addr string) error {
+// run starts the process and returns when it has stopped serving and released
+// everything it owns.
+//
+// The error is named because shutdown contributes to it. Closing a session
+// store or a connection pool can fail, and those failures used to be logged and
+// dropped; joined into the result they reach the exit status, where a
+// supervisor can see them.
+//
+// The order below is the whole lifecycle, and each step is placed where it is
+// on purpose:
+//
+//   - The listen address is checked first. It costs nothing and it is the guard
+//     that keeps the unauthenticated Admin API off the network, so it must not
+//     sit behind anything that can connect to a database.
+//   - The storage configuration is loaded and validated as a whole, before a
+//     single resource is opened, so a typo in a schema name is a refusal rather
+//     than a half-built process.
+//   - Cleanup is registered by deferring, which makes the shutdown order the
+//     reverse of the startup order for free: HTTP drain inside waitForStop,
+//     then the resolver's leases, then the session store, then the shared pool.
+//     The resolver waits for in-flight runtimes, and a runtime still writing to
+//     a session store that had already been closed would lose the last turn of
+//     the conversation it was serving.
+func run(addr string) (err error) {
 	if err := validateListenAddr(addr); err != nil {
 		return err
 	}
-	repository := tenant.NewMemoryRepository()
-	if err := platformconfig.SeedDemo(context.Background(), repository); err != nil {
+
+	storageCfg, err := loadStorageConfig(os.Getenv)
+	if err != nil {
 		return err
 	}
-	sessionService := sessioninmemory.NewSessionService()
-	defer func() {
-		if err := sessionService.Close(); err != nil {
-			log.Printf("close session service: %v", err)
-		}
-	}()
+	// Safe to log: describe reports presence, never contents.
+	log.Printf("storage %s", storageCfg.describe())
+
+	// One deadline over every connection, migration and constructor between
+	// here and a serving process.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
+	defer cancelStartup()
+
+	stack, err := openStorage(startupCtx, storageCfg, defaultStorageDeps())
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, stack.close()) }()
+
+	if err := platformconfig.SeedDemo(startupCtx, stack.repository); err != nil {
+		return err
+	}
 
 	resolver, err := platformagent.NewRuntimeResolver(
-		repository,
+		stack.repository,
 		func(
 			_ context.Context,
 			revision tenant.AgentRevision,
 		) (*platformagent.Runtime, error) {
-			return platformagent.NewRuntimeFromRevision(revision, sessionService)
+			return platformagent.NewRuntimeFromRevision(revision, stack.sessions)
 		},
 	)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if closeErr := resolver.Close(); closeErr != nil {
-			log.Printf("close runtime resolver: %v", closeErr)
-		}
-	}()
+	defer func() { err = errors.Join(err, resolver.Close()) }()
 
 	authenticator, err := demoAuthenticator()
 	if err != nil {
 		return err
 	}
 	api, err := web.NewPlatformServer(
-		repository,
+		stack.repository,
 		resolver,
 		authenticator,
-		sessiondir.NewMemoryDirectory(),
+		stack.directory,
 	)
 	if err != nil {
 		return err
