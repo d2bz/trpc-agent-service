@@ -283,3 +283,40 @@ return runCtx.Err()
 ## 8. 实现边界
 
 初期不采用服务网格、自研工作流引擎、跨地域多活、通用事件总线或复杂插件市场。它们不会直接提高本题验收覆盖率，却会显著增加三周内的实现风险。组件间先使用 Go 接口和明确数据契约，确认存在独立扩缩容需求后再拆进程。
+
+## 9. 社区扩展原则
+
+本项目在完成验收要求的同时，保留面向开源社区的扩展边界。原则是“核心稳定、外围可替换”：平台核心保证租户隔离、身份认证、Revision Pin、幂等、审计和资源生命周期；社区扩展实现 Agent 类型、存储后端、IM 通道、Tool/MCP、治理策略和 Telemetry Exporter。扩展不得绕过核心不变量，也不能直接依赖某个厂商 SDK 或数据库表结构。
+
+### 9.1 稳定核心与扩展 SPI
+
+以下契约属于平台核心，变更需要版本化并提供迁移：
+
+- `TenantContext`、Agent App、不可变 Agent Revision 和 `sessiondir.Key` 定义租户、应用、版本与会话边界。
+- `InboundEnvelope`、Run、Event、Outbox 和审计字段定义跨通道的业务语义。
+- `Repository`、`Directory` 以及上游 `session.Service` 的适配层负责数据访问，不把 SQL、Redis Key 或厂商消息格式泄漏到业务代码。
+
+以下位置是主要扩展 SPI：
+
+| 扩展点 | 首个参考实现 | 社区可增加 |
+| --- | --- | --- |
+| Agent Runtime Builder | tRPC-Agent-Go `LLMAgent` + `Runner` | Graph、Chain、Parallel、业务 Agent 或其他模型供应商 |
+| Control Plane / Session Directory | InMemory、PostgreSQL | MySQL、SQLite、Redis 或外部状态服务 |
+| Session / Memory / Knowledge / Artifact | tRPC-Agent-Go 对应 Service | Redis、向量数据库、对象存储和租户级路由实现 |
+| Channel Adapter | 企业微信、飞书 | 微信客服、公众号、Telegram、Slack 等 |
+| Tool / Policy | 平台白名单和 Guardrail 边界 | MCP Server、业务 Tool、审批和成本策略 |
+| Telemetry | OpenTelemetry | 不同 Trace、Metric、Log 后端 |
+
+接口保持小而稳定。新增能力优先通过独立接口、Options 或 capability 声明实现，避免向已有接口无条件追加方法而破坏所有社区实现。后端不具备事务、CAS、流式或幂等能力时必须显式声明并拒绝不满足前置条件的功能，不能把不同语义伪装成相同实现。
+
+### 9.2 插件实现与验证方式
+
+第一阶段采用编译期注册的 Go Factory/Registry。它跨平台、易调试，并且能让社区实现与主仓库共享类型和测试；不直接依赖 Go 动态插件机制，也不提前建设插件市场。需要独立发布或隔离运行时，再把同一份契约映射为 gRPC、HTTP 或 MCP 进程外服务。
+
+每个新适配器至少应提供：
+
+1. 一个不包含租户业务逻辑的适配器包和配置校验。
+2. 一套 conformance test，验证租户隔离、幂等、并发、错误语义、超时取消和 `Close` 生命周期。
+3. 能力矩阵、已知一致性限制、迁移/回滚方式和可复现示例。
+
+这样社区可以独立增加一个通道或后端，而不需要修改 Gateway、Worker 或 Agent 核心；平台仍然可以拒绝不满足安全和一致性要求的扩展。
