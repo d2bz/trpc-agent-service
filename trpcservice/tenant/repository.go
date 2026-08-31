@@ -36,6 +36,8 @@ type revisionNumberKey struct {
 	revisionNo uint64
 }
 
+var _ Repository = (*MemoryRepository)(nil)
+
 // MemoryRepository is a concurrency-safe reference implementation for local
 // development. Returned values are deep copies so revisions stay immutable.
 type MemoryRepository struct {
@@ -69,7 +71,7 @@ func (r *MemoryRepository) CreateTenant(ctx context.Context, item Tenant) (Tenan
 	}
 	item.CreatedAt = now
 	item.UpdatedAt = now
-	if err := item.validate(); err != nil {
+	if err := item.Validate(); err != nil {
 		return Tenant{}, err
 	}
 
@@ -118,7 +120,7 @@ func (r *MemoryRepository) CreateAgentApp(
 	item.UpdatedAt = now
 	item.RoutingVersion = 0
 	item.RoutingPolicy = RoutingPolicy{}
-	if err := item.validate(scope); err != nil {
+	if err := item.Validate(scope); err != nil {
 		return AgentApp{}, err
 	}
 
@@ -172,7 +174,7 @@ func (r *MemoryRepository) CreateRevision(
 	}
 	item.CreatedAt = r.now().UTC()
 	item.PublishedAt = nil
-	if err := item.validate(scope); err != nil {
+	if err := item.ValidateForCreate(scope); err != nil {
 		return AgentRevision{}, err
 	}
 	digest, err := item.Config.Digest()
@@ -290,9 +292,11 @@ func (r *MemoryRepository) PublishRevision(
 	if revision.Status != RevisionStatusDraft {
 		return AgentApp{}, AgentRevision{}, fmt.Errorf("%w: cannot publish status %q", ErrInvalidArgument, revision.Status)
 	}
+	// A mismatch here means the stored config was changed after it was created,
+	// which no request can cause and no request can fix. See ErrConfigIntegrity.
 	digest, err := revision.Config.Digest()
 	if err != nil || digest != revision.ConfigDigest {
-		return AgentApp{}, AgentRevision{}, fmt.Errorf("%w: revision config digest mismatch", ErrInvalidArgument)
+		return AgentApp{}, AgentRevision{}, fmt.Errorf("%w: revision %q", ErrConfigIntegrity, revisionID)
 	}
 
 	now := r.now().UTC()

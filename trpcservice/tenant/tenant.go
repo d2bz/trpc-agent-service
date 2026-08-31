@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -22,10 +23,32 @@ var (
 	ErrRevisionNotPublished = errors.New("tenant: revision is not published")
 )
 
+// ErrConfigIntegrity reports that a stored revision config no longer matches
+// the digest recorded when it was created. It means the row was changed by
+// something other than a Repository — a manual UPDATE, a partial restore, a
+// corrupt write — so it is a fault in the stored data, not in the request.
+//
+// It is deliberately not ErrInvalidArgument. The caller cannot cause this and
+// cannot fix it by changing the request, so answering "bad request" would be
+// both wrong and useless: the same request fails identically forever. It has to
+// be reported as a server fault. The admin API has no case for it and falls
+// through to its default, which answers 500; do not add a 4xx case for it.
+var ErrConfigIntegrity = errors.New("tenant: stored config does not match its digest")
+
 var (
 	slugPattern       = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	resourceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
+
+// maxRevisionNo is the largest revision number a revision may carry.
+//
+// RevisionNo is a uint64, but a revision number has to survive a round trip
+// through a signed 64-bit column, and a value above this would be stored as a
+// negative number and read back as a different revision. The bound lives here,
+// with the rest of the domain rules, rather than in the one implementation that
+// happens to have the column: an id that the reference implementation accepts
+// and a production implementation rejects is not a valid id, it is drift.
+const maxRevisionNo = uint64(math.MaxInt64)
 
 // TenantContext is the mandatory tenant scope for tenant-owned resources.
 type TenantContext struct {
@@ -76,7 +99,11 @@ type Tenant struct {
 	UpdatedAt   time.Time   `json:"updated_at"`
 }
 
-func (t Tenant) validate() error {
+// Validate reports whether this tenant is well formed. It is exported because
+// every Repository implementation, in this package or not, has to reject the
+// same input before it reaches storage; a second implementation that reimplemented
+// these rules would drift from this one on the first change.
+func (t Tenant) Validate() error {
 	if err := ValidateResourceID("tenant id", t.ID); err != nil {
 		return err
 	}
@@ -124,7 +151,10 @@ type AgentApp struct {
 	UpdatedAt      time.Time     `json:"updated_at"`
 }
 
-func (a AgentApp) validate(scope TenantContext) error {
+// Validate reports whether this app is well formed and belongs to scope.
+// Fields the Repository owns (RoutingVersion, RoutingPolicy) are not checked
+// here: a Repository overwrites them rather than trusting the caller.
+func (a AgentApp) Validate(scope TenantContext) error {
 	if err := scope.Validate(); err != nil {
 		return err
 	}
@@ -174,7 +204,8 @@ type RevisionConfig struct {
 	BackendProfileID string      `json:"backend_profile_id,omitempty"`
 }
 
-func (c RevisionConfig) validate() error {
+// Validate reports whether this config can be stored and later executed.
+func (c RevisionConfig) Validate() error {
 	if strings.TrimSpace(c.AgentName) == "" {
 		return fmt.Errorf("%w: agent name is required", ErrInvalidArgument)
 	}
@@ -192,7 +223,7 @@ func (c RevisionConfig) validate() error {
 
 // Digest returns the immutable configuration fingerprint.
 func (c RevisionConfig) Digest() (string, error) {
-	if err := c.validate(); err != nil {
+	if err := c.Validate(); err != nil {
 		return "", err
 	}
 	payload, err := json.Marshal(c)
@@ -218,7 +249,10 @@ type AgentRevision struct {
 	PublishedAt  *time.Time     `json:"published_at,omitempty"`
 }
 
-func (r AgentRevision) validate(scope TenantContext) error {
+// ValidateForCreate reports whether this revision is acceptable as a new
+// revision of scope's app. It is create-only: it requires the draft status, so
+// it must not be used to re-check a revision loaded back from storage.
+func (r AgentRevision) ValidateForCreate(scope TenantContext) error {
 	if err := scope.Validate(); err != nil {
 		return err
 	}
@@ -234,11 +268,15 @@ func (r AgentRevision) validate(scope TenantContext) error {
 	if r.RevisionNo == 0 {
 		return fmt.Errorf("%w: revision number must be positive", ErrInvalidArgument)
 	}
+	if r.RevisionNo > maxRevisionNo {
+		return fmt.Errorf(
+			"%w: revision number must be at most %d", ErrInvalidArgument, maxRevisionNo)
+	}
 	if strings.TrimSpace(r.CreatedBy) == "" {
 		return fmt.Errorf("%w: created_by is required", ErrInvalidArgument)
 	}
 	if r.Status != RevisionStatusDraft {
 		return fmt.Errorf("%w: a new revision must be draft", ErrInvalidArgument)
 	}
-	return r.Config.validate()
+	return r.Config.Validate()
 }
