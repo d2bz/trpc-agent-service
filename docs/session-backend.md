@@ -170,15 +170,17 @@ postgres://user:s3cret/x@host:5432/db
 
 这一节的措辞需要格外小心，避免把"计划"写成"已有"。
 
-**当前仓库没有 AppendEvent hook 接入，也没有任何租约（lease）或 fencing 实现。**
+**当前仓库没有 AppendEvent hook 接入，也没有任何 fencing（写入准入）实现。**
+
+Spike 之后交付了一把 Run 租约（`trpcservice/sessionlease`，见 [Session Run Lease](session-lease.md)），但它是**合作型**的：它决定谁被允许进入 Run，不决定谁被允许写。下面这条上游限制正是"为什么只能做到这一步"的原因，本节的结论没有因为租约的到来而改变。
 
 上游 PostgreSQL 与 Redis Session 模块确实提供 `WithAppendEventHook` / `WithGetSessionHook` 选项，后续的写入准入检查**计划**经由 `WithAppendEventHook` 接入。但必须记录一个上游层面的限制：
 
 > **hook 检查与后端写入之间不是原子的。** hook 先执行、通过后才写后端，两步之间没有任何屏障。上游没有提供原子 fence 提交的入口——没有"带 fencing token 的条件写"这类接口。因此 hook 只能做尽力而为的准入检查，**不能**用来实现"只有持有有效租约的 writer 才能写入"这种正确性保证。
 
-真正的单写者语义需要在存储层做条件写（例如 Redis Lua 脚本做 token 比较后再写，或 PostgreSQL 用带版本号的条件 UPDATE），这超出上游 Session 接口的能力，必须由平台层自建。本次 Spike 不做。
+真正的单写者语义需要在存储层做条件写（例如 Redis Lua 脚本做 token 比较后再写，或 PostgreSQL 用带版本号的条件 UPDATE），这超出上游 Session 接口的能力，必须由平台层自建。本次 Spike 不做，租约切片同样没有做——`Lease.Fence()` 只是观测句柄，不参与写入准入。
 
-同样不在本次范围内、且**没有**实现的：PostgreSQL 控制面 Repository、跨进程 Session Directory、Redis 租约/fencing、双 Worker、Inbox/Outbox、真实 IM 接入。
+同样不在本次 Spike 范围内的：PostgreSQL 控制面 Repository、跨进程 Session Directory、Redis 租约、双 Worker、Inbox/Outbox、真实 IM 接入。其中前四项已由后续切片交付（见 [验收矩阵](acceptance.md) 的 I10、I11）；Inbox/Outbox 与真实 IM 接入**仍然没有**实现。
 
 ### 6.1 持久 Session 与进程内 Pin 的重启不变量破裂
 
@@ -195,7 +197,9 @@ postgres://user:s3cret/x@host:5432/db
 
 **换句话说，Session 持久化会把 Pin 的不变量从"重启即全丢，语义一致"降级为"数据在但 Pin 不在，语义破裂"。** 现在 Session 在内存里，重启后会话和 Pin 一起消失，反而是自洽的；单独把 Session 持久化会打破这个自洽。
 
-**这一格已经由 §8 的进程存储 profile 关掉——只关掉了这一格。** profile 不提供"只持久化 Session"这个选项：三者绑在同一个 DSN 和同一个 schema 上，要么一起在内存里，要么一起在 PostgreSQL 里，上表右列因此无法被配置出来。它没有解决的，仍然一条都没解决：双 Worker 的写并发、租约与 fencing、租户级路由、Redis profile。多个进程指向同一个 schema 时，控制面与 Pin 是一致的，但对同一个会话的并发写入依然没有任何互斥。该限制的当前表述见[验收矩阵](acceptance.md#已知限制)。
+**这一格已经由 §8 的进程存储 profile 关掉——只关掉了这一格。** profile 不提供"只持久化 Session"这个选项：三者绑在同一个 DSN 和同一个 schema 上，要么一起在内存里，要么一起在 PostgreSQL 里，上表右列因此无法被配置出来。
+
+多个进程指向同一个 schema 时，控制面与 Pin 是一致的。对同一个会话的并发写入，现在由 Run 租约在**入口**串行化（`TRPC_SERVICE_SESSION_COORDINATION=redis`，见 [Session Run Lease](session-lease.md)）：第二个 Worker 拿不到租约，收到 `409 session_busy`，持有者失效后按 TTL 接管。这是合作型互斥，**不是**存储层的写入准入——已经在写的旧 Worker 不会被原子拒绝。仍然没有解决的：fencing/CAS 写入准入、等待队列、租户级路由、Redis 存储 profile。该限制的当前表述见[验收矩阵](acceptance.md#已知限制)。
 
 ## 7. 集成测试的运行方式
 

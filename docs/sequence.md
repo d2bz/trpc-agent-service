@@ -107,6 +107,8 @@ sequenceDiagram
 
 HTTP 调用方可以选择等待或收到 `409 session_busy`；IM 场景默认按到达时间排队。队列必须有最大长度和等待超时，超过限制时返回明确的繁忙提示。
 
+> **当前实现只到"获得租约/被拒绝"这一步。** 上图里的队列尚未实现：拿不到租约的请求直接收到 `409 session_busy` + `Retry-After`，不排队、不继承租约。租约本身也只在 Run 入口互斥，不阻止已经在写的旧 Worker——见 [Session Run Lease](session-lease.md)。
+
 ## 4. Worker 故障与重试
 
 Worker 可能在三个阶段故障：

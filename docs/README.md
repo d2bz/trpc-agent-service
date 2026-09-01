@@ -16,6 +16,7 @@
 - [提交检查清单](submission-checklist.md)：8 月 27 日材料提交、验收分支、验证命令和提交证据。
 - [验收矩阵](acceptance.md)：题目要求到设计、代码、测试和演示证据的映射。
 - [持久化 Session 后端 Spike](session-backend.md)：上游 PostgreSQL/Redis Session 子模块的版本、兼容验证、语义差异、集成测试运行方式和未实现边界。
+- [Session Run Lease](session-lease.md)：多 Worker 同 Session 的合作型 Run 租约——作用域与 key 布局、续约与 TTL 接管、HTTP 409/503 与释放规则、进程配置组合，以及"不是 enforcement fencing"这条边界。
 
 ## 待建立
 

@@ -49,7 +49,7 @@ Agent App 是稳定业务身份；Agent Revision 是模型、Prompt、Tool、Ski
 
 ### 5.3 无状态多节点
 
-不使用节点级 sticky session。所有 Worker 都能读取共享配置和 Session。同一 Session 默认串行执行，Redis 租约与单调 fencing token 负责单写者协调，后端版本/CAS 拒绝过期 Worker 写入。不同 Session 并行执行，并受租户并发、token 和费用配额控制。
+不使用节点级 sticky session。所有 Worker 都能读取共享配置和 Session。同一 Session 默认串行执行：Redis 租约在 Run 入口做合作型互斥，第二个 Worker 收到 `409 session_busy`，失去租约立即取消 Run；持有者崩溃时租约按 TTL 过期，另一个 Worker 接管。租约同时产出的单调 token 只用于观测，**不参与写入准入**——上游 `AppendEvent` 没有 fence/CAS 入口，因此过期 Worker 的写入不会被后端原子拒绝，取消是尽力而为且最终一致的（见 [Session Run Lease](session-lease.md)）。不同 Session 并行执行，并受租户并发、token 和费用配额控制。
 
 ### 5.4 多后端与一致性
 
@@ -129,7 +129,7 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 
 | 风险 | 缓解措施 |
 | --- | --- |
-| 同一 Session 被多个 Worker 同时执行 | Redis owner-token 租约、有界队列、后端 CAS/版本兜底 |
+| 同一 Session 被多个 Worker 同时执行 | Redis owner-token 租约（已实现，合作型入口互斥 + TTL 接管）、有界队列（未实现）、后端 CAS/版本兜底（上游 `AppendEvent` 无 fence/CAS 入口，做不到；残余风险按 [§5.3](#53-无状态多节点) 接受） |
 | IM 重复或乱序 | Inbox 唯一约束、平台事件 ID、会话队列、过期消息策略 |
 | Tool 重试造成重复业务操作 | `request_id + tool_call_id` 幂等；不支持幂等的危险 Tool 转人工 |
 | 租户数据串读 | 强制 TenantContext、复合查询、键前缀、向量过滤、对象路径分区和隔离测试 |

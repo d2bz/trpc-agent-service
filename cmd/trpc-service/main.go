@@ -126,6 +126,7 @@ func run(addr string) (err error) {
 		resolver,
 		authenticator,
 		stack.directory,
+		stack.coordinator,
 	)
 	if err != nil {
 		return err

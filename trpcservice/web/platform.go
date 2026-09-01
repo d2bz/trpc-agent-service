@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -20,7 +23,21 @@ const (
 	HeaderAgentRevisionID = "X-Agent-Revision-ID"
 	HeaderSessionID       = "X-Session-ID"
 	HeaderAuthorization   = "Authorization"
+	HeaderRetryAfter      = "Retry-After"
 )
+
+// busyRetryAfter is what a 409 tells the client to wait. It is short because
+// session_busy is usually one impatient client with two tabs open, not a queue:
+// the other run is expected to finish in seconds, and there is no waiting list
+// to join in the meantime.
+const busyRetryAfter = 2 * time.Second
+
+// releaseTimeout bounds giving the lease back on a clean finish. The response
+// has already been written by then, so this cannot make the client wait for
+// anything it can see — it only stops a stalled coordinator from holding the
+// connection open. A release that does not make it inside the budget costs
+// nothing but the remainder of the lease's TTL.
+const releaseTimeout = 2 * time.Second
 
 // bearerScheme is matched case-insensitively, as RFC 7235 requires.
 const bearerScheme = "bearer"
@@ -44,14 +61,21 @@ type PlatformServer struct {
 	resolver      runtimeResolver
 	authenticator identity.Authenticator
 	sessions      sessiondir.Directory
+	leases        sessionlease.Coordinator
 	handler       http.Handler
 }
 
+// NewPlatformServer builds the server. Every dependency is a parameter,
+// including the run-lease coordinator: a process that forgot to configure
+// coordination must fail to build rather than fall back to a package-level
+// default that coordinates nothing, which is precisely the deployment where two
+// Workers end up running one Session.
 func NewPlatformServer(
 	repository tenant.Repository,
 	resolver runtimeResolver,
 	authenticator identity.Authenticator,
 	sessions sessiondir.Directory,
+	leases sessionlease.Coordinator,
 ) (*PlatformServer, error) {
 	if repository == nil {
 		return nil, fmt.Errorf("web: tenant repository is required")
@@ -65,11 +89,15 @@ func NewPlatformServer(
 	if sessions == nil {
 		return nil, fmt.Errorf("web: session directory is required")
 	}
+	if leases == nil {
+		return nil, fmt.Errorf("web: session lease coordinator is required")
+	}
 	server := &PlatformServer{
 		repository:    repository,
 		resolver:      resolver,
 		authenticator: authenticator,
 		sessions:      sessions,
+		leases:        leases,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
@@ -144,6 +172,37 @@ func (s *PlatformServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 		PrincipalID: caller.PrincipalID,
 		SessionID:   sessionID,
 	}
+	// The lease is taken before the pin is read and before a Runtime is built.
+	// Everything after this point writes to the session, and a request that is
+	// going to be refused must not have created a pin or leased a Runtime on the
+	// way to being refused.
+	lease, ok := s.acquireRunLease(w, r, key)
+	if !ok {
+		return
+	}
+	// runCtx is the request's context with one more way to end: losing the
+	// lease. Cancelling it is the whole of what this platform can do about a
+	// takeover — see the sessionlease package documentation for what that does
+	// and does not stop.
+	runCtx, cancelRun := context.WithCancel(r.Context())
+	defer cancelRun()
+	// An independent watcher rather than a check inside the streaming loop. The
+	// SSE writer blocks for as long as the client takes to read, and renewal
+	// runs in the coordinator's own goroutine, so neither of them is anywhere a
+	// lost lease could be noticed promptly. This goroutine ends with the run.
+	go func() {
+		select {
+		case <-lease.Done():
+			cancelRun()
+		case <-runCtx.Done():
+		}
+	}()
+	r = r.WithContext(runCtx)
+	// Registered after cancelRun, so it runs before it: whether this was a clean
+	// finish is decided while runCtx still says so. ServeHTTP returning is the
+	// boundary — that is what "the run is over" means here.
+	defer releaseRunLease(runCtx, lease)
+
 	resolved, ok := s.pinnedRuntime(w, r, key)
 	if !ok {
 		return
@@ -155,7 +214,7 @@ func (s *PlatformServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 		writeDomainError(w, err)
 		return
 	}
-	runContext, err := identity.WithRunContext(r.Context(), identity.RunContext{
+	runContext, err := identity.WithRunContext(runCtx, identity.RunContext{
 		TenantID:    key.TenantID,
 		AppID:       key.AppID,
 		PrincipalID: key.PrincipalID,
@@ -168,12 +227,91 @@ func (s *PlatformServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 	// The adapter owns the status line from here on, so every response header
 	// has to be in place first: a client that let the platform mint a session
-	// id still needs it back from a 400 or a 500 answer.
+	// id still needs it back from a 400 or a 500 answer. The fence is not among
+	// them: it is an observation handle, it admits nothing, and publishing it
+	// would invite a client to treat it as a guarantee it is not.
 	writeChatResponseHeaders(w, key.SessionID, resolved.Revision.ID)
 	// Keep the adapter's own view of the session consistent with the pinned
 	// one. contextRunner ignores this header either way.
 	r.Header.Set(HeaderSessionID, key.SessionID)
 	handler.ServeHTTP(w, r.WithContext(runContext))
+}
+
+// acquireRunLease takes the run lease for this request, or answers the client.
+//
+// There are two answers, and the difference matters to a client deciding what to
+// do next. 409 means the platform is healthy and someone else is running this
+// session: the same request will work shortly. 503 means coordination could not
+// tell us anything, so the run was not started.
+//
+// Everything that is not a definite "busy" ends in 503, including a backend
+// reply this build does not recognise. That is the fail-closed half of the
+// contract: guessing that an unreadable answer meant "free" is how two Workers
+// end up in one Session, and the whole of this feature is the promise that they
+// do not.
+func (s *PlatformServer) acquireRunLease(
+	w http.ResponseWriter,
+	r *http.Request,
+	key sessiondir.Key,
+) (sessionlease.Lease, bool) {
+	lease, err := s.leases.Acquire(r.Context(), key)
+	if err == nil {
+		return lease, true
+	}
+	if errors.Is(err, sessionlease.ErrSessionBusy) {
+		w.Header().Set(HeaderRetryAfter, strconv.Itoa(int(busyRetryAfter.Seconds())))
+		writeAPIError(w, http.StatusConflict, "session_busy", fmt.Sprintf(
+			"session %q is already being run; retry when that run finishes",
+			key.SessionID,
+		))
+		return nil, false
+	}
+	// A cancelled request context arrives here too, and shares this answer. It
+	// is reported distinctly by the coordinator, but there is no separate HTTP
+	// status for "the caller stopped listening", and no caller left to read one.
+	writeAPIError(
+		w,
+		http.StatusServiceUnavailable,
+		"coordination_unavailable",
+		"run coordination is unavailable; this request was not started",
+	)
+	return nil, false
+}
+
+// releaseRunLease gives the lease back, but only after a clean finish.
+//
+// The asymmetry is deliberate. Releasing makes the session immediately available
+// to the next Worker, which is right when this one has genuinely stopped — but
+// an upstream Runner whose context was just cancelled keeps emitting terminal
+// events for about a second afterwards, on a context this process cannot reach.
+// Deleting the lock in that moment would hand the session to another Worker
+// while the previous run is still writing to it. Leaving it to expire by TTL
+// costs the next caller a few seconds and covers exactly that tail.
+//
+// So: a run that ended by itself releases; a run that ended because the client
+// disconnected, the lease was lost, or the process is shutting down does not.
+func releaseRunLease(runCtx context.Context, lease sessionlease.Lease) {
+	select {
+	case <-lease.Done():
+		// Lost or taken over. There is nothing of ours left to give back, and a
+		// Release cannot disturb a new owner anyway — it is owner-matched — but
+		// the TTL is what covers our own tail writes, so leave it alone.
+		return
+	default:
+	}
+	if runCtx.Err() != nil {
+		return
+	}
+	// Independent of the request: the response is written and the client may
+	// already be gone, and this still has to complete.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), releaseTimeout)
+	defer cancel()
+	// The result is deliberately discarded. The status line and the body left
+	// this process long ago — an SSE stream has been flushed turn by turn — so
+	// there is nothing left to tell the client and nothing to correct. A release
+	// that failed leaves a lock that expires by TTL, which is the same state a
+	// crash would have left, and the next Acquire recovers from it.
+	_ = lease.Release(ctx)
 }
 
 func (s *PlatformServer) authenticateChat(
@@ -310,7 +448,14 @@ func writeUnauthenticated(w http.ResponseWriter, message string) {
 func writeChatCORSHeaders(w http.ResponseWriter) {
 	header := w.Header()
 	header.Set("Access-Control-Allow-Origin", "*")
-	header.Set("Access-Control-Expose-Headers", HeaderSessionID+", "+HeaderAgentRevisionID)
+	// Retry-After is exposed because it is the actionable part of a 409: a
+	// browser client that cannot read it has been told "busy" with no idea when
+	// to come back, and will either give up or retry immediately.
+	header.Set("Access-Control-Expose-Headers", strings.Join([]string{
+		HeaderSessionID,
+		HeaderAgentRevisionID,
+		HeaderRetryAfter,
+	}, ", "))
 }
 
 // writeChatResponseHeaders publishes the run scope. It stays at the point where

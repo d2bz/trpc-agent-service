@@ -7,9 +7,13 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	goredis "github.com/redis/go-redis/v9"
+
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	sessiondirpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir/postgres"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
+	redislease "github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	tenantpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tenant/postgres"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -35,6 +39,17 @@ import (
 // not a profile here: sessionbackend can build a Redis session service, but
 // there is no Redis control-plane repository or session directory to pair it
 // with, so offering it would offer exactly the broken combination above.
+//
+// # Coordination is a second axis, and the two constrain each other
+//
+// Where state lives and which Worker may currently run a Session are different
+// questions, so run-lease coordination is configured separately. They are not
+// independent, though, and the combinations are checked rather than left to the
+// operator: a lock is only worth anything over state the lock's peers can all
+// see. Coordinating through Redis while every Worker keeps its sessions in its
+// own memory would be a shared lock over unshared state — a process that looks
+// coordinated, passes a smoke test, and protects nothing. It is refused at
+// startup.
 const (
 	// storageProfileEnvVar selects the profile. Unset or empty means inmemory,
 	// so the demo still runs against an empty machine.
@@ -50,6 +65,16 @@ const (
 	// upstream session tables land in it. Optional; empty means the server's
 	// default search_path, normally "public".
 	postgresSchemaEnvVar = "TRPC_SERVICE_POSTGRES_SCHEMA"
+
+	// coordinationEnvVar selects the run-lease backend. Unset or empty means
+	// inmemory, which coordinates this process and nothing else, and which
+	// reaches no network.
+	coordinationEnvVar = "TRPC_SERVICE_SESSION_COORDINATION"
+
+	// redisURLEnvVar carries the connection URL of the redis coordination
+	// backend. Like the DSN it may hold a password: it is never logged, and
+	// every error built from it goes through sessionbackend.Scrub.
+	redisURLEnvVar = "TRPC_SERVICE_REDIS_URL"
 )
 
 // storageProfile names one whole storage arrangement.
@@ -67,6 +92,19 @@ const (
 	profilePostgres storageProfile = "postgres"
 )
 
+// coordinationBackend names where run leases are coordinated.
+type coordinationBackend string
+
+const (
+	// coordinationInMemory coordinates the Workers inside this process and
+	// nobody else. It needs no external service and makes no network call.
+	coordinationInMemory coordinationBackend = "inmemory"
+
+	// coordinationRedis coordinates Workers across processes through a shared
+	// Redis instance.
+	coordinationRedis coordinationBackend = "redis"
+)
+
 // errStorageConfig is the sentinel behind every startup refusal this file
 // reports, so a caller can tell "you configured this wrong" from "the database
 // was unreachable".
@@ -74,11 +112,13 @@ var errStorageConfig = errors.New("storage: invalid configuration")
 
 // storageConfig is the whole storage configuration of one process.
 type storageConfig struct {
-	// dsn and schema are populated only under profilePostgres; see
-	// loadStorageConfig.
-	profile storageProfile
-	dsn     string
-	schema  string
+	// dsn and schema are populated only under profilePostgres, and redisURL
+	// only under coordinationRedis; see loadStorageConfig.
+	profile      storageProfile
+	dsn          string
+	schema       string
+	coordination coordinationBackend
+	redisURL     string
 }
 
 // loadStorageConfig reads the environment and refuses anything it cannot serve,
@@ -98,10 +138,17 @@ func loadStorageConfig(getenv func(string) string) (storageConfig, error) {
 	if err != nil {
 		return storageConfig{}, err
 	}
-	cfg := storageConfig{profile: profile}
+	coordination, err := parseCoordinationBackend(getenv(coordinationEnvVar))
+	if err != nil {
+		return storageConfig{}, err
+	}
+	cfg := storageConfig{profile: profile, coordination: coordination}
 	if profile == profilePostgres {
 		cfg.dsn = getenv(postgresDSNEnvVar)
 		cfg.schema = getenv(postgresSchemaEnvVar)
+	}
+	if coordination == coordinationRedis {
+		cfg.redisURL = getenv(redisURLEnvVar)
 	}
 	if err := cfg.validate(); err != nil {
 		return storageConfig{}, err
@@ -137,9 +184,43 @@ func unknownProfileError(value string) error {
 	)
 }
 
+// parseCoordinationBackend maps the environment value to a coordination
+// backend. The match is exact, for the same reason parseStorageProfile's is:
+// an operator who mistyped "redis" would otherwise get a process that silently
+// coordinates nothing while several Workers share one Session.
+func parseCoordinationBackend(value string) (coordinationBackend, error) {
+	switch coordinationBackend(value) {
+	case "":
+		return coordinationInMemory, nil
+	case coordinationInMemory, coordinationRedis:
+		return coordinationBackend(value), nil
+	default:
+		return "", unknownCoordinationError(value)
+	}
+}
+
+func unknownCoordinationError(value string) error {
+	return fmt.Errorf(
+		"%w: unknown %s %q (want %q or %q; leave it unset for %q)",
+		errStorageConfig, coordinationEnvVar, value,
+		coordinationInMemory, coordinationRedis, coordinationInMemory,
+	)
+}
+
 // validate reports whether this configuration can be opened. It contacts
 // nothing: a configuration that validates can still fail to connect.
+//
+// Both axes are checked here, before openStorage creates anything, so a process
+// that is going to be refused is refused without having opened a pool, dialled
+// Redis or created an upstream table.
 func (c storageConfig) validate() error {
+	if err := c.validateProfile(); err != nil {
+		return err
+	}
+	return c.validateCoordination()
+}
+
+func (c storageConfig) validateProfile() error {
 	switch c.profile {
 	case profileInMemory:
 		return nil
@@ -174,6 +255,56 @@ func (c storageConfig) validate() error {
 	return nil
 }
 
+// validateCoordination checks the run-lease axis and, more importantly, checks
+// it against the storage axis.
+func (c storageConfig) validateCoordination() error {
+	switch c.coordination {
+	case coordinationInMemory:
+		// Legal under either profile. Under postgres it means "one Worker", and
+		// that is a real deployment: a single process on a persistent store.
+		return nil
+	case coordinationRedis:
+		// Checked below.
+	default:
+		// Reached only by a config built in code; loadStorageConfig normalises
+		// an unset variable to coordinationInMemory. It is a refusal rather
+		// than a fallback for the same reason the profile's is: openStorage
+		// validates before it constructs, and an unrecognised value must fail
+		// there too.
+		return unknownCoordinationError(string(c.coordination))
+	}
+	if c.profile != profilePostgres {
+		return fmt.Errorf(
+			"%w: %s=%q needs a Session store every Worker can see, but %s=%q keeps "+
+				"sessions in this process's memory; a shared lock over unshared "+
+				"state is not safety, it only looks like it",
+			errStorageConfig, coordinationEnvVar, coordinationRedis,
+			storageProfileEnvVar, c.profile,
+		)
+	}
+	if strings.TrimSpace(c.redisURL) == "" {
+		return fmt.Errorf(
+			"%w: %s=%q requires %s to be set",
+			errStorageConfig, coordinationEnvVar, coordinationRedis, redisURLEnvVar,
+		)
+	}
+	// Parsing is configuration, not connection: goredis.ParseURL resolves
+	// nothing and dials nothing. Doing it here means a mistyped URL is refused
+	// before a pool exists, and the failure — which quotes the URL it could not
+	// parse — is scrubbed like every other error built from a secret.
+	//
+	// Scrubbing comes first and the sentinel is attached afterwards, because
+	// Scrub deliberately drops the chain it was handed: redacting the finished
+	// error would take errStorageConfig with it and leave the caller unable to
+	// tell a misconfiguration from an unreachable server.
+	if _, err := goredis.ParseURL(c.redisURL); err != nil {
+		safe := sessionbackend.Scrub(
+			fmt.Errorf("parse %s: %w", redisURLEnvVar, err), c.redisURL)
+		return fmt.Errorf("%w: %w", errStorageConfig, safe)
+	}
+	return nil
+}
+
 // sessionConfig renders the upstream session backend this profile implies. The
 // session store shares the profile's DSN and schema; nothing configures it
 // separately.
@@ -190,16 +321,22 @@ func (c storageConfig) sessionConfig() sessionbackend.Config {
 	}
 }
 
-// describe renders the configuration for the startup log: the profile, whether
-// a connection string is present, and the schema. Never its contents.
+// describe renders the configuration for the startup log: the profile, the
+// coordination backend, whether each connection string is present, and the
+// schema. Never the contents of a connection string.
 func (c storageConfig) describe() string {
-	if c.profile != profilePostgres {
-		return fmt.Sprintf("profile=%s", c.profile)
+	fields := []string{fmt.Sprintf("profile=%s", c.profile)}
+	if c.profile == profilePostgres {
+		fields = append(fields,
+			fmt.Sprintf("dsn=%s", presence(c.dsn)),
+			fmt.Sprintf("schema=%q", c.schema),
+		)
 	}
-	return fmt.Sprintf(
-		"profile=%s dsn=%s schema=%q",
-		c.profile, presence(c.dsn), c.schema,
-	)
+	fields = append(fields, fmt.Sprintf("coordination=%s", c.coordination))
+	if c.coordination == coordinationRedis {
+		fields = append(fields, fmt.Sprintf("redis_url=%s", presence(c.redisURL)))
+	}
+	return strings.Join(fields, " ")
 }
 
 func presence(value string) string {
@@ -226,14 +363,16 @@ type namedCloser struct {
 // those has to close them, in the right order, on the shutdown path and on
 // every partial startup failure alike. That is this type's whole job.
 type storageStack struct {
-	repository tenant.Repository
-	directory  sessiondir.Directory
-	sessions   session.Service
+	repository  tenant.Repository
+	directory   sessiondir.Directory
+	sessions    session.Service
+	coordinator sessionlease.Coordinator
 
-	// connString is kept so close errors can be scrubbed too. A pool reports a
-	// failure by echoing the string it was built from, and a close on the
-	// shutdown path is logged like any other error.
+	// connString and redisURL are kept so close errors can be scrubbed too. A
+	// pool reports a failure by echoing the string it was built from, and a
+	// close on the shutdown path is logged like any other error.
 	connString string
+	redisURL   string
 
 	closers []namedCloser
 	closed  bool
@@ -269,8 +408,12 @@ func (s *storageStack) close() error {
 	for i := len(s.closers) - 1; i >= 0; i-- {
 		closer := s.closers[i]
 		if err := closer.close(); err != nil {
-			errs = append(errs, sessionbackend.Scrub(
-				fmt.Errorf("close %s: %w", closer.name, err), s.connString))
+			// Both connection strings, because one stack can hold resources
+			// built from either and a close failure echoes whichever it came
+			// from. Scrub is idempotent, so the second pass is free.
+			scrubbed := sessionbackend.Scrub(
+				fmt.Errorf("close %s: %w", closer.name, err), s.connString)
+			errs = append(errs, sessionbackend.Scrub(scrubbed, s.redisURL))
 		}
 	}
 	s.closers = nil
@@ -286,15 +429,18 @@ func (s *storageStack) close() error {
 // tested against a real server on a machine that has none. With this, a unit
 // test fails any single step and watches what gets closed.
 //
-// It is deliberately five concrete functions and not an abstraction over pgx. A
-// fake supplies a nil pool, and every step that would touch one is replaced
-// alongside, so nothing dereferences it.
+// It is deliberately concrete functions and not an abstraction over pgx or
+// go-redis. A fake supplies a nil pool and a nil client, and every step that
+// would touch one is replaced alongside, so nothing dereferences them.
 type storageDeps struct {
 	openPool        func(ctx context.Context, cfg storageConfig) (*pgxpool.Pool, func() error, error)
 	ping            func(ctx context.Context, pool *pgxpool.Pool) error
 	migrate         func(ctx context.Context, pool *pgxpool.Pool) error
 	newControlPlane func(pool *pgxpool.Pool) (tenant.Repository, sessiondir.Directory, error)
 	newSessions     func(cfg sessionbackend.Config) (session.Service, error)
+	openRedis       func(ctx context.Context, cfg storageConfig) (goredis.UniversalClient, func() error, error)
+	pingRedis       func(ctx context.Context, client goredis.UniversalClient) error
+	newCoordinator  func(cfg storageConfig, client goredis.UniversalClient) (sessionlease.Coordinator, error)
 }
 
 // defaultStorageDeps is what the process runs with.
@@ -305,6 +451,9 @@ func defaultStorageDeps() storageDeps {
 		migrate:         migrateControlPlane,
 		newControlPlane: newPostgresControlPlane,
 		newSessions:     sessionbackend.New,
+		openRedis:       openLeaseRedisClient,
+		pingRedis:       pingLeaseRedisClient,
+		newCoordinator:  newLeaseCoordinator,
 	}
 }
 
@@ -321,7 +470,7 @@ func openStorage(ctx context.Context, cfg storageConfig, deps storageDeps) (*sto
 	}
 	switch cfg.profile {
 	case profileInMemory:
-		return openInMemoryStorage(cfg, deps)
+		return openInMemoryStorage(ctx, cfg, deps)
 	case profilePostgres:
 		return openPostgresStorage(ctx, cfg, deps)
 	default:
@@ -334,8 +483,13 @@ func openStorage(ctx context.Context, cfg storageConfig, deps storageDeps) (*sto
 }
 
 // openInMemoryStorage builds the zero-dependency stack. Nothing here connects,
-// resolves a name or reads a file.
-func openInMemoryStorage(cfg storageConfig, deps storageDeps) (*storageStack, error) {
+// resolves a name or reads a file: validate has already refused the only
+// coordination backend that would.
+func openInMemoryStorage(
+	ctx context.Context,
+	cfg storageConfig,
+	deps storageDeps,
+) (*storageStack, error) {
 	sessions, err := deps.newSessions(cfg.sessionConfig())
 	if err != nil {
 		return nil, err
@@ -346,6 +500,10 @@ func openInMemoryStorage(cfg storageConfig, deps storageDeps) (*storageStack, er
 		sessions:   sessions,
 	}
 	stack.push("session service", sessions.Close)
+
+	if err := openCoordination(ctx, cfg, deps, stack); err != nil {
+		return nil, errors.Join(err, stack.close())
+	}
 	return stack, nil
 }
 
@@ -364,15 +522,20 @@ func openInMemoryStorage(cfg storageConfig, deps storageDeps) (*storageStack, er
 //     inside a call that ignores it.
 //   - Migrations come before anything reads. Both migrations run on the shared
 //     pool, so they land in the schema its search_path names.
-//   - The session service is created last, so it is closed first.
+//   - Coordination is created last, so it is closed first. A Worker that is
+//     shutting down has to stop handing out and renewing run leases before the
+//     store those leases protect goes away.
 func openPostgresStorage(ctx context.Context, cfg storageConfig, deps storageDeps) (*storageStack, error) {
-	stack := &storageStack{connString: cfg.dsn}
+	stack := &storageStack{connString: cfg.dsn, redisURL: cfg.redisURL}
 	// fail closes exactly what has been created so far, in reverse order, and
 	// reports the failure together with anything that went wrong closing.
 	// Scrubbing here as well as at each step is redundant on purpose: Scrub is
 	// idempotent, and this is the boundary the DSN must not cross.
 	fail := func(err error) (*storageStack, error) {
-		return nil, errors.Join(sessionbackend.Scrub(err, cfg.dsn), stack.close())
+		return nil, errors.Join(
+			sessionbackend.Scrub(sessionbackend.Scrub(err, cfg.dsn), cfg.redisURL),
+			stack.close(),
+		)
 	}
 
 	pool, closePool, err := deps.openPool(ctx, cfg)
@@ -401,7 +564,52 @@ func openPostgresStorage(ctx context.Context, cfg storageConfig, deps storageDep
 	stack.push("session service", sessions.Close)
 	stack.sessions = sessions
 
+	if err := openCoordination(ctx, cfg, deps, stack); err != nil {
+		return fail(err)
+	}
 	return stack, nil
+}
+
+// openCoordination builds the run-lease coordinator and, under the redis
+// backend, the client it borrows.
+//
+// The client is pushed before the coordinator, so close runs them the other way
+// round: the coordinator stops renewing and releases while it still has a usable
+// connection, and only then does the connection go. Doing it the other way
+// would turn every shutdown into a burst of unavailable-backend errors on the
+// way out.
+//
+// Under the in-memory backend nothing here connects. The redis URL is not even
+// read: validate has already refused the combination that would need it.
+func openCoordination(
+	ctx context.Context,
+	cfg storageConfig,
+	deps storageDeps,
+	stack *storageStack,
+) error {
+	var client goredis.UniversalClient
+	if cfg.coordination == coordinationRedis {
+		opened, closeClient, err := deps.openRedis(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		stack.push("redis client", closeClient)
+		// Like the pool's ping: NewClient does not dial, so without this an
+		// unreachable Redis would first surface as a 503 on a live request
+		// rather than as a refusal to start.
+		if err := deps.pingRedis(ctx, opened); err != nil {
+			return err
+		}
+		client = opened
+	}
+
+	coordinator, err := deps.newCoordinator(cfg, client)
+	if err != nil {
+		return err
+	}
+	stack.push("coordination", coordinator.Close)
+	stack.coordinator = coordinator
+	return nil
 }
 
 // openControlPlanePool opens the pool the repository and the directory share.
@@ -470,6 +678,76 @@ func migrateControlPlane(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("migrate session directory: %w", err)
 	}
 	return nil
+}
+
+// openLeaseRedisClient builds the client the run-lease coordinator borrows.
+//
+// It is returned with its closer rather than closed here, because the caller
+// owns it from the moment it exists — the same rule the control-plane pool
+// follows, and the reason the coordinator never closes the client it is handed.
+//
+// # Why ContextTimeoutEnabled is set
+//
+// Without it, go-redis v9 hands context.Background() to the socket read and
+// write of every command, so the deadlines sessionlease sets — the acquire
+// budget on Lifetime.Call, the per-call timeout of the renewal loop, the
+// shutdown context of a release — stop at the client boundary and never become
+// a read deadline. What would actually bound a command already on the wire is
+// this client's own ReadTimeout and MaxRetries, which nothing in the lease
+// timings knows about. With it set, go-redis takes the earlier of the context
+// deadline and ReadTimeout, so Ping, Acquire, Renew and Release are each bounded
+// by the context their own caller chose.
+//
+// It has to be set here. ParseURL leaves it false and there is no URL parameter
+// for it: go-redis rejects query keys it does not recognise, so an operator
+// cannot supply it and this line is the only place it can be turned on.
+//
+// Setting it is safe as a process-wide property of this client because this
+// client is the coordinator's alone. openCoordination builds it, redislease.New
+// is the only thing handed it, and no Session store shares it — there is no
+// Redis storage profile to pair one with. Should a profile ever share one
+// client between the two, this stops being a lease decision and becomes a
+// decision about the shared client, and it belongs wherever that client is
+// built.
+func openLeaseRedisClient(
+	_ context.Context,
+	cfg storageConfig,
+) (goredis.UniversalClient, func() error, error) {
+	opts, err := goredis.ParseURL(cfg.redisURL)
+	if err != nil {
+		// ParseURL echoes the URL it could not parse, password included.
+		return nil, nil, sessionbackend.Scrub(
+			fmt.Errorf("parse %s: %w", redisURLEnvVar, err), cfg.redisURL)
+	}
+	opts.ContextTimeoutEnabled = true
+	client := goredis.NewClient(opts)
+	return client, client.Close, nil
+}
+
+// pingLeaseRedisClient is where an unreachable Redis is allowed to surface.
+func pingLeaseRedisClient(ctx context.Context, client goredis.UniversalClient) error {
+	if err := client.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("reach the configured Redis instance: %w", err)
+	}
+	return nil
+}
+
+// newLeaseCoordinator builds the coordinator this configuration asks for. The
+// client is nil under the in-memory backend and unused there.
+func newLeaseCoordinator(
+	cfg storageConfig,
+	client goredis.UniversalClient,
+) (sessionlease.Coordinator, error) {
+	switch cfg.coordination {
+	case coordinationInMemory:
+		// One store, one coordinator: this process is the only participant.
+		return sessionlease.NewMemoryCoordinator(
+			sessionlease.NewMemoryStore(), sessionlease.Config{})
+	case coordinationRedis:
+		return redislease.New(client, redislease.Options{})
+	default:
+		return nil, unknownCoordinationError(string(cfg.coordination))
+	}
 }
 
 // newPostgresControlPlane wraps the shared pool in the two components. Neither

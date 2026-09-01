@@ -59,23 +59,29 @@ Runtime Manager 根据 `(tenant_id, backend_profile_version)` 构造 `StorageBun
 
 ### 4.1 默认规则
 
-同一 Session 同时只运行一个 Run，不同 Session 并行。Session 的规范锁键为框架 Session Key 的摘要：
+同一 Session 同时只运行一个 Run，不同 Session 并行。租约的作用域是完整的 `{tenant, app, principal, session, epoch}`，与 Session Directory 的 Pin 同一把键；落到 Redis 上是它的定长 SHA-256 摘要，按字段长度前缀计算，因此租户、主体和 Session ID 都不进入 keyspace，也无法靠移动字段边界撞成同一把锁：
 
 ```text
-session-lock:{sha256(app_name + user_id + session_id)}
+<prefix>:{sha256(len-prefixed tenant|app|principal|session|epoch)}:lock    owner token，带 PX 过期
+<prefix>:{sha256(...)}:fence                                              只增不减的计数器
 ```
 
 Run Coordinator 使用 Redis Lua 脚本完成：
 
 1. `SET key owner_token NX PX lease_ttl` 获取租约。
-2. 获取租约时同时 `INCR` Session fence，得到单调 fencing token。
-3. Worker 定期比较 owner token 后续约。
+2. 获取租约时同时 `INCR` Session fence，得到单调 token。
+3. Worker 定期比较 owner token 后续约；续约的"未知"结果一律按失败处理，重试到安全边界后判定失去租约。
 4. 失去租约立刻取消 Run Context，并停止后续 Tool 与存储操作。
-5. Session 装饰器把 fencing token 传给参考 Backend；Backend 原子拒绝小于已提交 token 的写入。
-6. 释放时只允许 owner token 匹配者删除锁。
-7. 等待消息进入有界队列；队列满或超时返回 `session_busy`。
+5. 释放时只允许 owner token 匹配者删除锁，并且从不删除 fence 计数器。
+6. Run 结束或进程关闭时**不**删除锁，留给 TTL 过期，覆盖被取消 Runner 的收尾写入。
 
-Redis 租约解决正常运行时的串行化，fencing 防止租约过期后的旧 Worker 继续写入。SQL Session Backend 使用版本号和事务实现；Redis 参考适配使用 Lua 同时校验 fence 并提交单次 Event/State。无法接入 fencing/CAS 的上游后端不能宣称网络分区下的线性一致，只提供租约保护下的单写者语义。这一限制必须在 Backend Capabilities 中显式展示。
+**已实现的是第 1-6 步，并且它是一把合作型租约。**它把并发写者挡在 Run 入口：第二个 Worker 收到 `409 session_busy`，持有者失效后按 TTL 接管。实现见 [Session Run Lease](session-lease.md)。
+
+**没有实现、并且在当前上游接口下做不出来的是用 fencing token 做写入准入。** 上游 `session.Service.AppendEvent` 没有 fence 或 CAS 参数，PostgreSQL/Redis Session 模块的 `WithAppendEventHook` 在写入之前执行、两步之间没有屏障，不是原子的。因此"Session 装饰器把 token 传给 Backend、Backend 原子拒绝落后写入"无法在这一层补出来，**不能宣称过期 Worker 的写入被原子拒绝**，token 目前只是观测句柄。被暂停或分区后在 TTL 内恢复的持有者、以及上游 Runner 取消后仍通过 `context.WithoutCancel` 写约一秒终态 Event 的行为，都不被阻止；取消是尽力而为且最终一致的。
+
+真正的单写者语义需要存储层的条件写（Redis Lua 比对 token 后再写，或 PostgreSQL 带版本号的条件 UPDATE），这超出上游 Session 接口的能力，必须由平台自建，本切片不做。等待队列同样未实现：被拒绝的 Worker 不排队。
+
+单实例 Redis 是已验证的部署形态。failover 下锁 key 可能随未同步的副本丢失、fence 可能回退，因此**不宣称** failover 下仍然互斥或 fence 仍然单调。无法接入 fencing/CAS 的上游后端不能宣称网络分区下的线性一致。这一限制必须在 Backend Capabilities 中显式展示。
 
 ### 4.2 Tool 副作用
 
@@ -93,7 +99,7 @@ Tool Adapter 在业务系统侧保存该键与结果。相同键再次调用时�
 
 Runner 是一次 Invocation 内的事件顺序来源。Worker 只使用一个事件消费者，按收到顺序处理并持久化。`StateDelta` 必须通过 Session Backend 的 `AppendEvent` 语义与对应 Event 一起提交；不能先更新 State 再单独追加 Event。
 
-PostgreSQL 后端使用事务同时更新 Session State 和插入 Event。Redis 后端使用原子操作维护 Session 数据。平台装饰器负责租户键校验、租约检查、Telemetry 和审计，不绕开上游 Service 直接拼接后端命令。
+PostgreSQL 后端使用事务同时更新 Session State 和插入 Event。Redis 后端使用原子操作维护 Session 数据。平台装饰器负责租户键校验、Telemetry 和审计，不绕开上游 Service 直接拼接后端命令。**装饰器不做租约检查**：上游 `AppendEvent` 没有 fence/CAS 入口，`WithAppendEventHook` 与写入之间不是原子的，在这里"检查租约"只会产生一层看着像准入控制、实际拦不住任何东西的代码（见 [§4.1](#41-默认规则)）。
 
 ### 5.2 Summary
 

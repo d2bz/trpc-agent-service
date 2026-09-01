@@ -138,7 +138,16 @@ func createSchema(t *testing.T, dsn string) string {
 // hand-assembled stack would hide.
 func bootstrap(t *testing.T, dsn, schema string) *storageStack {
 	t.Helper()
-	cfg := storageConfig{profile: profilePostgres, dsn: dsn, schema: schema}
+	// In-memory coordination: this test restarts one process against one schema,
+	// so there is no second Worker to coordinate with, and the whole file has to
+	// keep running with nothing but PostgreSQL available. The redis backend has
+	// its own gated suite.
+	cfg := storageConfig{
+		profile:      profilePostgres,
+		dsn:          dsn,
+		schema:       schema,
+		coordination: coordinationInMemory,
+	}
 	require.NoError(t, cfg.validate())
 
 	ctx, cancel := setupContext()

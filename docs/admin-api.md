@@ -142,8 +142,8 @@ CORS 预检允许 `Authorization`、`X-Tenant-ID`、`X-Agent-App-ID`、`X-Agent-
 
 - Admin 身份认证、租户管理员授权和管理操作审计。
 - PostgreSQL Repository、事务、分页和跨节点配置通知。
-- 跨进程 Session 目录：当前 Pin 只在单进程内存中，多节点部署会各自 Pin。
-- 主体间共享 Session、显式 Retire/Unpin（`Key.Epoch` 已预留但恒为 0）、Redis 租约。
+- 跨进程 Session 目录：默认 profile 下 Pin 只在单进程内存中，多节点部署会各自 Pin；`postgres` profile 下 Pin 落库，这一条才不成立。
+- 主体间共享 Session、显式 Retire/Unpin（`Key.Epoch` 已预留但恒为 0）。Redis Run 租约已实现（见 [Session Run Lease](session-lease.md)），但它只做 Run 入口的合作型互斥，不做写入准入。
 - 静态 API Key 之外的凭据体系：轮转、过期、撤销、按 Principal 的配额与限流。
 - 权重灰度、白名单路由、Runtime TTL/LRU 淘汰和配置失效通知。
 - 生产模型 Provider、Secret Resolver、Tool/Knowledge/Policy 组装。

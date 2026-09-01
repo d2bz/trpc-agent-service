@@ -9,71 +9,101 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	goredis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
-// Nothing in this file contacts a database. The point of most of it is that the
-// refusals and the cleanup happen *before* anything could: a test that needed a
-// server to prove a startup failure would not be proving it.
+// Nothing in this file contacts a database or a Redis. The point of most of it
+// is that the refusals and the cleanup happen *before* anything could: a test
+// that needed a server to prove a startup failure would not be proving it.
 //
-// Every test sets all three storage variables explicitly. A developer with the
-// integration environment exported has a DSN in their shell, and a test that
-// only cleared the profile would then assert something different from what CI
-// asserts.
+// Every test sets all storage variables explicitly. A developer with the
+// integration environment exported has a DSN and a Redis URL in their shell, and
+// a test that only cleared the profile would then assert something different
+// from what CI asserts.
 
 const testPassword = "s3cret"
 
-// setStorageEnv puts the three storage variables in a known state for the
-// duration of one test. Empty means unset as far as this process is concerned.
-func setStorageEnv(t *testing.T, profile, dsn, schema string) {
-	t.Helper()
-	t.Setenv(storageProfileEnvVar, profile)
-	t.Setenv(postgresDSNEnvVar, dsn)
-	t.Setenv(postgresSchemaEnvVar, schema)
+// storageEnv is the whole environment one test runs with. It is a struct rather
+// than a list of parameters because every field is a string and a call site with
+// five bare strings in it says nothing about which is which.
+type storageEnv struct {
+	profile      string
+	dsn          string
+	schema       string
+	coordination string
+	redisURL     string
 }
 
-// The demo has to keep running on an empty machine: no profile at all means
-// in-memory, and in-memory means no external dependency.
+// setStorageEnv puts the storage variables in a known state for the duration of
+// one test. Empty means unset as far as this process is concerned.
+func setStorageEnv(t *testing.T, env storageEnv) {
+	t.Helper()
+	t.Setenv(storageProfileEnvVar, env.profile)
+	t.Setenv(postgresDSNEnvVar, env.dsn)
+	t.Setenv(postgresSchemaEnvVar, env.schema)
+	t.Setenv(coordinationEnvVar, env.coordination)
+	t.Setenv(redisURLEnvVar, env.redisURL)
+}
+
+// The demo has to keep running on an empty machine: no profile and no
+// coordination backend at all means in-memory, and in-memory means no external
+// dependency on either axis.
 func TestLoadStorageConfigDefaultsToInMemory(t *testing.T) {
-	setStorageEnv(t, "", "", "")
+	setStorageEnv(t, storageEnv{})
 
 	cfg, err := loadStorageConfig(os.Getenv)
 	require.NoError(t, err)
 	require.Equal(t, profileInMemory, cfg.profile)
+	require.Equal(t, coordinationInMemory, cfg.coordination)
 	require.Equal(t, sessionbackend.DefaultConfig(), cfg.sessionConfig())
 }
 
-// A DSN sitting in the environment must never be what turns persistence on.
-// Storage that writes to a shared database is something an operator asks for by
-// name, and an integration variable left exported is not that request.
-func TestLoadStorageConfigIgnoresStrayPostgresSettings(t *testing.T) {
-	const strayDSN = "postgres://user:" + testPassword + "@127.0.0.1:55432/db"
+// A connection string sitting in the environment must never be what turns
+// persistence or cross-process coordination on. Either is something an operator
+// asks for by name, and an integration variable left exported is not that
+// request.
+func TestLoadStorageConfigIgnoresStrayConnectionSettings(t *testing.T) {
+	const (
+		strayDSN   = "postgres://user:" + testPassword + "@127.0.0.1:55432/db"
+		strayRedis = "redis://:" + testPassword + "@127.0.0.1:56379/0"
+	)
 
 	for _, profile := range []string{"", string(profileInMemory)} {
 		t.Run("profile="+strconv.Quote(profile), func(t *testing.T) {
-			setStorageEnv(t, profile, strayDSN, "some_schema")
+			setStorageEnv(t, storageEnv{
+				profile:  profile,
+				dsn:      strayDSN,
+				schema:   "some_schema",
+				redisURL: strayRedis,
+			})
 
 			cfg, err := loadStorageConfig(os.Getenv)
 			require.NoError(t, err)
 			require.Equal(t, profileInMemory, cfg.profile)
+			require.Equal(t, coordinationInMemory, cfg.coordination)
 			require.Empty(t, cfg.dsn)
 			require.Empty(t, cfg.schema)
+			require.Empty(t, cfg.redisURL)
 			require.Equal(t, sessionbackend.DefaultConfig(), cfg.sessionConfig())
 			require.NotContains(t, cfg.describe(), testPassword)
 
-			// And it stays in-memory all the way through construction. Building
-			// the session service is the only step there is: nothing opens a
-			// pool, pings, migrates, or builds a control plane.
+			// And it stays in-memory all the way through construction. The
+			// session service and the coordinator are the only steps there are:
+			// nothing opens a pool, pings, migrates, builds a control plane, or
+			// dials Redis.
 			stub := &stubStorage{}
 			stack, err := openStorage(context.Background(), cfg, stub.deps())
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, stack.close()) })
-			require.Equal(t, []string{"new sessions"}, stub.steps)
+			require.Equal(t, []string{"new sessions", "new coordinator"}, stub.steps)
 		})
 	}
 }
@@ -95,7 +125,7 @@ func TestLoadStorageConfigRejectsUnknownProfiles(t *testing.T) {
 		"true",
 	} {
 		t.Run(strconv.Quote(profile), func(t *testing.T) {
-			setStorageEnv(t, profile, "", "")
+			setStorageEnv(t, storageEnv{profile: profile})
 
 			_, err := loadStorageConfig(os.Getenv)
 			require.ErrorIs(t, err, errStorageConfig)
@@ -113,7 +143,7 @@ func TestLoadStorageConfigRejectsUnknownProfiles(t *testing.T) {
 func TestLoadStorageConfigRequiresADSNForPostgres(t *testing.T) {
 	for _, dsn := range []string{"", "   ", "\t", "\n\n", " \t\n "} {
 		t.Run(strconv.Quote(dsn), func(t *testing.T) {
-			setStorageEnv(t, string(profilePostgres), dsn, "")
+			setStorageEnv(t, storageEnv{profile: string(profilePostgres), dsn: dsn})
 
 			_, err := loadStorageConfig(os.Getenv)
 			require.ErrorIs(t, err, errStorageConfig)
@@ -144,7 +174,9 @@ func TestLoadStorageConfigRejectsABadSchema(t *testing.T) {
 		{name: "control character", schema: "sch\tema"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			setStorageEnv(t, string(profilePostgres), dsn, tc.schema)
+			setStorageEnv(t, storageEnv{
+				profile: string(profilePostgres), dsn: dsn, schema: tc.schema,
+			})
 
 			_, err := loadStorageConfig(os.Getenv)
 			require.ErrorIs(t, err, errStorageConfig)
@@ -155,7 +187,9 @@ func TestLoadStorageConfigRejectsABadSchema(t *testing.T) {
 	}
 
 	t.Run("a valid schema is accepted", func(t *testing.T) {
-		setStorageEnv(t, string(profilePostgres), dsn, "trpc_service")
+		setStorageEnv(t, storageEnv{
+			profile: string(profilePostgres), dsn: dsn, schema: "trpc_service",
+		})
 
 		cfg, err := loadStorageConfig(os.Getenv)
 		require.NoError(t, err)
@@ -169,7 +203,7 @@ func TestLoadStorageConfigRejectsABadSchema(t *testing.T) {
 	})
 
 	t.Run("no schema is accepted", func(t *testing.T) {
-		setStorageEnv(t, string(profilePostgres), dsn, "")
+		setStorageEnv(t, storageEnv{profile: string(profilePostgres), dsn: dsn})
 
 		cfg, err := loadStorageConfig(os.Getenv)
 		require.NoError(t, err)
@@ -184,9 +218,10 @@ func TestLoadStorageConfigRejectsABadSchema(t *testing.T) {
 // at that layer instead.
 func TestValidateRejectsASchemaTheEnvironmentCannotCarry(t *testing.T) {
 	err := storageConfig{
-		profile: profilePostgres,
-		dsn:     "postgres://user:" + testPassword + "@127.0.0.1:55432/db",
-		schema:  "sch\x00ema",
+		profile:      profilePostgres,
+		dsn:          "postgres://user:" + testPassword + "@127.0.0.1:55432/db",
+		schema:       "sch\x00ema",
+		coordination: coordinationInMemory,
 	}.validate()
 	require.ErrorIs(t, err, errStorageConfig)
 	require.ErrorIs(t, err, sessionbackend.ErrInvalidConfig)
@@ -206,7 +241,9 @@ func TestOpenStorageRefusesAProfileItDoesNotRecognise(t *testing.T) {
 			stub := &stubStorage{}
 
 			stack, err := openStorage(
-				context.Background(), storageConfig{profile: profile}, stub.deps())
+				context.Background(),
+				storageConfig{profile: profile, coordination: coordinationInMemory},
+				stub.deps())
 			require.ErrorIs(t, err, errStorageConfig)
 			require.ErrorContains(t, err, string(profileInMemory))
 			require.ErrorContains(t, err, string(profilePostgres))
@@ -217,31 +254,49 @@ func TestOpenStorageRefusesAProfileItDoesNotRecognise(t *testing.T) {
 	}
 }
 
-// The startup log is the one place a DSN could reach a file, so what describe
-// renders is part of the contract.
-func TestStorageConfigDescribeNeverRendersTheDSN(t *testing.T) {
-	const dsn = "postgres://user:" + testPassword + "@127.0.0.1:55432/db"
+// The startup log is the one place a connection string could reach a file, so
+// what describe renders is part of the contract. It says which backend is in use
+// and whether each connection string is present — never what is in one.
+func TestStorageConfigDescribeNeverRendersAConnectionString(t *testing.T) {
+	const (
+		dsn      = "postgres://user:" + testPassword + "@127.0.0.1:55432/db"
+		redisURL = "redis://:" + testPassword + "@127.0.0.1:56379/0"
+	)
 
 	described := storageConfig{
-		profile: profilePostgres,
-		dsn:     dsn,
-		schema:  "trpc_service",
+		profile:      profilePostgres,
+		dsn:          dsn,
+		schema:       "trpc_service",
+		coordination: coordinationRedis,
+		redisURL:     redisURL,
 	}.describe()
 	require.NotContains(t, described, testPassword)
 	require.NotContains(t, described, dsn)
+	require.NotContains(t, described, redisURL)
 	require.Contains(t, described, "profile=postgres")
 	require.Contains(t, described, "dsn=set")
 	require.Contains(t, described, "trpc_service")
+	require.Contains(t, described, "coordination=redis")
+	require.Contains(t, described, "redis_url=set")
 
-	require.Contains(t, storageConfig{profile: profilePostgres}.describe(), "dsn=absent")
-	require.Equal(t, "profile=inmemory", storageConfig{profile: profileInMemory}.describe())
+	absent := storageConfig{profile: profilePostgres, coordination: coordinationRedis}.describe()
+	require.Contains(t, absent, "dsn=absent")
+	require.Contains(t, absent, "redis_url=absent")
+
+	// The default process logs two words and mentions no connection string at
+	// all, because it has none.
+	require.Equal(t, "profile=inmemory coordination=inmemory", storageConfig{
+		profile: profileInMemory, coordination: coordinationInMemory,
+	}.describe())
 }
 
-// The default stack is the three concrete in-memory implementations, built
+// The default stack is the four concrete in-memory implementations, built
 // without a pool, a dial or a name lookup.
 func TestOpenStorageInMemoryBuildsTheConcreteImplementations(t *testing.T) {
 	stack, err := openStorage(
-		context.Background(), storageConfig{profile: profileInMemory}, defaultStorageDeps())
+		context.Background(),
+		storageConfig{profile: profileInMemory, coordination: coordinationInMemory},
+		defaultStorageDeps())
 	require.NoError(t, err)
 	require.NotNil(t, stack)
 	t.Cleanup(func() { require.NoError(t, stack.close()) })
@@ -249,7 +304,9 @@ func TestOpenStorageInMemoryBuildsTheConcreteImplementations(t *testing.T) {
 	require.IsType(t, (*tenant.MemoryRepository)(nil), stack.repository)
 	require.IsType(t, (*sessiondir.MemoryDirectory)(nil), stack.directory)
 	require.IsType(t, (*sessioninmemory.SessionService)(nil), stack.sessions)
+	require.IsType(t, (*sessionlease.MemoryCoordinator)(nil), stack.coordinator)
 	require.Empty(t, stack.connString, "there is no connection string to scrub")
+	require.Empty(t, stack.redisURL)
 }
 
 // openStorage validates before it constructs. This is checked on openStorage
@@ -263,19 +320,45 @@ func TestOpenStorageValidatesBeforeConstructingAnything(t *testing.T) {
 	}{
 		{
 			name: "postgres without a dsn",
-			cfg:  storageConfig{profile: profilePostgres},
+			cfg:  storageConfig{profile: profilePostgres, coordination: coordinationInMemory},
 		},
 		{
 			name: "postgres with a blank dsn",
-			cfg:  storageConfig{profile: profilePostgres, dsn: "   "},
+			cfg: storageConfig{
+				profile: profilePostgres, dsn: "   ", coordination: coordinationInMemory,
+			},
 		},
 		{
 			name: "postgres with a bad schema",
 			cfg: storageConfig{
-				profile: profilePostgres,
-				dsn:     "postgres://user:" + testPassword + "@127.0.0.1:55432/db",
-				schema:  "bad-schema",
+				profile:      profilePostgres,
+				dsn:          "postgres://user:" + testPassword + "@127.0.0.1:55432/db",
+				schema:       "bad-schema",
+				coordination: coordinationInMemory,
 			},
+		},
+		{
+			name: "an unrecognised coordination backend",
+			cfg: storageConfig{
+				profile:      profileInMemory,
+				coordination: "etcd",
+			},
+		},
+		{
+			name: "redis coordination over in-memory storage",
+			cfg: storageConfig{
+				profile:      profileInMemory,
+				coordination: coordinationRedis,
+				redisURL:     "redis://127.0.0.1:56379/0",
+			},
+		},
+		{
+			name: "redis coordination without a url",
+			cfg:  redisTestConfig(""),
+		},
+		{
+			name: "redis coordination with an unparseable url",
+			cfg:  redisTestConfig("redis://127.0.0.1:notaport/0"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -307,16 +390,53 @@ func TestOpenPostgresStorageRunsTheStepsInOrder(t *testing.T) {
 		"migrate",
 		"new control plane",
 		"new sessions",
+		"new coordinator",
 	}, stub.steps)
 	require.NotNil(t, stack.repository)
 	require.NotNil(t, stack.directory)
 	require.NotNil(t, stack.sessions)
+	require.NotNil(t, stack.coordinator)
 
-	// Shutdown releases what startup acquired, newest first: the session
-	// service holds a pool of its own, and the shared pool has to outlive
-	// everything reading through it.
+	// Shutdown releases what startup acquired, newest first: coordination stops
+	// handing out and renewing leases before the store those leases protect goes
+	// away, the session service holds a pool of its own, and the shared pool has
+	// to outlive everything reading through it.
 	require.NoError(t, stack.close())
-	require.Equal(t, []string{"session service", "postgres pool"}, stub.closed)
+	require.Equal(t, []string{"coordination", "session service", "postgres pool"}, stub.closed)
+}
+
+// The redis coordination backend adds three steps to the end of the same
+// sequence, and one more resource to unwind. The client is opened and pinged
+// before the coordinator that borrows it exists, and closed after it: a
+// coordinator that lost its connection first would answer every shutdown-time
+// call with an unavailable-backend error.
+func TestOpenPostgresStorageWithRedisCoordinationRunsTheStepsInOrder(t *testing.T) {
+	stub := &stubStorage{}
+
+	cfg := redisTestConfig("redis://127.0.0.1:56379/0")
+	stack, err := openStorage(context.Background(), cfg, stub.deps())
+	require.NoError(t, err)
+	require.NotNil(t, stack)
+
+	require.Equal(t, []string{
+		"open pool",
+		"ping",
+		"migrate",
+		"new control plane",
+		"new sessions",
+		"open redis",
+		"ping redis",
+		"new coordinator",
+	}, stub.steps)
+	require.NotNil(t, stack.coordinator)
+
+	require.NoError(t, stack.close())
+	require.Equal(t, []string{
+		"coordination",
+		"redis client",
+		"session service",
+		"postgres pool",
+	}, stub.closed)
 }
 
 // A failure part way through must leave nothing open. Each case fails one step
@@ -333,6 +453,10 @@ func TestOpenPostgresStorageClosesWhatItBuiltOnFailure(t *testing.T) {
 		{failAt: "migrate", closed: []string{"postgres pool"}},
 		{failAt: "new control plane", closed: []string{"postgres pool"}},
 		{failAt: "new sessions", closed: []string{"postgres pool"}},
+		{
+			failAt: "new coordinator",
+			closed: []string{"session service", "postgres pool"},
+		},
 	} {
 		t.Run("fails at "+tc.failAt, func(t *testing.T) {
 			stepErr := errors.New("step failure")
@@ -347,6 +471,57 @@ func TestOpenPostgresStorageClosesWhatItBuiltOnFailure(t *testing.T) {
 			require.Equal(t, tc.failAt, stub.steps[len(stub.steps)-1])
 		})
 	}
+}
+
+// The same, for the steps only the redis backend has. A client that was opened
+// and then abandoned by an early return holds its connections for the life of
+// the process, so "open redis succeeded but ping did not" has to close it.
+func TestOpenRedisCoordinationClosesWhatItBuiltOnFailure(t *testing.T) {
+	for _, tc := range []struct {
+		failAt string
+		closed []string
+	}{
+		{
+			failAt: "open redis",
+			closed: []string{"session service", "postgres pool"},
+		},
+		{
+			failAt: "ping redis",
+			closed: []string{"redis client", "session service", "postgres pool"},
+		},
+		{
+			failAt: "new coordinator",
+			closed: []string{"redis client", "session service", "postgres pool"},
+		},
+	} {
+		t.Run("fails at "+tc.failAt, func(t *testing.T) {
+			stepErr := errors.New("step failure")
+			stub := &stubStorage{failAt: tc.failAt, failErr: stepErr}
+
+			cfg := redisTestConfig("redis://127.0.0.1:56379/0")
+			stack, err := openStorage(context.Background(), cfg, stub.deps())
+			require.ErrorIs(t, err, stepErr)
+			require.Nil(t, stack)
+			require.Equal(t, tc.closed, nilIfEmpty(stub.closed))
+			require.Equal(t, tc.failAt, stub.steps[len(stub.steps)-1])
+		})
+	}
+}
+
+// An in-memory stack that failed to build its coordinator must not leave the
+// session service open either. It is the shortest startup there is, which is
+// exactly why the unwinding is easy to leave out of it.
+func TestOpenInMemoryStorageClosesWhatItBuiltOnFailure(t *testing.T) {
+	stepErr := errors.New("step failure")
+	stub := &stubStorage{failAt: "new coordinator", failErr: stepErr}
+
+	stack, err := openStorage(
+		context.Background(),
+		storageConfig{profile: profileInMemory, coordination: coordinationInMemory},
+		stub.deps())
+	require.ErrorIs(t, err, stepErr)
+	require.Nil(t, stack)
+	require.Equal(t, []string{"session service"}, stub.closed)
 }
 
 // A close that fails during a failed startup must not disappear behind the
@@ -382,22 +557,27 @@ func TestStorageStackCloseJoinsEveryFailureAndIsIdempotent(t *testing.T) {
 	closeErr := stack.close()
 	require.ErrorIs(t, closeErr, sessionsErr)
 	require.ErrorIs(t, closeErr, poolErr, "a failure closing one resource must not stop the next")
-	require.Equal(t, []string{"session service", "postgres pool"}, stub.closed)
+	expected := []string{"coordination", "session service", "postgres pool"}
+	require.Equal(t, expected, stub.closed)
 
 	// Closing again is a no-op, which is what lets the startup path close a
 	// partial stack and the shutdown path close on the way out without either
 	// having to know what the other did.
 	require.NoError(t, stack.close())
-	require.Equal(t, []string{"session service", "postgres pool"}, stub.closed)
+	require.Equal(t, expected, stub.closed)
 }
 
 // A pool reports a failure by echoing the string it was built from, and a close
 // failure ends up in the process's error like any other, so the shutdown path
-// needs the same redaction as the startup path.
-func TestStorageStackCloseScrubsTheConnectionString(t *testing.T) {
-	cfg := postgresTestConfig()
+// needs the same redaction as the startup path. One stack can hold resources
+// built from either connection string, so both are scrubbed out of every close
+// failure regardless of which resource produced it.
+func TestStorageStackCloseScrubsBothConnectionStrings(t *testing.T) {
+	const redisPassword = "r3dis-s3cret"
+	cfg := redisTestConfig("redis://:" + redisPassword + "@127.0.0.1:56379/0")
 	stub := &stubStorage{closeErrs: map[string]error{
 		"postgres pool": errors.New("cannot close " + cfg.dsn),
+		"redis client":  errors.New("cannot close " + cfg.redisURL),
 	}}
 
 	stack, err := openStorage(context.Background(), cfg, stub.deps())
@@ -406,7 +586,185 @@ func TestStorageStackCloseScrubsTheConnectionString(t *testing.T) {
 	closeErr := stack.close()
 	require.Error(t, closeErr)
 	require.NotContains(t, closeErr.Error(), testPassword)
+	require.NotContains(t, closeErr.Error(), redisPassword)
 	require.Contains(t, closeErr.Error(), "127.0.0.1", "the host is what makes it debuggable")
+	require.Contains(t, closeErr.Error(), "close postgres pool")
+	require.Contains(t, closeErr.Error(), "close redis client")
+}
+
+// The refusal to coordinate through Redis over sessions this process keeps to
+// itself is the one combination rule that protects anything: a lock every Worker
+// can see, over state none of them share, is a process that passes a smoke test
+// and prevents nothing. The message has to say so, because the operator who
+// configured it was trying to make the deployment safer.
+func TestValidateRefusesASharedLockOverUnsharedState(t *testing.T) {
+	err := storageConfig{
+		profile:      profileInMemory,
+		coordination: coordinationRedis,
+		redisURL:     "redis://127.0.0.1:56379/0",
+	}.validate()
+	require.ErrorIs(t, err, errStorageConfig)
+	require.ErrorContains(t, err, coordinationEnvVar)
+	require.ErrorContains(t, err, storageProfileEnvVar)
+}
+
+// An unknown coordination backend is a refusal, not a fallback, for the same
+// reason an unknown profile is: silently coordinating nothing is what puts two
+// Workers on one Session.
+func TestLoadStorageConfigRejectsUnknownCoordinationBackends(t *testing.T) {
+	for _, value := range []string{
+		"Redis",  // case matters
+		"REDIS",  //
+		" redis", // padding is not trimmed
+		"redis ", //
+		"inmemory\n",
+		"in-memory",
+		"memory",
+		"postgres", // a storage profile, not a coordination backend
+		"etcd",
+		"true",
+	} {
+		t.Run(strconv.Quote(value), func(t *testing.T) {
+			setStorageEnv(t, storageEnv{coordination: value})
+
+			_, err := loadStorageConfig(os.Getenv)
+			require.ErrorIs(t, err, errStorageConfig)
+			require.ErrorContains(t, err, coordinationEnvVar)
+			require.ErrorContains(t, err, string(coordinationInMemory))
+			require.ErrorContains(t, err, string(coordinationRedis))
+		})
+	}
+}
+
+// The redis coordination backend is refused before anything is opened if it has
+// no URL, and the refusal names the variable to set.
+func TestLoadStorageConfigRequiresARedisURL(t *testing.T) {
+	const dsn = "postgres://user:" + testPassword + "@127.0.0.1:55432/db"
+
+	for _, redisURL := range []string{"", "   ", "\t", " \t\n "} {
+		t.Run(strconv.Quote(redisURL), func(t *testing.T) {
+			setStorageEnv(t, storageEnv{
+				profile:      string(profilePostgres),
+				dsn:          dsn,
+				coordination: string(coordinationRedis),
+				redisURL:     redisURL,
+			})
+
+			_, err := loadStorageConfig(os.Getenv)
+			require.ErrorIs(t, err, errStorageConfig)
+			require.ErrorContains(t, err, redisURLEnvVar)
+		})
+	}
+}
+
+// A mistyped Redis URL is caught by configuration rather than by a dial, and the
+// refusal must not quote the URL back: go-redis's parse errors carry the string
+// they failed on, password and all. No network is involved — these URLs never
+// get as far as a connection.
+func TestLoadStorageConfigRejectsAnUnparseableRedisURLWithoutLeakingIt(t *testing.T) {
+	const dsn = "postgres://user:" + testPassword + "@127.0.0.1:55432/db"
+
+	for _, tc := range []struct {
+		name     string
+		redisURL string
+	}{
+		{
+			name:     "wrong scheme",
+			redisURL: "http://:" + testPassword + "@127.0.0.1:56379/0",
+		},
+		{
+			name:     "no scheme",
+			redisURL: "127.0.0.1:56379",
+		},
+		{
+			name:     "unparseable port",
+			redisURL: "redis://:" + testPassword + "@127.0.0.1:notaport/0",
+		},
+		{
+			name:     "unparseable database number",
+			redisURL: "redis://:" + testPassword + "@127.0.0.1:56379/notadb",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setStorageEnv(t, storageEnv{
+				profile:      string(profilePostgres),
+				dsn:          dsn,
+				coordination: string(coordinationRedis),
+				redisURL:     tc.redisURL,
+			})
+
+			_, err := loadStorageConfig(os.Getenv)
+			require.ErrorIs(t, err, errStorageConfig)
+			require.NotContains(t, err.Error(), testPassword)
+			// It still has to say which setting was wrong.
+			require.ErrorContains(t, err, redisURLEnvVar)
+		})
+	}
+}
+
+// openLeaseRedisClient is the second place the URL could leak, and unlike
+// validate it runs after the process has decided to start. NewClient does not
+// dial, so nothing here reaches a network either way.
+func TestOpenLeaseRedisClientDoesNotLeakThePassword(t *testing.T) {
+	client, closeClient, err := openLeaseRedisClient(
+		context.Background(),
+		redisTestConfig("redis://:"+testPassword+"@127.0.0.1:notaport/0"),
+	)
+	require.Error(t, err)
+	require.Nil(t, client)
+	require.Nil(t, closeClient)
+	require.NotContains(t, err.Error(), testPassword)
+	require.ErrorContains(t, err, redisURLEnvVar)
+}
+
+// The counterpart: a usable URL produces a client without contacting anything.
+// go-redis dials lazily, which is why openCoordination pings — if that ever
+// changes, this test fails on a refused connection.
+func TestOpenLeaseRedisClientDoesNotConnect(t *testing.T) {
+	client, closeClient, err := openLeaseRedisClient(
+		context.Background(),
+		// Port 1 with nothing listening: no packet leaves the machine either way.
+		redisTestConfig("redis://:"+testPassword+"@127.0.0.1:1/0"),
+	)
+	require.NoError(t, err, "creating a client must not depend on a reachable server")
+	require.NotNil(t, client)
+	require.NotNil(t, closeClient)
+	require.NoError(t, closeClient())
+}
+
+// The lease timings are expressed as contexts — the acquire budget, the renewal
+// loop's per-call timeout, the release deadline — and on a go-redis client they
+// reach the socket only when the client was built with ContextTimeoutEnabled.
+// Without it every one of those deadlines stops at the client boundary and what
+// actually bounds a command on the wire is this client's own ReadTimeout and
+// MaxRetries, which nothing in the lease timings knows about.
+//
+// Nothing here dials: NewClient is lazy, and this only reads back the options
+// the factory built.
+func TestOpenLeaseRedisClientLetsLeaseDeadlinesReachTheSocket(t *testing.T) {
+	const url = "redis://:" + testPassword + "@127.0.0.1:1/0"
+
+	// The factory is what turns it on, not the library and not the URL. ParseURL
+	// leaves it false, and go-redis rejects query keys it does not recognise, so
+	// an operator cannot supply it either.
+	parsed, err := goredis.ParseURL(url)
+	require.NoError(t, err)
+	require.False(t, parsed.ContextTimeoutEnabled,
+		"if ParseURL ever starts defaulting this on, the assertion below stops "+
+			"proving anything about this factory")
+	_, err = goredis.ParseURL(url + "?context_timeout_enabled=true")
+	require.Error(t, err, "there is no URL parameter for it; this is the only place it can be set")
+
+	client, closeClient, err := openLeaseRedisClient(context.Background(), redisTestConfig(url))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, closeClient()) })
+
+	concrete, ok := client.(*goredis.Client)
+	require.True(t, ok, "openLeaseRedisClient builds a single-node client (got %T)", client)
+	require.True(t, concrete.Options().ContextTimeoutEnabled,
+		"without this the coordinator's Ping, Acquire, Renew and Release are "+
+			"bounded by the client's read timeout rather than by the contexts "+
+			"sessionlease gives them")
 }
 
 // The parse failure is the one that leaks: pgx redacts the copy of the
@@ -519,7 +877,7 @@ func TestOpenControlPlanePoolDoesNotConnect(t *testing.T) {
 // is broken too: if the order were ever reversed, this would fail with the
 // storage error instead.
 func TestRunRefusesANonLoopbackAddrBeforeItTouchesStorage(t *testing.T) {
-	setStorageEnv(t, "nonsense-profile", "", "")
+	setStorageEnv(t, storageEnv{profile: "nonsense-profile"})
 
 	err := run("192.0.2.1:8080")
 	require.ErrorContains(t, err, "refusing to listen")
@@ -530,11 +888,25 @@ func TestRunRefusesANonLoopbackAddrBeforeItTouchesStorage(t *testing.T) {
 // still without binding anything: openStorage is reached and returns before the
 // HTTP server exists.
 func TestRunRefusesABrokenStorageConfiguration(t *testing.T) {
-	setStorageEnv(t, string(profilePostgres), "", "")
+	setStorageEnv(t, storageEnv{profile: string(profilePostgres)})
 
 	err := run("127.0.0.1:0")
 	require.ErrorIs(t, err, errStorageConfig)
 	require.ErrorContains(t, err, postgresDSNEnvVar)
+}
+
+// The same, on the coordination axis: a combination that cannot be safe is
+// refused before the listener exists, not after the first request finds two
+// Workers on one Session.
+func TestRunRefusesABrokenCoordinationConfiguration(t *testing.T) {
+	setStorageEnv(t, storageEnv{
+		coordination: string(coordinationRedis),
+		redisURL:     "redis://127.0.0.1:56379/0",
+	})
+
+	err := run("127.0.0.1:0")
+	require.ErrorIs(t, err, errStorageConfig)
+	require.ErrorContains(t, err, coordinationEnvVar)
 }
 
 // postgresTestConfig is a syntactically valid postgres configuration. Nothing
@@ -542,18 +914,29 @@ func TestRunRefusesABrokenStorageConfiguration(t *testing.T) {
 // would.
 func postgresTestConfig() storageConfig {
 	return storageConfig{
-		profile: profilePostgres,
-		dsn:     "postgres://user:" + testPassword + "@127.0.0.1:55432/db",
-		schema:  "trpc_service",
+		profile:      profilePostgres,
+		dsn:          "postgres://user:" + testPassword + "@127.0.0.1:55432/db",
+		schema:       "trpc_service",
+		coordination: coordinationInMemory,
 	}
 }
 
-// stubStorage replaces the five steps that touch a database, records what ran
-// and what was released, and can fail any one step.
+// redisTestConfig is the same configuration with coordination moved to redis.
+// The URL is a parameter because several tests are about which URLs are refused.
+func redisTestConfig(redisURL string) storageConfig {
+	cfg := postgresTestConfig()
+	cfg.coordination = coordinationRedis
+	cfg.redisURL = redisURL
+	return cfg
+}
+
+// stubStorage replaces the eight steps that touch a database or a Redis, records
+// what ran and what was released, and can fail any one step.
 //
-// It hands out a nil *pgxpool.Pool on purpose: every step that would use one is
-// replaced alongside openPool, so a nil pool reaching a real call is a bug this
-// makes obvious rather than one it hides behind a mock.
+// It hands out a nil *pgxpool.Pool and a nil redis client on purpose: every step
+// that would use one is replaced alongside the step that opens it, so a nil
+// reaching a real call is a bug this makes obvious rather than one it hides
+// behind a mock.
 type stubStorage struct {
 	steps  []string
 	closed []string
@@ -592,6 +975,21 @@ func (s *stubStorage) deps() storageDeps {
 			}
 			return &stubSessionService{closeFn: s.closer("session service")}, nil
 		},
+		openRedis: func(context.Context, storageConfig) (goredis.UniversalClient, func() error, error) {
+			if err := s.step("open redis"); err != nil {
+				return nil, nil, err
+			}
+			return nil, s.closer("redis client"), nil
+		},
+		pingRedis: func(context.Context, goredis.UniversalClient) error {
+			return s.step("ping redis")
+		},
+		newCoordinator: func(storageConfig, goredis.UniversalClient) (sessionlease.Coordinator, error) {
+			if err := s.step("new coordinator"); err != nil {
+				return nil, err
+			}
+			return &stubCoordinator{closeFn: s.closer("coordination")}, nil
+		},
 	}
 }
 
@@ -620,6 +1018,16 @@ type stubSessionService struct {
 }
 
 func (s *stubSessionService) Close() error { return s.closeFn() }
+
+// stubCoordinator is a sessionlease.Coordinator that only implements Close.
+// Nothing in this file acquires a lease; the startup sequence is what is under
+// test, so Acquire is left to panic if that ever stops being true.
+type stubCoordinator struct {
+	sessionlease.Coordinator
+	closeFn func() error
+}
+
+func (s *stubCoordinator) Close() error { return s.closeFn() }
 
 // nilIfEmpty lets a table say "nothing was closed" as nil.
 func nilIfEmpty(values []string) []string {

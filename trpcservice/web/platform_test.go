@@ -15,6 +15,7 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -325,10 +326,16 @@ func TestPlatformPublishesHeadersBeforeAdapterErrors(t *testing.T) {
 	require.Equal(t, 1, platform.directory.Size())
 }
 
-// Two first runs of one session can resolve different candidates before either
-// reaches the directory. Both must end up on the single winner, and the loser
-// has to hand its runtime lease back.
-func TestPlatformConcurrentFirstRunsAgreeOnOneRevision(t *testing.T) {
+// Two first runs of one session used to reach the directory together and race
+// for the pin; the run lease now serializes them before either resolves a
+// candidate. Both still end up on the single winning revision, and the refused
+// one has to leave no runtime lease behind.
+//
+// The directory's own guarantee for genuinely simultaneous EnsurePin callers is
+// not weakened by this, it just stops being reachable through one process's
+// chat endpoint. It is proven directly, against every implementation, by
+// sessiondirtest.EnsurePinConcurrently.
+func TestPlatformSerializesConcurrentRunsOfOneSession(t *testing.T) {
 	barrier := &barrierDirectory{
 		inner:   sessiondir.NewMemoryDirectory(),
 		arrived: make(chan struct{}),
@@ -347,31 +354,30 @@ func TestPlatformConcurrentFirstRunsAgreeOnOneRevision(t *testing.T) {
 	defaulted := chatHeaders(keyTenantA, appAssistant)
 	defaulted[HeaderSessionID] = "conversation-1"
 
-	responses := make(chan *httptest.ResponseRecorder, 2)
-	for _, headers := range []map[string]string{hinted, defaulted} {
-		go func(headers map[string]string) {
-			responses <- doChat(t, platform.handler, `{
-				"model":"ignored","messages":[{"role":"user","content":"concurrent"}]
-			}`, headers)
-		}(headers)
-	}
-	// Both requests are now holding a resolved candidate and are parked in
-	// EnsurePin, so neither could have seen the other's pin.
+	body := `{"model":"ignored","messages":[{"role":"user","content":"concurrent"}]}`
+	firstCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstCh <- doChat(t, platform.handler, body, hinted) }()
+
+	// The first request holds the lease and is parked in EnsurePin. The second
+	// arrives while it is there, so it is refused without resolving anything.
 	barrier.awaitArrival(t)
-	barrier.awaitArrival(t)
+	refused := doChat(t, platform.handler, body, defaulted)
+	require.Equal(t, http.StatusConflict, refused.Code, refused.Body.String())
+	require.Contains(t, refused.Body.String(), `"code":"session_busy"`)
+	require.Equal(t, "2", refused.Header().Get(HeaderRetryAfter))
+
 	barrier.releaseAll()
-
-	first := <-responses
-	second := <-responses
+	first := <-firstCh
 	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
-	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
-
 	winner := first.Header().Get(HeaderAgentRevisionID)
-	require.Contains(t, []string{"revision-1", "revision-2"}, winner)
+	require.Equal(t, "revision-1", winner)
+
+	// Retrying after the first run finished works, and lands on the same pin.
+	second := doChat(t, platform.handler, body, defaulted)
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
 	require.Equal(t, winner, second.Header().Get(HeaderAgentRevisionID))
-	winnerModel := map[string]string{"revision-1": "echo-v1", "revision-2": "echo-v2"}[winner]
-	require.Contains(t, first.Body.String(), `"model":"`+winnerModel+`"`)
-	require.Contains(t, second.Body.String(), `"model":"`+winnerModel+`"`)
+	require.Contains(t, first.Body.String(), `"model":"echo-v1"`)
+	require.Contains(t, second.Body.String(), `"model":"echo-v1"`)
 
 	pinned, found, err := barrier.inner.GetPin(context.Background(), sessiondir.Key{
 		TenantID:    "tenant-a",
@@ -383,8 +389,8 @@ func TestPlatformConcurrentFirstRunsAgreeOnOneRevision(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, winner, pinned)
 
-	// Close only returns once every lease is back, so a loser that kept its
-	// lease would hang here instead of reporting a leak.
+	// Close only returns once every lease is back, so a refusal that kept one
+	// would hang here instead of reporting a leak.
 	closed := make(chan error, 1)
 	go func() { closed <- platform.resolver.Close() }()
 	select {
@@ -544,6 +550,7 @@ func TestPlatformRejectsRuntimeWithoutOpenAIHandler(t *testing.T) {
 		}),
 		newTestAuthenticator(t),
 		sessiondir.NewMemoryDirectory(),
+		newTestCoordinator(t),
 	)
 	require.NoError(t, err)
 
@@ -565,17 +572,25 @@ func TestNewPlatformServerRequiresEveryDependency(t *testing.T) {
 	})
 	authenticator := newTestAuthenticator(t)
 	directory := sessiondir.NewMemoryDirectory()
+	leases := newTestCoordinator(t)
 
-	_, err := NewPlatformServer(nil, resolver, authenticator, directory)
+	_, err := NewPlatformServer(nil, resolver, authenticator, directory, leases)
 	require.ErrorContains(t, err, "tenant repository is required")
-	_, err = NewPlatformServer(repository, nil, authenticator, directory)
+	_, err = NewPlatformServer(repository, nil, authenticator, directory, leases)
 	require.ErrorContains(t, err, "runtime resolver is required")
-	_, err = NewPlatformServer(repository, resolver, nil, directory)
+	_, err = NewPlatformServer(repository, resolver, nil, directory, leases)
 	require.ErrorContains(t, err, "chat authenticator is required")
-	_, err = NewPlatformServer(repository, resolver, authenticator, nil)
+	_, err = NewPlatformServer(repository, resolver, authenticator, nil, leases)
 	require.ErrorContains(t, err, "session directory is required")
+	// No fallback to a process-wide coordinator: a platform that silently
+	// coordinated through its own memory would be exclusive against nothing but
+	// itself, which is worse than refusing to start.
+	_, err = NewPlatformServer(repository, resolver, authenticator, directory, nil)
+	require.ErrorContains(t, err, "session lease coordinator is required")
 
-	server, err := NewPlatformServer(repository, resolver, authenticator, directory)
+	server, err := NewPlatformServer(
+		repository, resolver, authenticator, directory, leases,
+	)
 	require.NoError(t, err)
 	require.NotNil(t, server.Handler())
 }
@@ -610,6 +625,9 @@ func TestPlatformHTTPMethodAndCORS(t *testing.T) {
 	exposed := preflight.Header().Get("Access-Control-Expose-Headers")
 	require.Contains(t, exposed, HeaderSessionID)
 	require.Contains(t, exposed, HeaderAgentRevisionID)
+	// Retry-After is the only actionable part of a 409 session_busy, and a
+	// browser cannot read it unless it is exposed.
+	require.Contains(t, exposed, HeaderRetryAfter)
 	require.Equal(t, http.MethodPost, preflight.Header().Get("Access-Control-Allow-Methods"))
 }
 
@@ -673,6 +691,7 @@ func TestPlatformPublishesCORSHeadersOnEarlyRefusals(t *testing.T) {
 			exposed := response.Header().Get("Access-Control-Expose-Headers")
 			require.Contains(t, exposed, HeaderSessionID)
 			require.Contains(t, exposed, HeaderAgentRevisionID)
+			require.Contains(t, exposed, HeaderRetryAfter)
 		})
 	}
 
@@ -693,11 +712,47 @@ type platformTestServer struct {
 	resolver  *platformagent.RuntimeResolver
 	sessions  session.Service
 	directory *sessiondir.MemoryDirectory
+
+	// leases is what the platform coordinates through, and leaseStore is the
+	// state behind it. A test that needs a second Worker builds another
+	// coordinator over the same store; see peerCoordinator.
+	leases     sessionlease.Coordinator
+	leaseStore *sessionlease.MemoryStore
+}
+
+// platformTestOptions replaces what used to be a growing parameter list. Every
+// field is optional and the zero value is the ordinary platform.
+type platformTestOptions struct {
+	// directory wraps the pin store, so a test can park or observe a run at the
+	// point where it has the lease but has not yet resolved a revision.
+	directory chatDirectory
+
+	// coordinator replaces the in-memory one entirely, for the failure modes a
+	// working coordinator cannot be made to produce.
+	coordinator sessionlease.Coordinator
+
+	// lease tunes the timings of the default coordinator. The zero value is the
+	// production 15s TTL, which is what most tests want: a lease that cannot
+	// expire underneath them.
+	lease sessionlease.Config
+}
+
+// chatDirectory is what the platform is handed: a directory, plus whatever a
+// test wrapper needs from it.
+type chatDirectory interface {
+	sessiondir.Directory
+	// inner returns the real directory the wrapper delegates to, so assertions
+	// read the pins rather than the wrapper.
+	unwrap() *sessiondir.MemoryDirectory
+	// cleanup releases anything parked in the wrapper. It runs before the
+	// resolver is closed, so a failed test never leaves a request waiting while
+	// Close waits for its lease.
+	cleanup()
 }
 
 func newPlatformTestServer(t *testing.T) *platformTestServer {
 	t.Helper()
-	return newPlatformTestServerWithDirectory(t, nil)
+	return newPlatformTestServerWith(t, platformTestOptions{})
 }
 
 // newPlatformTestServerWithDirectory lets a test observe or delay the pin
@@ -705,6 +760,17 @@ func newPlatformTestServer(t *testing.T) *platformTestServer {
 func newPlatformTestServerWithDirectory(
 	t *testing.T,
 	wrapper *barrierDirectory,
+) *platformTestServer {
+	t.Helper()
+	if wrapper == nil {
+		return newPlatformTestServerWith(t, platformTestOptions{})
+	}
+	return newPlatformTestServerWith(t, platformTestOptions{directory: wrapper})
+}
+
+func newPlatformTestServerWith(
+	t *testing.T,
+	opts platformTestOptions,
 ) *platformTestServer {
 	t.Helper()
 	repository := tenant.NewMemoryRepository()
@@ -723,24 +789,60 @@ func newPlatformTestServerWithDirectory(
 	t.Cleanup(func() { require.NoError(t, resolver.Close()) })
 
 	directory := sessiondir.NewMemoryDirectory()
-	var chatDirectory sessiondir.Directory = directory
-	if wrapper != nil {
-		directory = wrapper.inner
-		chatDirectory = wrapper
-		// Runs before the resolver is closed, so a failed test never leaves a
-		// request parked at the barrier while Close waits for its lease.
-		t.Cleanup(wrapper.releaseAll)
+	var chat sessiondir.Directory = directory
+	if opts.directory != nil {
+		directory = opts.directory.unwrap()
+		chat = opts.directory
+		t.Cleanup(opts.directory.cleanup)
 	}
+
+	store := sessionlease.NewMemoryStore()
+	coordinator := opts.coordinator
+	if coordinator == nil {
+		concrete, coordErr := sessionlease.NewMemoryCoordinator(store, opts.lease)
+		require.NoError(t, coordErr)
+		coordinator = concrete
+	}
+	// Before the resolver's cleanup, so a run that is only still alive because
+	// it holds a lease is cut loose before Close waits for it.
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
+
 	server, err := NewPlatformServer(
-		repository, resolver, newTestAuthenticator(t), chatDirectory,
+		repository, resolver, newTestAuthenticator(t), chat, coordinator,
 	)
 	require.NoError(t, err)
 	return &platformTestServer{
-		handler:   server.Handler(),
-		resolver:  resolver,
-		sessions:  sessionService,
-		directory: directory,
+		handler:    server.Handler(),
+		resolver:   resolver,
+		sessions:   sessionService,
+		directory:  directory,
+		leases:     coordinator,
+		leaseStore: store,
 	}
+}
+
+// newTestCoordinator is the coordinator for tests that only need the platform
+// to have one, and never contend for a session.
+func newTestCoordinator(t *testing.T) sessionlease.Coordinator {
+	t.Helper()
+	coordinator, err := sessionlease.NewMemoryCoordinator(
+		sessionlease.NewMemoryStore(), sessionlease.Config{},
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
+	return coordinator
+}
+
+// peerCoordinator is a second Worker over the same lease state: what the Redis
+// backend gives two processes, the memory backend gives two coordinators over
+// one store. It is how these tests both hold a session against the platform and
+// check whether the platform gave one back.
+func (p *platformTestServer) peerCoordinator(t *testing.T) sessionlease.Coordinator {
+	t.Helper()
+	peer, err := sessionlease.NewMemoryCoordinator(p.leaseStore, sessionlease.Config{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, peer.Close()) })
+	return peer
 }
 
 func newTestAuthenticator(t *testing.T) identity.Authenticator {
@@ -808,6 +910,69 @@ func (d *barrierDirectory) awaitArrival(t *testing.T) {
 func (d *barrierDirectory) releaseAll() {
 	d.releaseOnce.Do(func() { close(d.release) })
 }
+
+func (d *barrierDirectory) unwrap() *sessiondir.MemoryDirectory { return d.inner }
+
+func (d *barrierDirectory) cleanup() { d.releaseAll() }
+
+// contextDirectory parks a run the same way barrierDirectory does, but hands
+// the test the run's context. That context is the one the platform derived from
+// the lease, so it is what a test asserts on when it wants to know whether
+// losing a lease actually stops the run that held it.
+type contextDirectory struct {
+	inner       *sessiondir.MemoryDirectory
+	arrived     chan context.Context
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func newContextDirectory() *contextDirectory {
+	return &contextDirectory{
+		inner:   sessiondir.NewMemoryDirectory(),
+		arrived: make(chan context.Context, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (d *contextDirectory) GetPin(
+	ctx context.Context,
+	key sessiondir.Key,
+) (string, bool, error) {
+	return d.inner.GetPin(ctx, key)
+}
+
+func (d *contextDirectory) EnsurePin(
+	ctx context.Context,
+	key sessiondir.Key,
+	candidateRevisionID string,
+) (string, error) {
+	select {
+	case d.arrived <- ctx:
+	default:
+	}
+	<-d.release
+	return d.inner.EnsurePin(ctx, key, candidateRevisionID)
+}
+
+// awaitRunContext returns the context the parked run is executing under.
+func (d *contextDirectory) awaitRunContext(t *testing.T) context.Context {
+	t.Helper()
+	select {
+	case ctx := <-d.arrived:
+		return ctx
+	case <-time.After(10 * time.Second):
+		t.Fatal("a chat request never reached EnsurePin")
+		return nil
+	}
+}
+
+func (d *contextDirectory) releaseAll() {
+	d.releaseOnce.Do(func() { close(d.release) })
+}
+
+func (d *contextDirectory) unwrap() *sessiondir.MemoryDirectory { return d.inner }
+
+func (d *contextDirectory) cleanup() { d.releaseAll() }
 
 func seedTenantAppRevision(
 	t *testing.T,

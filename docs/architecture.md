@@ -247,7 +247,7 @@ Gateway 和 Worker 都保持无状态。运行中的 HTTP/SSE 连接只绑定当
 
 ## 7. 并发与故障边界
 
-- 同一 Session 默认串行执行。Run Coordinator 使用 Redis 租约锁，锁值包含随机 owner token 和单调 fencing token，并由 Worker 续约；失去租约立即取消 `context.Context`。Session 装饰器在写入前拒绝落后的 fencing token，避免暂停后的旧 Worker 回写。
+- 同一 Session 默认串行执行。Run Coordinator 使用 Redis 租约锁，锁值是随机 owner token，由 Worker 续约；失去租约立即取消 `context.Context`，第二个 Worker 在 Run 入口收到 `409 session_busy`。**这把租约是合作型的**：它把并发写者挡在入口，但不阻止已经在运行的写者继续写。获取租约时 `INCR` 出的单调 token 目前只是观测句柄，**不参与 Session 写入准入**——上游 `session.Service.AppendEvent` 没有 fence/CAS 参数，`WithAppendEventHook` 与后端写入之间也不是原子的，因此"装饰器在写入前拒绝落后 token"在当前上游接口下做不出来，不能称为 enforcement fencing。实现与边界见 [Session Run Lease](session-lease.md)。
 - 不同 Session 可并行执行。同一租户和 Agent 还受并发数、token 和费用配额约束。
 - Runner 返回的 Event Channel 必须由唯一消费者持续读取，直到关闭或完成取消后的排空，防止 goroutine 泄漏。
 - 入站消息、Run 和出站回复都有稳定幂等键。模型推理可以重试，具有副作用的 Tool 必须接收业务幂等键。
