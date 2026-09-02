@@ -18,10 +18,10 @@
 - [持久化 Session 后端 Spike](session-backend.md)：上游 PostgreSQL/Redis Session 子模块的版本、兼容验证、语义差异、集成测试运行方式和未实现边界。
 - [Session Run Lease](session-lease.md)：多 Worker 同 Session 的合作型 Run 租约——作用域与 key 布局、续约与 TTL 接管、HTTP 409/503 与释放规则、进程配置组合，以及"不是 enforcement fencing"这条边界。
 - [Tool 与 Policy Runtime](tool-policy.md)：静态 Registry、Revision 工具白名单、模型工具循环、结构化审计、离线 SSE 闭环测试和当前授权边界。
+- [身份、权限与密钥治理](security-and-governance.md)：对话面/控制面两条互不相交的凭据链路、`platform_admin`/`tenant_admin` 角色模型、Admin 请求处理顺序、Security Manifest 的严格解析、租户 SecretRef/PolicyRef entitlement、Runtime 构建顺序和发布态摘要校验，以及明确未实现的部分。
 
 ## 待建立
 
-- `security-and-governance.md`：身份、权限、密钥、Guardrail、预算、脱敏和审计。
 - `observability.md`：日志、指标、Trace、成本和告警规范。
 - `operations.md`：故障恢复、灰度、回滚、容量和部署方案。
 - `adr/`：影响多个模块或长期兼容性的架构决策记录。

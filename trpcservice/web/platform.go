@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -56,13 +57,20 @@ type runtimeResolver interface {
 
 // PlatformServer exposes the control plane and routes authenticated chat
 // traffic to the revision each session is pinned to.
+//
+// The two authenticators are separate fields of separate types, so a chat
+// credential cannot reach an admin route and an admin credential cannot reach a
+// chat one. That isolation is a property of the type system here, not of a
+// comparison somewhere in a handler.
 type PlatformServer struct {
-	repository    tenant.Repository
-	resolver      runtimeResolver
-	authenticator identity.Authenticator
-	sessions      sessiondir.Directory
-	leases        sessionlease.Coordinator
-	handler       http.Handler
+	repository tenant.Repository
+	resolver   runtimeResolver
+	chat       identity.Authenticator
+	admin      identity.AdminAuthenticator
+	revisions  security.RevisionAuthorizer
+	sessions   sessiondir.Directory
+	leases     sessionlease.Coordinator
+	handler    http.Handler
 }
 
 // NewPlatformServer builds the server. Every dependency is a parameter,
@@ -70,10 +78,17 @@ type PlatformServer struct {
 // coordination must fail to build rather than fall back to a package-level
 // default that coordinates nothing, which is precisely the deployment where two
 // Workers end up running one Session.
+//
+// The same applies to the admin authenticator and the revision authorizer.
+// Neither has a permissive default and neither may be nil: a control plane that
+// started with no way to authenticate, or with no opinion on which revisions
+// may run, is a control plane whose safety depends on nobody finding it.
 func NewPlatformServer(
 	repository tenant.Repository,
 	resolver runtimeResolver,
-	authenticator identity.Authenticator,
+	chatAuthenticator identity.Authenticator,
+	adminAuthenticator identity.AdminAuthenticator,
+	revisionAuthorizer security.RevisionAuthorizer,
 	sessions sessiondir.Directory,
 	leases sessionlease.Coordinator,
 ) (*PlatformServer, error) {
@@ -83,8 +98,14 @@ func NewPlatformServer(
 	if resolver == nil {
 		return nil, fmt.Errorf("web: runtime resolver is required")
 	}
-	if authenticator == nil {
+	if chatAuthenticator == nil {
 		return nil, fmt.Errorf("web: chat authenticator is required")
+	}
+	if adminAuthenticator == nil {
+		return nil, fmt.Errorf("web: admin authenticator is required")
+	}
+	if revisionAuthorizer == nil {
+		return nil, fmt.Errorf("web: revision authorizer is required")
 	}
 	if sessions == nil {
 		return nil, fmt.Errorf("web: session directory is required")
@@ -93,19 +114,56 @@ func NewPlatformServer(
 		return nil, fmt.Errorf("web: session lease coordinator is required")
 	}
 	server := &PlatformServer{
-		repository:    repository,
-		resolver:      resolver,
-		authenticator: authenticator,
-		sessions:      sessions,
-		leases:        leases,
+		repository: repository,
+		resolver:   resolver,
+		chat:       chatAuthenticator,
+		admin:      adminAuthenticator,
+		revisions:  revisionAuthorizer,
+		sessions:   sessions,
+		leases:     leases,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
-	mux.HandleFunc("/admin/v1/tenants", server.handleAdmin)
-	mux.HandleFunc("/admin/v1/tenants/", server.handleAdmin)
 	mux.HandleFunc("/v1/chat/completions", server.handleChatCompletions)
-	server.handler = mux
+	// The admin subtree is deliberately not registered on the mux: it is taken
+	// before the mux runs at all. See adminFirst.
+	server.handler = adminFirst(mux, server.handleAdmin)
 	return server, nil
+}
+
+// adminFirst puts the control-plane trust boundary in front of the router.
+//
+// The whole /admin subtree is one handler, not just the paths that exist. Left
+// to a router, every other admin path would be answered by the router itself —
+// before anything has authenticated — so "does this admin route exist" would be
+// a question any unauthenticated caller could ask.
+//
+// http.ServeMux cannot be that router, because it answers about /admin before
+// it dispatches: it cleans the request path first, and a path that changes
+// under cleaning gets a 301 to the cleaned form no matter what is registered.
+// /admin//v1/tenants, /admin/./v1/tenants and /admin/v1/tenants/../secrets are
+// each a redirect written for a caller holding no credential. So the prefix is
+// matched here, on the raw URL.Path, and handleAdmin runs before the mux ever
+// sees the request.
+//
+// handleAdmin then routes on that same raw path by exact comparison, which is
+// what makes this safe rather than merely quiet: no traversal is resolved on
+// the way in, so a path that spells a real route oddly is not that route. It
+// authenticates, and is then a 404 like any other name that is not there.
+func adminFirst(mux http.Handler, admin http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isAdminPath(r.URL.Path) {
+			admin(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// isAdminPath reports whether path addresses the control plane. The bare
+// prefix is included: /admin is answered, never redirected to /admin/.
+func isAdminPath(path string) bool {
+	return path == adminPathPrefix || strings.HasPrefix(path, adminPathPrefix+"/")
 }
 
 func (s *PlatformServer) Handler() http.Handler {
@@ -323,7 +381,7 @@ func (s *PlatformServer) authenticateChat(
 		writeUnauthenticated(w, "a Bearer credential is required")
 		return identity.Identity{}, false
 	}
-	caller, err := s.authenticator.Authenticate(r.Context(), token)
+	caller, err := s.chat.Authenticate(r.Context(), token)
 	if err != nil {
 		if errors.Is(err, identity.ErrForbidden) {
 			writeAPIError(w, http.StatusForbidden, "forbidden", "this credential is not allowed")

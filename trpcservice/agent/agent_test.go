@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -138,9 +139,11 @@ func TestRuntimeCloseKeepsSharedSessionService(t *testing.T) {
 	shared := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, shared.Close()) })
 
-	first, err := NewRuntimeFromRevision(publishedRevision("revision-1", "echo-v1"), shared)
+	firstRevision := publishedRevision("revision-1", "echo-v1")
+	first, err := NewRuntimeFromRevision(firstRevision, shared, entitling(t, firstRevision))
 	require.NoError(t, err)
-	second, err := NewRuntimeFromRevision(publishedRevision("revision-2", "echo-v2"), shared)
+	secondRevision := publishedRevision("revision-2", "echo-v2")
+	second, err := NewRuntimeFromRevision(secondRevision, shared, entitling(t, secondRevision))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, second.Close()) })
 
@@ -164,8 +167,17 @@ func TestRuntimeCloseKeepsSharedSessionService(t *testing.T) {
 	require.GreaterOrEqual(t, sess.GetEventCount(), 2)
 }
 
+// publishedRevision builds a revision the way the repository would have: with a
+// ConfigDigest computed from the config it carries.
+//
+// The digest is not decoration here. A Runtime re-derives it and refuses a
+// revision whose stored digest does not match, so a helper that left it empty
+// would produce revisions no test could build — and, worse, a helper that
+// hard-coded one would keep passing after the config beside it changed.
+//
+// Callers that mutate Config afterwards must re-seal it.
 func publishedRevision(revisionID string, modelName string) tenant.AgentRevision {
-	return tenant.AgentRevision{
+	return sealed(tenant.AgentRevision{
 		ID:         revisionID,
 		TenantID:   "tenant-a",
 		AgentAppID: "assistant",
@@ -175,7 +187,54 @@ func publishedRevision(revisionID string, modelName string) tenant.AgentRevision
 			Instruction: "Answer through the deterministic model.",
 			Model:       tenant.ModelConfig{Provider: "deterministic", Name: modelName},
 		},
+	})
+}
+
+// sealed returns revision with its digest recomputed over its current config.
+func sealed(revision tenant.AgentRevision) tenant.AgentRevision {
+	digest, err := revision.Config.Digest()
+	if err != nil {
+		panic("agent test: revision config is not digestible: " + err.Error())
 	}
+	revision.ConfigDigest = digest
+	return revision
+}
+
+// entitling grants revision's tenant exactly the capabilities revision names.
+//
+// Every test that builds a Runtime states its entitlement, because the platform
+// requires one and a test that got a permissive default would be testing a build
+// path the process does not have. This helper is the "yes, this tenant may"
+// answer; tests about refusal pass security.DenyCapabilities() or a narrower
+// grant instead.
+//
+// It deduplicates before granting so that a revision deliberately repeating a
+// ref still reaches the tool registry, which is what owns that complaint.
+func entitling(t *testing.T, revision tenant.AgentRevision) security.RevisionAuthorizer {
+	t.Helper()
+	grant := security.Grant{
+		TenantID:   revision.TenantID,
+		PolicyRefs: unique(revision.Config.PolicyRefs),
+	}
+	if ref := revision.Config.Model.SecretRef; ref != "" {
+		grant.SecretRefs = []string{ref}
+	}
+	entitlements, err := security.NewEntitlements(grant)
+	require.NoError(t, err)
+	return entitlements
+}
+
+func unique(refs []string) []string {
+	seen := make(map[string]struct{}, len(refs))
+	result := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if _, repeated := seen[ref]; repeated {
+			continue
+		}
+		seen[ref] = struct{}{}
+		result = append(result, ref)
+	}
+	return result
 }
 
 // serveChatCompletion calls a Runtime adapter the way the platform does: with

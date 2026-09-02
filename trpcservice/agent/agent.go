@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -73,24 +74,43 @@ type Runtime struct {
 // requiring an external model API. It stays on the deterministic provider so
 // the bootstrap path needs no endpoint and no credential; a revision selects a
 // real model through its own ModelConfig.
+//
+// It is built under an authorizer that entitles nothing, which is not a
+// weakening of the demo but a statement about it: the demo config names no
+// secret_ref and no policy_refs, so it needs no entitlement, and building it
+// this way proves that the capability-free path stays open with no security
+// configuration behind it.
 func NewDemoRuntime() *Runtime {
 	sessionService := sessioninmemory.NewSessionService()
-	revision := tenant.AgentRevision{
-		ID:         "echo-v1",
-		TenantID:   "demo",
-		AgentAppID: "echo",
-		Status:     tenant.RevisionStatusPublished,
-		Config: tenant.RevisionConfig{
-			AgentName:   DemoAgentName,
-			Description: "Deterministic bootstrap agent",
-			Instruction: "Return the model response. This bootstrap runtime verifies the service path.",
-			Model: tenant.ModelConfig{
-				Provider: ProviderDeterministic,
-				Name:     DemoModelName,
-			},
+	config := tenant.RevisionConfig{
+		AgentName:   DemoAgentName,
+		Description: "Deterministic bootstrap agent",
+		Instruction: "Return the model response. This bootstrap runtime verifies the service path.",
+		Model: tenant.ModelConfig{
+			Provider: ProviderDeterministic,
+			Name:     DemoModelName,
 		},
 	}
-	runtime, err := newRuntimeFromRevision(revision, sessionService, true, nil)
+	// The digest is computed rather than left empty. A published revision now
+	// has its digest re-verified when it is built, so a helper that hand-built
+	// one without a digest would be a helper that produces revisions the
+	// platform refuses — and the first place that would surface is a demo that
+	// used to work.
+	digest, err := config.Digest()
+	if err != nil {
+		_ = sessionService.Close()
+		panic(fmt.Sprintf("agent: digest static demo revision: %v", err))
+	}
+	revision := tenant.AgentRevision{
+		ID:           "echo-v1",
+		TenantID:     "demo",
+		AgentAppID:   "echo",
+		Status:       tenant.RevisionStatusPublished,
+		Config:       config,
+		ConfigDigest: digest,
+	}
+	runtime, err := newRuntimeFromRevision(
+		revision, sessionService, true, nil, security.DenyCapabilities())
 	if err != nil {
 		_ = sessionService.Close()
 		panic(fmt.Sprintf("agent: build static demo runtime: %v", err))
@@ -100,21 +120,43 @@ func NewDemoRuntime() *Runtime {
 
 // NewRuntimeFromRevision builds the currently supported runtime from an
 // immutable published revision. The caller retains ownership of sessionService.
+//
+// authorizer is mandatory and has no default. It is not variadic and there is
+// no allow-everything convenience value, because the choice of who may run a
+// revision that names a credential is exactly the choice that must not be made
+// by omission: every call site states it, and the compiler makes sure a new one
+// does too. A caller with no capability configuration passes
+// security.DenyCapabilities().
 func NewRuntimeFromRevision(
 	revision tenant.AgentRevision,
 	sessionService session.Service,
+	authorizer security.RevisionAuthorizer,
 ) (*Runtime, error) {
-	return newRuntimeFromRevision(revision, sessionService, false, nil)
+	return newRuntimeFromRevision(revision, sessionService, false, nil, authorizer)
 }
 
 // newRuntimeFromRevision builds a Runtime. A nil auditSink selects the process
 // default, which is slog; it is a parameter so the tool trail can be read back
 // without redirecting the logger of the whole process.
+//
+// The order of the checks below is the security property, not a style:
+//
+//   - Identity and config shape first, because nothing else is meaningful
+//     without them.
+//   - The digest next. A published revision is immutable, so its config must
+//     still hash to the value recorded when it was created; anything else means
+//     the stored row was edited outside a Repository, and the edit is exactly
+//     how a secret_ref or a base_url would be moved after review.
+//   - The authorizer next, and before both the tool registry and any secret
+//     resolution. A revision its tenant is not entitled to must be refused
+//     without the platform revealing whether the policy exists or whether the
+//     environment variable does — and without reading the variable at all.
 func newRuntimeFromRevision(
 	revision tenant.AgentRevision,
 	sessionService session.Service,
 	ownsSessionService bool,
 	auditSink tool.AuditSink,
+	authorizer security.RevisionAuthorizer,
 ) (*Runtime, error) {
 	if revision.Status != tenant.RevisionStatusPublished {
 		return nil, fmt.Errorf("agent: revision %q is not published", revision.ID)
@@ -128,16 +170,32 @@ func newRuntimeFromRevision(
 	if err := tenant.ValidateResourceID("revision id", revision.ID); err != nil {
 		return nil, fmt.Errorf("agent: invalid runtime revision: %w", err)
 	}
-	if _, err := revision.Config.Digest(); err != nil {
+	digest, err := revision.Config.Digest()
+	if err != nil {
 		return nil, fmt.Errorf("agent: invalid revision config: %w", err)
+	}
+	// An empty stored digest is a mismatch, not an exemption. A revision that
+	// carries no fingerprint cannot be checked against one, and "unverifiable"
+	// has to fail the same way "wrong" does.
+	if revision.ConfigDigest == "" || revision.ConfigDigest != digest {
+		return nil, fmt.Errorf(
+			"agent: revision %q: %w", revision.ID, tenant.ErrConfigIntegrity)
 	}
 	if sessionService == nil {
 		return nil, fmt.Errorf("agent: session service is required")
 	}
+	if authorizer == nil {
+		return nil, fmt.Errorf("agent: revision authorizer is required")
+	}
+	if err := authorizer.AuthorizeRevision(revision.TenantID, revision.Config); err != nil {
+		// Wrapped with the revision id and nothing else. The refusal must read
+		// the same whichever reference caused it.
+		return nil, fmt.Errorf("agent: revision %q: %w", revision.ID, err)
+	}
 	// Tools and policies are resolved before anything is constructed. A
 	// revision the platform cannot authorize must not reach a model, a Runner
-	// or a protocol adapter — and running this first also means an unbuildable
-	// revision never causes a credential to be resolved.
+	// or a protocol adapter — and running this before the model also means an
+	// unbuildable revision never causes a credential to be resolved.
 	tools, err := tool.Builtin().Resolve(revision.Config.ToolRefs, revision.Config.PolicyRefs)
 	if err != nil {
 		return nil, fmt.Errorf("agent: assemble tools for revision %q: %w", revision.ID, err)

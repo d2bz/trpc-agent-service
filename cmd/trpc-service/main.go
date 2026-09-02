@@ -17,8 +17,9 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
 
@@ -30,15 +31,6 @@ const shutdownTimeout = 10 * time.Second
 // fails the process instead of hanging it. The inmemory profile never reaches
 // it, having nothing to wait for.
 const startupTimeout = 30 * time.Second
-
-const (
-	// apiKeyEnvVar overrides the chat credential of the local process.
-	apiKeyEnvVar = "TRPC_SERVICE_API_KEY"
-	// developmentAPIKey is a published placeholder, not a secret. It exists so
-	// the demo runs without configuration and is safe only because
-	// validateListenAddr keeps the process on a loopback address.
-	developmentAPIKey = "local-development-key-not-a-secret"
-)
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
@@ -65,8 +57,13 @@ func main() {
 // on purpose:
 //
 //   - The listen address is checked first. It costs nothing and it is the guard
-//     that keeps the unauthenticated Admin API off the network, so it must not
-//     sit behind anything that can connect to a database.
+//     that keeps the control plane off the network, so it must not sit behind
+//     anything that can connect to a database.
+//   - The security configuration is loaded, resolved and cross-validated in
+//     full before anything is opened. It reads a file and the environment and
+//     touches nothing else, so it is the cheapest possible refusal — and a
+//     process whose credentials are misconfigured must not have connected to a
+//     shared database or run a migration on the way to finding that out.
 //   - The storage configuration is loaded and validated as a whole, before a
 //     single resource is opened, so a typo in a schema name is a refusal rather
 //     than a half-built process.
@@ -76,12 +73,35 @@ func main() {
 //     The resolver waits for in-flight runtimes, and a runtime still writing to
 //     a session store that had already been closed would lose the last turn of
 //     the conversation it was serving.
-func run(addr string) (err error) {
+func run(addr string) error {
+	return runWith(addr, os.Getenv, defaultStorageDeps())
+}
+
+// runWith is run with its two sources of outside state made explicit: the
+// environment it reads, and the constructors that actually touch a database.
+//
+// The seam exists so the startup *order* can be tested rather than merely
+// documented. Given an environment that is wrong in two ways at once, a test can
+// assert which refusal comes back and that no storage constructor was reached —
+// which is the only way to keep "security first" from decaying into "security
+// eventually" as steps are added above it.
+func runWith(addr string, getenv func(string) string, deps storageDeps) (err error) {
 	if err := validateListenAddr(addr); err != nil {
 		return err
 	}
 
-	storageCfg, err := loadStorageConfig(os.Getenv)
+	// Before storage, and before any deadline: the tool registry is the same
+	// static one every Runtime resolves against, so a policy this manifest
+	// entitles is checked against the policies that actually exist.
+	securityCfg, err := security.Load(getenv, tool.Builtin())
+	if err != nil {
+		return err
+	}
+	// Safe to log: Description names configuration sources and counts, never a
+	// key, a hash or a resolved value.
+	log.Printf("security %s", securityCfg.Description)
+
+	storageCfg, err := loadStorageConfig(getenv)
 	if err != nil {
 		return err
 	}
@@ -93,7 +113,7 @@ func run(addr string) (err error) {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStartup()
 
-	stack, err := openStorage(startupCtx, storageCfg, defaultStorageDeps())
+	stack, err := openStorage(startupCtx, storageCfg, deps)
 	if err != nil {
 		return err
 	}
@@ -109,7 +129,13 @@ func run(addr string) (err error) {
 			_ context.Context,
 			revision tenant.AgentRevision,
 		) (*platformagent.Runtime, error) {
-			return platformagent.NewRuntimeFromRevision(revision, stack.sessions)
+			// The same authorizer value the Admin API checks against. One
+			// instance, not two equivalent ones: a revision that Admin accepted
+			// and a Runtime later refused — or the reverse — would be a
+			// disagreement about what this tenant may do, and there is no
+			// correct way to resolve one at request time.
+			return platformagent.NewRuntimeFromRevision(
+				revision, stack.sessions, securityCfg.Revisions)
 		},
 	)
 	if err != nil {
@@ -117,14 +143,12 @@ func run(addr string) (err error) {
 	}
 	defer func() { err = errors.Join(err, resolver.Close()) }()
 
-	authenticator, err := demoAuthenticator()
-	if err != nil {
-		return err
-	}
 	api, err := web.NewPlatformServer(
 		stack.repository,
 		resolver,
-		authenticator,
+		securityCfg.Chat,
+		securityCfg.Admin,
+		securityCfg.Revisions,
 		stack.directory,
 		stack.coordinator,
 	)
@@ -163,11 +187,15 @@ func run(addr string) (err error) {
 // at startup, so anything else is refused even if it happens to point at 127/8.
 const loopbackHostname = "localhost"
 
-// validateListenAddr fails closed on every address that is not loopback. The
-// Admin API carries no authentication at all, so a wildcard or routable bind
-// would publish tenant creation and revision publishing to the network. This is
-// deliberately not overridable: the override belongs in the slice that adds
-// Admin authentication, not in this one.
+// validateListenAddr fails closed on every address that is not loopback.
+//
+// The Admin API now authenticates, so this is no longer the only thing standing
+// between the control plane and the network — but it stays, and it stays
+// non-overridable. What it defends is everything authentication does not: this
+// process serves plain HTTP, so a routable bind would put admin Bearer tokens on
+// the wire in cleartext, and the demo profile still boots with a published chat
+// key. Exposure is a deployment decision that belongs to a reverse proxy
+// terminating TLS, not to an environment variable read by this binary.
 func validateListenAddr(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -182,32 +210,11 @@ func validateListenAddr(addr string) error {
 	// An empty host is the wildcard form (":8080"), which is the easiest way to
 	// expose this process by accident.
 	return fmt.Errorf(
-		"refusing to listen on %q: the Admin API is unauthenticated, so this process "+
-			"may only bind a loopback address such as 127.0.0.1:8080, localhost:8080 or [::1]:8080",
+		"refusing to listen on %q: this process serves plain HTTP and must sit behind a "+
+			"TLS-terminating proxy, so it may only bind a loopback address such as "+
+			"127.0.0.1:8080, localhost:8080 or [::1]:8080",
 		addr,
 	)
-}
-
-// demoAuthenticator builds the single-key chat credential of the local demo. It
-// grants exactly one tenant, one principal and one agent app; chat identity is
-// never taken from a request. Admin endpoints stay unauthenticated, which is
-// why validateListenAddr refuses to bind anything but loopback.
-func demoAuthenticator() (*identity.StaticAPIKeyAuthenticator, error) {
-	apiKey := os.Getenv(apiKeyEnvVar)
-	if apiKey == "" {
-		apiKey = developmentAPIKey
-		log.Printf(
-			"%s is not set; serving chat with the published local development key",
-			apiKeyEnvVar,
-		)
-	}
-	return identity.NewStaticAPIKeyAuthenticator(map[string]identity.Identity{
-		apiKey: {
-			TenantID:      platformconfig.DemoTenantID,
-			PrincipalID:   platformconfig.DemoPrincipalID,
-			AllowedAppIDs: []string{platformconfig.DemoAgentAppID},
-		},
-	})
 }
 
 type httpServerLifecycle interface {

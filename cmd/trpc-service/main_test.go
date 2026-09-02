@@ -7,49 +7,13 @@ import (
 	"testing"
 	"time"
 
-	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/stretchr/testify/require"
 )
 
-// The demo credential is the whole chat authorisation of the local process, so
-// it must grant exactly one tenant, one principal and one agent app.
-func TestDemoAuthenticatorGrantsOnlyTheDemoScope(t *testing.T) {
-	t.Setenv(apiKeyEnvVar, "")
-	authenticator, err := demoAuthenticator()
-	require.NoError(t, err)
-
-	granted, err := authenticator.Authenticate(context.Background(), developmentAPIKey)
-	require.NoError(t, err)
-	require.Equal(t, platformconfig.DemoTenantID, granted.TenantID)
-	require.Equal(t, platformconfig.DemoPrincipalID, granted.PrincipalID)
-	require.Equal(t, []string{platformconfig.DemoAgentAppID}, granted.AllowedAppIDs)
-	require.True(t, granted.AllowsApp(platformconfig.DemoAgentAppID))
-	require.False(t, granted.AllowsApp("another-app"))
-
-	_, err = authenticator.Authenticate(context.Background(), "not-the-development-key")
-	require.ErrorIs(t, err, identity.ErrUnauthenticated)
-}
-
-// A configured key replaces the published one instead of being accepted next to
-// it, otherwise the documented placeholder would stay a valid credential.
-func TestDemoAuthenticatorPrefersTheConfiguredKey(t *testing.T) {
-	const configured = "configured-local-key-0123456789"
-	t.Setenv(apiKeyEnvVar, configured)
-	authenticator, err := demoAuthenticator()
-	require.NoError(t, err)
-
-	granted, err := authenticator.Authenticate(context.Background(), configured)
-	require.NoError(t, err)
-	require.Equal(t, platformconfig.DemoTenantID, granted.TenantID)
-
-	_, err = authenticator.Authenticate(context.Background(), developmentAPIKey)
-	require.ErrorIs(t, err, identity.ErrUnauthenticated)
-}
-
-// The Admin API is unauthenticated, so the loopback bind is the only thing
-// keeping the control plane off the network. It has to be enforced, not just
-// documented and defaulted.
+// The Admin API authenticates, but the process still speaks plain HTTP: a
+// credential sent to a non-loopback bind is a credential on the wire in the
+// clear. The loopback restriction has to be enforced, not just documented and
+// defaulted.
 func TestValidateListenAddrAcceptsLoopbackOnly(t *testing.T) {
 	for _, addr := range []string{
 		"127.0.0.1:8080",

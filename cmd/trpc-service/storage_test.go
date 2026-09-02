@@ -14,6 +14,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
@@ -889,6 +890,9 @@ func TestRunRefusesANonLoopbackAddrBeforeItTouchesStorage(t *testing.T) {
 // HTTP server exists.
 func TestRunRefusesABrokenStorageConfiguration(t *testing.T) {
 	setStorageEnv(t, storageEnv{profile: string(profilePostgres)})
+	// The security configuration has to be valid to reach the storage step at
+	// all; see TestRunLoadsSecurityBeforeStorage.
+	t.Setenv(security.AdminAPIKeyEnvVar, runTestAdminKey)
 
 	err := run("127.0.0.1:0")
 	require.ErrorIs(t, err, errStorageConfig)
@@ -903,6 +907,7 @@ func TestRunRefusesABrokenCoordinationConfiguration(t *testing.T) {
 		coordination: string(coordinationRedis),
 		redisURL:     "redis://127.0.0.1:56379/0",
 	})
+	t.Setenv(security.AdminAPIKeyEnvVar, runTestAdminKey)
 
 	err := run("127.0.0.1:0")
 	require.ErrorIs(t, err, errStorageConfig)

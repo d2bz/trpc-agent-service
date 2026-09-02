@@ -87,7 +87,7 @@ go test -race -count=1 ./...
 
 ## 5. 明确限制
 
-- `PolicyRefs` 目前由 Revision 选择，还没有“某租户允许引用哪些 Policy”的控制面授权。当前唯一 Policy 只开放两个无副作用工具；增加业务 Tool 或有副作用 Tool 前，必须先加入租户级 Policy entitlement。
+- `PolicyRefs` 由 Revision 选择，但**必须先被该租户的 entitlement 授权**：授权表来自 Security Manifest 的 `tenant_entitlements.allowed_policy_refs`，在 Admin 创建、Admin 发布和 Runtime 构建三处由同一个 authorizer 判定，未授权一律返回同一个 `not_entitled`，不区分策略是否真的注册过。规则见[身份、权限与密钥治理](security-and-governance.md#6-租户-entitlement)。默认 demo profile 只授权 `demo` 租户使用 `builtin.safe-tools`。仍然没有的是**按 Tool 粒度**的租户授权：entitlement 的单位是 Policy，一个租户被授权某个 Policy 就等于被授权该 Policy 里的全部 Tool。
 - 4 轮上限不是 Run 总超时，也不限制一轮返回的并行 Tool 数量。慢模型、慢 Tool 和单轮大量 Tool 仍可能长期占用 Session Lease；后续需要 Run deadline、单轮 Tool 数和并发预算。
 - 审计当前写结构化 `slog`，不是持久化、不可篡改的 Audit Store，也没有查询、保留期和访问控制。
 - 尚未实现 MCP、动态插件市场、危险操作审批、Tool Secret 注入、业务幂等键和沙箱。

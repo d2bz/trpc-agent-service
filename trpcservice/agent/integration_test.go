@@ -68,10 +68,15 @@ func TestOpenAICompatibleLiveEndpoint(t *testing.T) {
 		SecretRef: os.Getenv(envModelSecretRef),
 		MaxTokens: 64,
 	}
+	revision = sealed(revision)
 
 	sessionService := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, sessionService.Close()) })
-	runtime, err := NewRuntimeFromRevision(revision, sessionService)
+	// The entitlement is stated here rather than defaulted, and it is the same
+	// authorizer type the process uses. A live test that ran under a permissive
+	// stand-in would be the one test most likely to hide an entitlement
+	// regression: it is the only one that resolves a real credential.
+	runtime, err := NewRuntimeFromRevision(revision, sessionService, entitling(t, revision))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
 

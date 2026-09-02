@@ -107,8 +107,12 @@ func TestNewRuntimeFromRevisionFailsClosedOnToolsAndPolicies(t *testing.T) {
 			revision := publishedRevision("revision-1", "echo-v1")
 			revision.Config.ToolRefs = testCase.toolRefs
 			revision.Config.PolicyRefs = testCase.policyRefs
+			revision = sealed(revision)
 
-			runtime, err := NewRuntimeFromRevision(revision, shared)
+			// Entitled to every ref it names, so what is left to refuse it is
+			// the tool registry — which is the point: entitlement narrows what
+			// a tenant may reach, it never stands in for tool authorization.
+			runtime, err := NewRuntimeFromRevision(revision, shared, entitling(t, revision))
 			require.Nil(t, runtime)
 			require.ErrorIs(t, err, testCase.wantErr)
 			// Enough to locate the revision, and nothing more.
@@ -129,8 +133,9 @@ func TestToolValidationPrecedesModelConstruction(t *testing.T) {
 		revision.Config.ToolRefs = []string{"builtin_shell"}
 		revision.Config.PolicyRefs = []string{servicetool.PolicySafeTools}
 		revision.Config.Model.Provider = "anthropic"
+		revision = sealed(revision)
 
-		_, err := NewRuntimeFromRevision(revision, shared)
+		_, err := NewRuntimeFromRevision(revision, shared, entitling(t, revision))
 		require.ErrorIs(t, err, servicetool.ErrUnknownTool)
 		require.NotContains(t, err.Error(), "unsupported model provider")
 	})
@@ -143,12 +148,13 @@ func TestToolValidationPrecedesModelConstruction(t *testing.T) {
 			Provider:  ProviderOpenAICompatible,
 			Name:      "test-model",
 			BaseURL:   "https://api.example.com/v1",
-			SecretRef: "env:TRPC_SERVICE_TEST_ABSENT_KEY",
+			SecretRef: "env:TEST_ABSENT_MODEL_KEY",
 		}
+		revision = sealed(revision)
 
-		_, err := NewRuntimeFromRevision(revision, shared)
+		_, err := NewRuntimeFromRevision(revision, shared, entitling(t, revision))
 		require.ErrorIs(t, err, servicetool.ErrPolicyRequired)
-		require.NotContains(t, err.Error(), "TRPC_SERVICE_TEST_ABSENT_KEY")
+		require.NotContains(t, err.Error(), "TEST_ABSENT_MODEL_KEY")
 	})
 }
 
@@ -167,14 +173,14 @@ func toolRevision(
 		Name:     "test-model",
 		BaseURL:  serverURL + "/v1",
 	}
-	return revision
+	return sealed(revision)
 }
 
 func buildRuntime(t *testing.T, revision tenant.AgentRevision) *Runtime {
 	t.Helper()
 	sessionService := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, sessionService.Close()) })
-	runtime, err := NewRuntimeFromRevision(revision, sessionService)
+	runtime, err := NewRuntimeFromRevision(revision, sessionService, entitling(t, revision))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
 	return runtime

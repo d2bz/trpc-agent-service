@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"strings"
 
 	openaiopt "github.com/openai/openai-go/option"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/secretref"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	modelopenai "trpc.group/trpc-go/trpc-agent-go/model/openai"
@@ -22,11 +22,6 @@ const (
 	ProviderDeterministic    = "deterministic"
 	ProviderOpenAICompatible = "openai-compatible"
 )
-
-// envSecretPrefix is the only secret_ref scheme this slice resolves. A real
-// secret manager arrives later; until then a ref that is not "env:VAR_NAME" is
-// rejected rather than treated as a literal key.
-const envSecretPrefix = "env:"
 
 // Headers openai-go's DefaultClientOptions fills from the process environment.
 // Each is named here because it has to be removed, not merely left unset; see
@@ -162,30 +157,25 @@ func validateBaseURL(raw string) error {
 
 // resolveSecret returns the credential named by ref, or "" when no ref is set.
 //
-// Only "env:VAR_NAME" is understood. No error here contains the resolved
-// value, and the unsupported-scheme error does not repeat ref either: a ref
+// The syntax is not parsed here: secretref owns it, and the security manifest
+// entitles refs through the same parser. Two parsers would be two sets of
+// rules, and a ref that the entitlement check and the resolver read differently
+// is a ref that is entitled as one variable and read as another.
+//
+// No error here contains the resolved value, and none repeats ref either: a ref
 // that is not a reference is most likely a key that was pasted into the config
 // by mistake, and an error message is exactly the wrong place for it to
 // resurface.
+//
+// This runs after the RevisionAuthorizer, never before it — see
+// newRuntimeFromRevision.
 func resolveSecret(ref string) (string, error) {
 	if ref == "" {
 		return "", nil
 	}
-	name, found := strings.CutPrefix(ref, envSecretPrefix)
-	if !found {
-		return "", fmt.Errorf(
-			"agent: model secret_ref must use the %sVAR_NAME scheme", envSecretPrefix)
-	}
-	if name == "" {
-		return "", errors.New("agent: model secret_ref names no environment variable")
-	}
-	// Only a POSIX-style name is accepted. Anything else cannot name a real
-	// variable, and the likeliest way to get one is a key pasted in behind the
-	// scheme ("env:sk-..."), which must not reach the error below and be
-	// repeated there.
-	if !isEnvName(name) {
-		return "", errors.New(
-			"agent: model secret_ref must name a valid environment variable")
+	name, err := secretref.EnvName(ref)
+	if err != nil {
+		return "", fmt.Errorf("agent: model secret_ref: %w", err)
 	}
 	// An exported-but-empty variable is treated as unset. It means the operator
 	// asked for a credential that is not there, and continuing would send the
@@ -196,22 +186,6 @@ func resolveSecret(ref string) (string, error) {
 			"agent: model secret_ref environment variable %q is unset or empty", name)
 	}
 	return value, nil
-}
-
-// isEnvName reports whether name is a POSIX-style environment variable name: a
-// letter or underscore, followed by letters, digits or underscores. Callers
-// have already rejected the empty string.
-func isEnvName(name string) bool {
-	for i, char := range name {
-		switch {
-		case char == '_':
-		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z':
-		case char >= '0' && char <= '9' && i > 0:
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // generationConfig maps a revision's model settings onto generation

@@ -14,6 +14,7 @@ import (
 
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -29,6 +30,19 @@ const (
 	principalA   = "principal-a"
 	principalB   = "principal-b"
 	appAssistant = "assistant"
+)
+
+// Admin credentials for these tests. They are longer than the chat keys because
+// the admin authenticator holds them to a 32-character minimum, and the point of
+// that minimum is lost if the tests quietly work below it.
+const (
+	adminKeyPlatform  = "admin-key-platform-0123456789abcdef"
+	adminKeyTenantA   = "admin-key-tenant-a-0123456789abcdef"
+	adminKeyTenantB   = "admin-key-tenant-b-0123456789abcdef"
+	adminKeyUnknown   = "admin-key-unknown--0123456789abcdef"
+	principalPlatform = "platform-admin"
+	principalAdminA   = "tenant-a-admin"
+	principalAdminB   = "tenant-b-admin"
 )
 
 // The pin makes a published revision invisible to sessions that already
@@ -429,7 +443,7 @@ func TestPlatformTenantIsolationAndErrors(t *testing.T) {
 	unknownRevision := requireStatus(
 		t, platform.handler, http.MethodGet,
 		"/admin/v1/tenants/tenant-b/apps/assistant/revisions/private-a",
-		"", nil, http.StatusNotFound,
+		"", adminHeaders(adminKeyPlatform), http.StatusNotFound,
 	)
 	require.JSONEq(t, `{
 		"error":{"code":"not_found","message":"resource not found"}
@@ -438,13 +452,13 @@ func TestPlatformTenantIsolationAndErrors(t *testing.T) {
 	invalidJSON := requireStatus(
 		t, platform.handler, http.MethodPost, "/admin/v1/tenants",
 		`{"id":"tenant-c","slug":"tenant-c","name":"Tenant C","unknown":true}`,
-		nil, http.StatusBadRequest,
+		adminHeaders(adminKeyPlatform), http.StatusBadRequest,
 	)
 	require.Contains(t, invalidJSON.Body.String(), `"code":"invalid_json"`)
 
 	duplicate := requireStatus(t, platform.handler, http.MethodPost, "/admin/v1/tenants", `{
 		"id":"tenant-a","slug":"tenant-a","name":"Duplicate"
-	}`, nil, http.StatusConflict)
+	}`, adminHeaders(adminKeyPlatform), http.StatusConflict)
 	require.Contains(t, duplicate.Body.String(), `"code":"already_exists"`)
 }
 
@@ -549,6 +563,8 @@ func TestPlatformRejectsRuntimeWithoutOpenAIHandler(t *testing.T) {
 			}, nil
 		}),
 		newTestAuthenticator(t),
+		newTestAdminAuthenticator(t),
+		security.DenyCapabilities(),
 		sessiondir.NewMemoryDirectory(),
 		newTestCoordinator(t),
 	)
@@ -571,25 +587,42 @@ func TestNewPlatformServerRequiresEveryDependency(t *testing.T) {
 		return platformagent.ResolvedRuntime{}, nil
 	})
 	authenticator := newTestAuthenticator(t)
+	admin := newTestAdminAuthenticator(t)
+	revisions := security.DenyCapabilities()
 	directory := sessiondir.NewMemoryDirectory()
 	leases := newTestCoordinator(t)
 
-	_, err := NewPlatformServer(nil, resolver, authenticator, directory, leases)
+	_, err := NewPlatformServer(
+		nil, resolver, authenticator, admin, revisions, directory, leases)
 	require.ErrorContains(t, err, "tenant repository is required")
-	_, err = NewPlatformServer(repository, nil, authenticator, directory, leases)
+	_, err = NewPlatformServer(
+		repository, nil, authenticator, admin, revisions, directory, leases)
 	require.ErrorContains(t, err, "runtime resolver is required")
-	_, err = NewPlatformServer(repository, resolver, nil, directory, leases)
+	_, err = NewPlatformServer(
+		repository, resolver, nil, admin, revisions, directory, leases)
 	require.ErrorContains(t, err, "chat authenticator is required")
-	_, err = NewPlatformServer(repository, resolver, authenticator, nil, leases)
+	// A control plane with no way to authenticate is a control plane whose only
+	// protection is that nobody has found the port yet.
+	_, err = NewPlatformServer(
+		repository, resolver, authenticator, nil, revisions, directory, leases)
+	require.ErrorContains(t, err, "admin authenticator is required")
+	// And one with no opinion on which revisions may run would let every tenant
+	// name every capability the process can reach.
+	_, err = NewPlatformServer(
+		repository, resolver, authenticator, admin, nil, directory, leases)
+	require.ErrorContains(t, err, "revision authorizer is required")
+	_, err = NewPlatformServer(
+		repository, resolver, authenticator, admin, revisions, nil, leases)
 	require.ErrorContains(t, err, "session directory is required")
 	// No fallback to a process-wide coordinator: a platform that silently
 	// coordinated through its own memory would be exclusive against nothing but
 	// itself, which is worse than refusing to start.
-	_, err = NewPlatformServer(repository, resolver, authenticator, directory, nil)
+	_, err = NewPlatformServer(
+		repository, resolver, authenticator, admin, revisions, directory, nil)
 	require.ErrorContains(t, err, "session lease coordinator is required")
 
 	server, err := NewPlatformServer(
-		repository, resolver, authenticator, directory, leases,
+		repository, resolver, authenticator, admin, revisions, directory, leases,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, server.Handler())
@@ -600,11 +633,15 @@ func TestPlatformHTTPMethodAndCORS(t *testing.T) {
 	health := requireStatus(t, platform.handler, http.MethodGet, "/healthz", "", nil, http.StatusOK)
 	require.JSONEq(t, `{"status":"ok"}`, health.Body.String())
 
+	// The wrong method on an admin route is a 405 only once the caller has
+	// proved who they are. Unauthenticated, the method is not information the
+	// server owes anybody — see TestAdminAuthenticatesBeforeRouting.
 	wrongMethod := requireStatus(
-		t, platform.handler, http.MethodGet, "/admin/v1/tenants", "", nil,
-		http.StatusMethodNotAllowed,
+		t, platform.handler, http.MethodGet, "/admin/v1/tenants",
+		"", adminHeaders(adminKeyPlatform), http.StatusMethodNotAllowed,
 	)
 	require.Equal(t, http.MethodPost, wrongMethod.Header().Get("Allow"))
+	require.Empty(t, wrongMethod.Header().Values("Access-Control-Allow-Origin"))
 
 	chatMethod := requireStatus(
 		t, platform.handler, http.MethodGet, chatPath, "", nil, http.StatusMethodNotAllowed,
@@ -708,10 +745,11 @@ func TestPlatformPublishesCORSHeadersOnEarlyRefusals(t *testing.T) {
 const chatPath = "/v1/chat/completions"
 
 type platformTestServer struct {
-	handler   http.Handler
-	resolver  *platformagent.RuntimeResolver
-	sessions  session.Service
-	directory *sessiondir.MemoryDirectory
+	handler    http.Handler
+	repository tenant.Repository
+	resolver   *platformagent.RuntimeResolver
+	sessions   session.Service
+	directory  *sessiondir.MemoryDirectory
 
 	// leases is what the platform coordinates through, and leaseStore is the
 	// state behind it. A test that needs a second Worker builds another
@@ -735,6 +773,16 @@ type platformTestOptions struct {
 	// production 15s TTL, which is what most tests want: a lease that cannot
 	// expire underneath them.
 	lease sessionlease.Config
+
+	// revisions is the entitlement table. It is nil for the tests whose
+	// revisions name no capability at all, which then get the deny-everything
+	// authorizer rather than a permissive one.
+	revisions security.RevisionAuthorizer
+
+	// repository replaces the in-memory control plane. It exists so a test can
+	// prove that a refusal happened *before* the repository, by handing the
+	// platform one that fails the test if it is called at all.
+	repository tenant.Repository
 }
 
 // chatDirectory is what the platform is handed: a directory, plus whatever a
@@ -773,7 +821,10 @@ func newPlatformTestServerWith(
 	opts platformTestOptions,
 ) *platformTestServer {
 	t.Helper()
-	repository := tenant.NewMemoryRepository()
+	var repository tenant.Repository = tenant.NewMemoryRepository()
+	if opts.repository != nil {
+		repository = opts.repository
+	}
 	sessionService := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, sessionService.Close()) })
 	resolver, err := platformagent.NewRuntimeResolver(
@@ -782,7 +833,15 @@ func newPlatformTestServerWith(
 			_ context.Context,
 			revision tenant.AgentRevision,
 		) (*platformagent.Runtime, error) {
-			return platformagent.NewRuntimeFromRevision(revision, sessionService)
+			// Explicitly capability-denying: every revision these tests publish
+			// names no secret and no policy, so this is both the strictest
+			// authorizer and an accurate one. Tests that need a capability build
+			// their own server with a grant.
+			authorizer := opts.revisions
+			if authorizer == nil {
+				authorizer = security.DenyCapabilities()
+			}
+			return platformagent.NewRuntimeFromRevision(revision, sessionService, authorizer)
 		},
 	)
 	require.NoError(t, err)
@@ -807,17 +866,59 @@ func newPlatformTestServerWith(
 	// it holds a lease is cut loose before Close waits for it.
 	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 
+	revisions := opts.revisions
+	if revisions == nil {
+		revisions = security.DenyCapabilities()
+	}
 	server, err := NewPlatformServer(
-		repository, resolver, newTestAuthenticator(t), chat, coordinator,
+		repository, resolver, newTestAuthenticator(t), newTestAdminAuthenticator(t),
+		revisions, chat, coordinator,
 	)
 	require.NoError(t, err)
 	return &platformTestServer{
 		handler:    server.Handler(),
+		repository: repository,
 		resolver:   resolver,
 		sessions:   sessionService,
 		directory:  directory,
 		leases:     coordinator,
 		leaseStore: store,
+	}
+}
+
+// newTestAdminAuthenticator grants the three control-plane roles these tests
+// exercise: one platform admin, and one tenant admin for each of the two
+// tenants, so a cross-tenant attempt is a real credential reaching for something
+// that is not its own rather than an unknown key being turned away.
+func newTestAdminAuthenticator(t *testing.T) identity.AdminAuthenticator {
+	t.Helper()
+	authenticator, err := identity.NewStaticAdminAPIKeyAuthenticator(
+		map[string]identity.AdminIdentity{
+			adminKeyPlatform: {
+				Role:        identity.RolePlatformAdmin,
+				PrincipalID: principalPlatform,
+			},
+			adminKeyTenantA: {
+				Role:        identity.RoleTenantAdmin,
+				PrincipalID: principalAdminA,
+				TenantID:    "tenant-a",
+			},
+			adminKeyTenantB: {
+				Role:        identity.RoleTenantAdmin,
+				PrincipalID: principalAdminB,
+				TenantID:    "tenant-b",
+			},
+		})
+	require.NoError(t, err)
+	return authenticator
+}
+
+// adminHeaders is what every admin request carries: the credential, and the
+// media type that keeps the request outside the browser's simple-request set.
+func adminHeaders(apiKey string) map[string]string {
+	return map[string]string{
+		HeaderAuthorization: "Bearer " + apiKey,
+		"Content-Type":      "application/json",
 	}
 }
 
@@ -986,10 +1087,12 @@ func seedTenantAppRevision(
 	t.Helper()
 	requireStatus(t, handler, http.MethodPost, "/admin/v1/tenants", fmt.Sprintf(`{
 		"id":%q,"slug":%q,"name":%q
-	}`, tenantID, tenantID, "Tenant "+tenantID), nil, http.StatusCreated)
+	}`, tenantID, tenantID, "Tenant "+tenantID),
+		adminHeaders(adminKeyPlatform), http.StatusCreated)
 	requireStatus(
 		t, handler, http.MethodPost, "/admin/v1/tenants/"+tenantID+"/apps",
-		fmt.Sprintf(`{"id":%q,"name":"Assistant"}`, appID), nil, http.StatusCreated,
+		fmt.Sprintf(`{"id":%q,"name":"Assistant"}`, appID),
+		adminHeaders(adminKeyPlatform), http.StatusCreated,
 	)
 	createRevisionThroughAPI(t, handler, tenantID, appID, revisionID, revisionNo, modelName)
 	publishRevisionThroughAPI(t, handler, tenantID, appID, revisionID)
@@ -1073,10 +1176,11 @@ func createRevisionThroughAPI(
 	modelName string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
+	// No created_by: the request cannot state authorship, and a body carrying
+	// the field is a 400. The stored value comes from the credential.
 	body := fmt.Sprintf(`{
 		"id":%q,
 		"revision_no":%d,
-		"created_by":"test-admin",
 		"config":{
 			"agent_name":"test-agent",
 			"instruction":"Answer through the deterministic model.",
@@ -1089,7 +1193,7 @@ func createRevisionThroughAPI(
 		http.MethodPost,
 		fmt.Sprintf("/admin/v1/tenants/%s/apps/%s/revisions", tenantID, appID),
 		body,
-		nil,
+		adminHeaders(adminKeyPlatform),
 		http.StatusCreated,
 	)
 }
@@ -1113,7 +1217,9 @@ func publishRevisionThroughAPI(
 			revisionID,
 		),
 		"",
-		nil,
+		// Content-Type is required even though publish sends no body: the rule
+		// is about what a browser may send unasked, not about parsing.
+		adminHeaders(adminKeyPlatform),
 		http.StatusOK,
 	)
 }

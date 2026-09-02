@@ -30,7 +30,7 @@
 git status --short --branch
 git diff --check
 go test ./...
-go test -race ./trpcservice/config ./trpcservice/tenant ./trpcservice/identity ./trpcservice/sessiondir ./trpcservice/sessionbackend ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
+go test -race -count=1 ./trpcservice/config ./trpcservice/tenant ./trpcservice/identity ./trpcservice/security ./trpcservice/secretref ./trpcservice/sessiondir ./trpcservice/sessionbackend ./trpcservice/tool ./trpcservice/agent ./trpcservice/web ./cmd/trpc-service
 go vet ./...
 ./build.sh
 ./start.sh
@@ -61,7 +61,7 @@ docker compose -f deploy/docker-compose.session.yml down -v
 1. `GET /healthz` 返回 `200`。
 2. 预置 `demo/echo` 可以带 `Authorization: Bearer` 通过 `/v1/chat/completions` 对话；缺少该请求头返回 `401`。
 3. 响应头带回 `X-Session-ID` 和 `X-Agent-Revision-ID`，用回传的 Session ID 可续接同一段对话。
-4. Admin API 可以创建 Tenant、App、Revision 并发布。
+4. Admin API 带 `Authorization: Bearer $(cat data/admin-api-key)` 和 `Content-Type: application/json` 可以创建 Tenant、App、Revision 并发布；不带该请求头返回 `401`，且 `start.sh` 的输出里只有 key 文件的路径、没有 key 本身。
 5. 发布新 Revision 后，已开始的 Session 仍返回旧版本，新建 Session 才用新版本。
 6. `./stop.sh` 正常停止服务并清理 PID 文件。
 
@@ -75,4 +75,4 @@ docker compose -f deploy/docker-compose.session.yml down -v
 
 ## 5. 当前实现边界
 
-截至方案 `1.0`，已实现最小 Runner 链路、Tenant/App/Revision 内存控制面、Admin API、动态 Runtime 路由、版本发布/回滚和多租户隔离测试。此后追加了对话面的静态 API Key 认证、服务端决定的会话归属和进程内 Session Revision Pin。另有一次持久化 Session 后端 Spike：`trpcservice/sessionbackend` 能构造 PostgreSQL/Redis 的 `session.Service` 并通过集成测试，但**默认后端仍是 InMemory，进程中没有任何代码使用持久化后端**。共享 Session、跨进程 Pin、Admin 认证、双 Worker、IM Adapter、治理、Telemetry 和生产部署仍在后续计划中，已知限制见[验收矩阵](acceptance.md#已知限制)。方案提交不改变这些功能的 `planned/partial` 状态。
+截至方案 `1.0`，已实现最小 Runner 链路、Tenant/App/Revision 内存控制面、Admin API、动态 Runtime 路由、版本发布/回滚和多租户隔离测试。此后追加了对话面的静态 API Key 认证、服务端决定的会话归属和进程内 Session Revision Pin。另有一次持久化 Session 后端 Spike：`trpcservice/sessionbackend` 能构造 PostgreSQL/Redis 的 `session.Service` 并通过集成测试，但**默认后端仍是 InMemory，进程中没有任何代码使用持久化后端**。此后又追加了控制面身份与租户 entitlement：Admin 面有独立于对话面的静态凭据和 `platform_admin`/`tenant_admin` 角色模型，SecretRef/PolicyRef 按租户授权，发布态 Revision 的摘要在构建时重算校验，规则见[身份、权限与密钥治理](security-and-governance.md)。共享 Session、IM Adapter、Telemetry 和生产部署仍在后续计划中；安全侧仍未实现 JWT/OIDC、动态 RBAC、清单热加载、凭据轮转/撤销、持久化管理审计、生产 Secret Manager 和预算/审批/Guardrail。已知限制见[验收矩阵](acceptance.md#已知限制)。方案提交不改变这些功能的 `planned/partial` 状态。

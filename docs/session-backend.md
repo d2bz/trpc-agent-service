@@ -269,14 +269,15 @@ Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis）�
 
 顺序本身就是实现的主要内容，逐条都有原因：
 
-1. 先校验监听地址。Admin API 无鉴权，这条守卫必须排在任何可能连数据库的动作之前。
-2. 读取并整体校验存储配置，此时还没有创建任何资源；schema 拼错在这一步就失败，而不是迁移跑到一半才失败。
-3. 解析 pgx 连接池配置，把校验过的 schema 写进 `search_path`（写在 pool config 上而不是 checkout 后 `SET`，这样连接池后来新开的连接也带同一个 `search_path`）。
-4. 建池，**并立即登记关闭动作**——之后任何一步失败都不会漏掉这个池。
-5. 在带超时的上下文里 `Ping`。`pgxpool.NewWithConfig` 不拨号，而上游 Session 构造函数建表时用的是它自己的、**不可取消**的 background 上下文；不可达的库必须在进入上游之前、在调用方的 deadline 还有效时暴露出来。
-6. 依次跑 `tenantpostgres.Migrate` 和 `sessiondirpostgres.Migrate`（都持咨询锁、都是 `IF NOT EXISTS`，每个 worker 每次启动都跑是安全的）。
-7. 构造 Repository 与 Directory（共用同一个池，两者都只借用、都不关闭）；再构造上游 Session 服务（它自己持有并拥有另一个池）。
-8. 最后才 `SeedDemo`——它要写控制面，必须在迁移之后。
+1. 先校验监听地址。本进程只服务明文 HTTP，可路由的监听地址会把 Admin Bearer token 明文放到网络上，因此这条守卫必须排在任何可能连数据库的动作之前。（早期版本的理由是"Admin API 无鉴权"；Admin 现在已认证，守卫的位置不变，理由换了。）
+2. 加载并整体校验安全配置（Security Manifest 或 demo profile）。凭据、角色和租户 entitlement 全部在这一步定型，排在存储之前：一份配错的清单不该先建出连接池、跑完迁移再失败。详见[身份、权限与密钥治理](security-and-governance.md#8-启动顺序)。
+3. 读取并整体校验存储配置，此时还没有创建任何资源；schema 拼错在这一步就失败，而不是迁移跑到一半才失败。
+4. 解析 pgx 连接池配置，把校验过的 schema 写进 `search_path`（写在 pool config 上而不是 checkout 后 `SET`，这样连接池后来新开的连接也带同一个 `search_path`）。
+5. 建池，**并立即登记关闭动作**——之后任何一步失败都不会漏掉这个池。
+6. 在带超时的上下文里 `Ping`。`pgxpool.NewWithConfig` 不拨号，而上游 Session 构造函数建表时用的是它自己的、**不可取消**的 background 上下文；不可达的库必须在进入上游之前、在调用方的 deadline 还有效时暴露出来。
+7. 依次跑 `tenantpostgres.Migrate` 和 `sessiondirpostgres.Migrate`（都持咨询锁、都是 `IF NOT EXISTS`，每个 worker 每次启动都跑是安全的）。
+8. 构造 Repository 与 Directory（共用同一个池，两者都只借用、都不关闭）；再构造上游 Session 服务（它自己持有并拥有另一个池）。
+9. 最后才 `SeedDemo`——它要写控制面，必须在迁移之后。
 
 关闭顺序是它的严格逆序：HTTP 优雅关闭（在 `waitForStop` 里）→ Resolver（等待在途 runtime 交还租约）→ Session 服务 → 共享连接池。启动中途失败时只关闭已经建成的那些资源，同样逆序；**关闭错误用 `errors.Join` 合并进进程退出错误，不再是打条日志就丢掉**——一个"关闭时没刷完"的 Session 服务，一周后表现为"每段会话最后一轮不见了"。
 

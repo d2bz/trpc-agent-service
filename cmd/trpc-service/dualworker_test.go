@@ -20,6 +20,7 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	redislease "github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease/redis"
@@ -57,6 +58,11 @@ import (
 // chatCredential is the API key both Workers accept. It grants the demo
 // identity, which is the only one SeedDemo creates.
 const chatCredential = "dual-worker-integration-key-0123456789"
+
+// adminCredential exists only because a platform cannot be built without an
+// admin authenticator. No request in this file carries it; it is long enough to
+// satisfy the 32-character admin minimum.
+const adminCredential = "dual-worker-admin-key-0123456789abcdef"
 
 // leaseKeyPrefix is per-run, so a shared Redis can serve several runs at once
 // and a leftover key is attributable to the run that made it.
@@ -179,7 +185,11 @@ func newWorker(
 			_ context.Context,
 			revision tenant.AgentRevision,
 		) (*platformagent.Runtime, error) {
-			return platformagent.NewRuntimeFromRevision(revision, stack.sessions)
+			// The demo revision names no secret and no policy, so the strictest
+			// authorizer is the correct one: what this file exercises is the run
+			// lease, and it must not be doing so under a permissive stand-in.
+			return platformagent.NewRuntimeFromRevision(
+				revision, stack.sessions, security.DenyCapabilities())
 		},
 	)
 	require.NoError(t, err)
@@ -202,9 +212,22 @@ func newWorker(
 	)
 	require.NoError(t, err)
 
+	// Nothing here calls the Admin API, but the server will not be built without
+	// an admin authenticator, so this Worker gets a real one rather than a nil.
+	adminAuthenticator, err := identity.NewStaticAdminAPIKeyAuthenticator(
+		map[string]identity.AdminIdentity{
+			adminCredential: {
+				Role:        identity.RolePlatformAdmin,
+				PrincipalID: "dualworker-admin",
+			},
+		},
+	)
+	require.NoError(t, err)
+
 	directory := &parkingDirectory{inner: stack.directory, release: make(chan struct{})}
 	api, err := web.NewPlatformServer(
-		stack.repository, resolver, authenticator, directory, leases,
+		stack.repository, resolver, authenticator, adminAuthenticator,
+		security.DenyCapabilities(), directory, leases,
 	)
 	require.NoError(t, err)
 

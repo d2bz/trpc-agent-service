@@ -100,6 +100,15 @@ func NewStaticAPIKeyAuthenticator(
 	}
 	identities := make(map[[sha256.Size]byte]Identity, len(keys))
 	for key, granted := range keys {
+		// The data plane presents its credential the same way the control plane
+		// does, so it is refused for the same reasons. This cannot turn away a
+		// key that works today: every key it refuses is one the header parser
+		// could never have reproduced.
+		if err := validateBearerCredential(key); err != nil {
+			return nil, fmt.Errorf(
+				"identity: API key for tenant %q cannot be sent as a Bearer credential: %w",
+				granted.TenantID, err)
+		}
 		if len(key) < minCredentialLength {
 			return nil, fmt.Errorf(
 				"identity: API key for tenant %q must have at least %d characters",

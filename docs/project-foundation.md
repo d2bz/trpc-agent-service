@@ -184,8 +184,8 @@ Agent 基础运行时、内置编排、通用 Session/Memory 接口、模型适�
 以下事项需要结合题目规则、上游兼容性和参赛实现成本，通过 ADR 确认：
 
 1. 项目开源许可证。若希望与上游保持一致，可评估 Apache License 2.0。
-2. 生产密钥管理基线，例如 Kubernetes Secret、Vault 或云 KMS。
-3. Admin API 的身份提供方和租户管理员授权模型。
+2. 生产密钥管理基线，例如 Kubernetes Secret、Vault 或云 KMS。当前实现只做到 `env:VAR_NAME` + 租户 entitlement，不是这一项的答案。
+3. Admin API 的**外部**身份提供方（JWT/OIDC）和动态 RBAC。角色模型本身已经确定并实现为 `platform_admin`/`tenant_admin` 两个封闭取值（见 §18 与[身份、权限与密钥治理](security-and-governance.md)），待确认的是凭据从哪里来、怎么轮转和撤销。
 
 ## 13. 参考资料
 
@@ -207,7 +207,7 @@ Agent 基础运行时、内置编排、通用 Session/Memory 接口、模型适�
 - `/v1/chat/completions` 已要求显式 Tenant/App 路由，可按默认或指定的已发布 Revision 获取 Runtime，并继续复用上游 OpenAI-compatible 非流式和 SSE 协议。
 - 主进程已改为 `Repository → Runtime Resolver → LLMAgent/Runner` 的真实平台装配，所有 Revision 共用 App 级 Session Service；启动时只种入一个无外部依赖的 demo 配置。
 - HTTP 集成测试已覆盖多租户同名资源隔离、发布、固定版本、回滚、跨版本 Session、动态 SSE、错误响应和 CORS。
-- 当前控制面仍使用 InMemory Repository，Admin API 仍缺少身份认证；在 PostgreSQL 和授权模型完成前不作为生产接口。
+- 当前控制面仍使用 InMemory Repository，Admin API 仍缺少身份认证；在 PostgreSQL 和授权模型完成前不作为生产接口。（这两条都已改变：PostgreSQL Repository 见 §17 之后的存储 profile，Admin 认证与授权见 §18。）
 
 ## 16. 2026-08-26 提交冻结
 
@@ -222,4 +222,17 @@ Agent 基础运行时、内置编排、通用 Session/Memory 接口、模型适�
 - 新增 `trpcservice/identity` 与 `trpcservice/sessiondir` 两个包。静态 API Key 只保存 token 的 SHA-256 摘要，长期 map 中不留明文；Session Directory 以 `{tenant, app, principal, session, epoch}` 为键，`EnsurePin` 的首次写入是线性化点。
 - Session 在首轮原子钉住当时的 Revision。这反转了上一版行为：发布新版本后，已经开始的会话不再切到新版本，回滚也不改变已有 Pin。`X-Agent-Revision-ID` 退化为新会话首轮的开发用提示，对已 Pin 会话给出不同值返回 `409 pin_conflict`。
 - `Key.Epoch` 已在结构中预留但恒为 0；显式 Retire/Unpin、跨进程 Pin、共享 Session 和按 Principal 的配额限流都未实现，已在[验收矩阵](acceptance.md#已知限制)中记录为已知限制。
-- Admin API 依然完全未认证。对话面的认证不改变"进程只能绑定本机地址"这一边界。
+- Admin API 依然完全未认证。对话面的认证不改变"进程只能绑定本机地址"这一边界。（**已被 §18 取代**：Admin 面现在有独立的静态凭据和角色模型；绑定本机地址这条边界保留，但理由换了。）
+
+## 18. 2026-09-02 控制面身份与租户 Entitlement
+
+- **两条凭据链路互不相交。** `identity.AdminIdentity`/`AdminAuthenticator` 与对话面的 `Identity`/`Authenticator` 是两组独立类型，方法名分别是 `AuthenticateAdmin` 和 `Authenticate`，因此没有任何值能同时满足两者——Chat Key 不可能被当成 Admin Key 用，反之亦然。Admin 凭据的长度下限是 32 字符（对话面是 16）：一把 chat key 只能和一个租户的一个 App 对话，一把 admin key 决定平台执行什么，两者不是同一种凭据换个标签。
+- **角色是封闭集合。** `platform_admin` 不属于任何租户，是唯一能创建租户的角色；`tenant_admin` 恰好绑定一个租户，比较是精确字符串。清单里写不出第三个角色，因为一个无法识别的角色一定得被赋予某种默认含义。
+- **认证排在路由之前。** Admin 请求的处理顺序是：认证 → Content-Type（POST）→ 路径前缀 → 租户作用域 → 方法 → 角色 → Repository。`/admin` 整个子树由一层包装器在 `http.ServeMux` 之前接管，否则 ServeMux 的路径清洗会把 `/admin/../admin/v1/tenants` 这类请求用一个 301 回答未认证的调用方，泄漏"这个路径存在"。`tenant_admin` 触碰别的租户得到的是和"资源不存在"逐字节相同的 404，且**不产生任何 Repository 调用**——用一个任何方法被调用就让测试失败的 Repository 断言。
+- **`created_by` 来自认证后的 Principal。** 创建 Revision 的请求体里不再有这个字段，未知字段会被拒绝，所以伪造作者不再是一次请求的事。
+- **Admin 面不发布任何 CORS 头**，也没有预检分支；所有 POST 必须携带 `application/json`，这同时把 Admin 写操作挡在 CORS simple request 之外。
+- **Security Manifest 是严格版本化的。** `version` 必须恰好是 1，文件上限 256 KiB 且必须是普通文件，未知字段拒绝，任意层级的重复成员按大小写折叠拒绝，整个文件只允许一个 JSON 值。多把静态 key 长期只以 SHA-256 保存；无法作为 Bearer 可靠传输的 key（空、首尾有空白、含 header 非法字节）在构造期就被拒绝，而不是等到某次认证莫名失败。
+- **能力按租户授权。** `allowed_secret_refs` / `allowed_policy_refs` 按租户组织：能不能引用一个能力，是"跑这个 Revision 的租户"的属性，不是"碰巧创建它的人"的属性。加载期就拒绝把持有平台自身凭据的变量或 `TRPC_SERVICE_` 命名空间授权给任何租户。Admin 创建、Admin 发布和 Runtime 构建三处共用同一个 authorizer 实例。
+- **Runtime 的构建顺序本身是一条安全属性。** 发布态 → 身份/形状 → 重算并逐字节比对 `config_digest` → entitlement → Tool Registry → 模型/Secret。entitlement 先于 Secret 解析，意味着未授权的引用被拒时那个环境变量根本没有被读取。
+- **`start.sh` 首次启动生成 `data/admin-api-key`（0600），重启复用，只打印路径、从不打印 key**；显式设置 `TRPC_SERVICE_ADMIN_API_KEY` 或 `TRPC_SERVICE_SECURITY_CONFIG_FILE` 时不生成。
+- **明确未实现：** JWT/OIDC、动态 RBAC、清单热加载、凭据轮转/过期/撤销、持久化管理操作审计、生产 Secret Manager、预算/审批/Guardrail。`base_url` 仍不是受 entitlement 约束的能力，`config_digest` 仍是不带密钥的 SHA-256。完整边界见[身份、权限与密钥治理](security-and-governance.md)。

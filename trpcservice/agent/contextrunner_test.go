@@ -124,7 +124,8 @@ func TestContextRunnerCloseDoesNotCloseInnerRunner(t *testing.T) {
 func TestRuntimeGivesProtocolAdapterTheContextRunner(t *testing.T) {
 	shared := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, shared.Close()) })
-	runtime, err := NewRuntimeFromRevision(publishedRevision("revision-1", "echo-v1"), shared)
+	revision := publishedRevision("revision-1", "echo-v1")
+	runtime, err := NewRuntimeFromRevision(revision, shared, entitling(t, revision))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
 

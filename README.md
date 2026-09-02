@@ -149,7 +149,22 @@ cd trpc-agent-service
 
 当前实现会启动内存控制面，预置 `demo` Tenant、`echo` Agent App 和已发布的 `echo-v1` Revision，再通过 Runtime Resolver 懒加载真实的 tRPC-Agent-Go `LLMAgent + Runner + InMemory Session`。服务监听 `127.0.0.1:8080`，确定性回显模型不需要外部 API Key。
 
-健康检查：
+对话面和 Admin 面都要求 Bearer 凭据，且使用两套互不相通的凭据体系。Admin Key 没有公开默认值：环境里没有 `TRPC_SERVICE_ADMIN_API_KEY` 时，`start.sh` 会生成一个并存到 `data/admin-api-key`（`0600`，已被 `.gitignore` 排除），重启复用同一个文件。脚本只打印路径，不打印 key：
+
+```text
+generated a new admin API key: /path/to/project/data/admin-api-key
+admin API key: /path/to/project/data/admin-api-key
+```
+
+后面的 Admin 示例统一用这个值：
+
+```bash
+ADMIN_KEY="$(cat data/admin-api-key)"
+```
+
+环境里已有 `TRPC_SERVICE_ADMIN_API_KEY`，或设置了 `TRPC_SERVICE_SECURITY_CONFIG_FILE` 时，脚本不生成也不写这个文件。
+
+健康检查（不需要凭据）：
 
 ```bash
 curl http://127.0.0.1:8080/healthz
@@ -166,7 +181,7 @@ curl -i http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"deterministic-echo","messages":[{"role":"user","content":"hello platform"}]}'
 ```
 
-本地开发 key 通过环境变量覆盖，未设置时使用上面这个公开的、明确命名为非密钥的占位值。key 至少需要 16 个字符，否则进程启动即失败：
+本地开发 chat key 通过环境变量覆盖，未设置时使用上面这个公开的、明确命名为非密钥的占位值。chat key 至少 16 个字符，Admin key 至少 32 个字符，首尾带空白或含有无法放进 HTTP 头的字节的 key 会在启动时直接拒绝（否则进程会正常启动，然后对着刚刚配置好的 key 返回 `401`）：
 
 ```bash
 TRPC_SERVICE_API_KEY=replace-with-your-own-local-key ./start.sh
@@ -178,22 +193,71 @@ TRPC_SERVICE_API_KEY=replace-with-your-own-local-key ./start.sh
 - **`X-Session-ID` 可以不传**，平台会生成一个并通过响应头 `X-Session-ID` 回传，续接对话时原样带回即可；`-i` 就是为了看到这个响应头。
 - **响应头 `X-Agent-Revision-ID`** 是本次实际执行的版本。每个 Session 在首轮就被钉在当时的 Revision 上，之后发布新版本或回滚都不会改变它，新建 Session 才会用上新版本。
 
-将请求体加入 `"stream":true` 即可验证 SSE 流式响应，响应头同样带回上述两个字段。创建其他 Tenant、Agent App 和 Revision 的接口、完整路由顺序和错误码见 [Admin API 与动态路由](docs/admin-api.md)。
+将请求体加入 `"stream":true` 即可验证 SSE 流式响应，响应头同样带回上述两个字段。
+
+创建其他 Tenant、Agent App 和 Revision 的接口、完整路由顺序和错误码见 [Admin API 与动态路由](docs/admin-api.md)；凭据体系、角色模型、Security Manifest、租户 Entitlement 和已知边界见[身份、权限与密钥治理](docs/security-and-governance.md)。
+
+用 `platform_admin` 凭据创建一个新租户：
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/v1/tenants \
+  -H "Authorization: Bearer ${ADMIN_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"team-a","slug":"team-a","name":"Team A"}'
+```
 
 ### 运行真实模型
 
-Revision 也可以把模型 Provider 设为 `openai-compatible`。Worker 启动前先准备 Revision 引用的环境变量，再通过 Admin API 创建并发布新版本：
+Revision 也可以把模型 Provider 设为 `openai-compatible`，用 `secret_ref` 从 Worker 环境解析 API Key。
+
+引用 `secret_ref` 需要该**租户**被授权引用那个变量。默认的 demo profile 只授权 `demo` 租户使用 `builtin.safe-tools` 策略，**不授权任何 SecretRef**，所以直接用默认配置发布下面这个 Revision 会得到 `403 not_entitled`。要跑真实模型，需要提供一份自定义 security manifest。
+
+`security.json`（key 的值不写在文件里，只写它来自哪个环境变量）：
+
+```json
+{
+  "version": 1,
+  "credentials": [
+    {
+      "purpose": "chat",
+      "principal_id": "demo-user",
+      "key_ref": "env:DEMO_CHAT_KEY",
+      "tenant_id": "demo",
+      "allowed_app_ids": ["echo"]
+    },
+    {
+      "purpose": "platform_admin",
+      "principal_id": "local-admin",
+      "key_ref": "env:DEMO_ADMIN_KEY"
+    }
+  ],
+  "tenant_entitlements": [
+    {
+      "tenant_id": "demo",
+      "allowed_secret_refs": ["env:TEAM_MODEL_API_KEY"],
+      "allowed_policy_refs": ["builtin.safe-tools"]
+    }
+  ]
+}
+```
+
+设置了 `TRPC_SERVICE_SECURITY_CONFIG_FILE` 后，manifest 就是**全部**配置：`TRPC_SERVICE_API_KEY` 和上面那个公开的开发 key 都不再参与，`start.sh` 也不再生成 `data/admin-api-key`，两个 key 都由你自己提供。
 
 ```bash
 export TEAM_MODEL_API_KEY='replace-with-provider-key'
+export DEMO_CHAT_KEY='replace-with-your-own-chat-key'
+export DEMO_ADMIN_KEY='replace-with-your-own-admin-key-at-least-32-chars'
+export TRPC_SERVICE_SECURITY_CONFIG_FILE="$PWD/security.json"
 ./start.sh
 
+ADMIN_KEY="$DEMO_ADMIN_KEY"
+
 curl -X POST http://127.0.0.1:8080/admin/v1/tenants/demo/apps/echo/revisions \
+  -H "Authorization: Bearer ${ADMIN_KEY}" \
   -H 'Content-Type: application/json' \
   -d '{
     "id":"echo-openai-v1",
     "revision_no":2,
-    "created_by":"local-admin",
     "config":{
       "agent_name":"echo-assistant",
       "instruction":"Answer the user request.",
@@ -211,10 +275,14 @@ curl -X POST http://127.0.0.1:8080/admin/v1/tenants/demo/apps/echo/revisions \
   }'
 
 curl -X POST \
+  -H "Authorization: Bearer ${ADMIN_KEY}" \
+  -H 'Content-Type: application/json' \
   http://127.0.0.1:8080/admin/v1/tenants/demo/apps/echo/revisions/echo-openai-v1/publish
 ```
 
-之后用一个新的 `X-Session-ID` 调用前面的对话接口；已开始的 Session 仍保持原 Revision。默认测试不会访问外网，真实端点冒烟测试必须显式开启：
+请求体里**没有** `created_by`：作者身份取自认证凭据的 Principal，不是请求可以声明的字段，仍然携带它的请求体会被 `400 invalid_json` 拒绝。`publish` 虽然不带 body，同样需要 `Content-Type: application/json`——所有 Admin 写操作都要求它，这是把 Admin 写请求挡在浏览器"简单请求"集合之外的那一条。
+
+之后用一个新的 `X-Session-ID` 调用前面的对话接口，Bearer 换成 manifest 里那个 chat key（`$DEMO_CHAT_KEY`）；已开始的 Session 仍保持原 Revision。默认测试不会访问外网，真实端点冒烟测试必须显式开启：
 
 ```bash
 TRPC_SERVICE_MODEL_INTEGRATION=1 \
@@ -227,9 +295,11 @@ go test -race -timeout 120s \
 
 上面这个 Revision 会把两个内置安全工具交给真实模型：`builtin_add` 做整数加法，`builtin_echo` 原样返回文本；`builtin.safe-tools` 是当前唯一白名单策略。有 `tool_refs` 却没有已知 `policy_refs`、引用未知或重复、或者策略不允许指定工具时，Runtime 会拒绝构建，不会静默减少工具集合。工具调用通过 tRPC-Agent-Go 的 callback 记录结构化 before/after 审计，但不记录参数、结果或错误正文。完整语义、离线两轮 Tool/SSE 测试和当前限制见 [Tool 与 Policy Runtime](docs/tool-policy.md)。
 
-`base_url` 必填，避免上游客户端从进程环境静默选择请求目标。空 `secret_ref` 明确表示无凭据调用，不会继承进程的 OpenAI API Key；当前 `env:` 解析器仍是本地开发能力，尚无租户级变量授权，限制见 [Admin API](docs/admin-api.md#6-已知限制)。
+`base_url` 必填，避免上游客户端从进程环境静默选择请求目标。空 `secret_ref` 明确表示无凭据调用，不会继承进程的 OpenAI API Key。`secret_ref` 仍然只支持 `env:VAR_NAME`，但现在**必须**先被该租户的 entitlement 授权：租户之间不能互相引用变量，任何租户都不能被授权引用持有平台自身凭据的变量，也不能引用 `TRPC_SERVICE_` 命名空间。未授权的引用一律返回同一个 `403 not_entitled`，不区分变量存在与否，也不区分策略是否注册。完整规则见[身份、权限与密钥治理](docs/security-and-governance.md)。
 
-**Admin API 仍未接入任何认证**，任何能访问该端口的人都可以创建租户和发布版本，因此服务只允许绑定回环地址：`127.0.0.1`、`localhost`、`[::1]` 之外的监听地址（包括 `:8080`、`0.0.0.0:8080` 这类通配形式）会在启动时直接拒绝，且没有绕过开关。对话面的认证不改变这个边界，等 Admin 认证落地后才会放开。
+**Admin API 要求 Bearer 凭据**，角色为 `platform_admin`（可管理任意租户，且是唯一能创建租户的角色）或 `tenant_admin`（只能管理绑定的那一个租户，访问别的租户得到与"资源不存在"逐字节相同的 `404`，且不会产生任何 Repository 调用）。认证发生在路由、方法和 `Content-Type` 判断之前，因此无凭据的调用方在真实路由、不存在的路由和错误方法上得到同一个 `401`。Admin 的任何响应都不带 CORS 头。
+
+即便如此，服务仍然只允许绑定回环地址：`127.0.0.1`、`localhost`、`[::1]` 之外的监听地址（包括 `:8080`、`0.0.0.0:8080` 这类通配形式）会在启动时直接拒绝，且没有绕过开关。理由已经不是"Admin 未认证"，而是本进程只服务明文 HTTP——可路由的监听地址会把 Admin Bearer token 明文放到网络上，而且 demo profile 仍然可以用公开的开发 chat key 启动。TLS 终止属于外部反向代理，不属于本二进制的环境变量。
 
 自定义监听地址时使用：
 

@@ -49,8 +49,9 @@ func TestNewRuntimeFromRevisionRejectsUnknownProvider(t *testing.T) {
 
 	revision := publishedRevision("revision-1", "gpt-4o-mini")
 	revision.Config.Model.Provider = "anthropic"
+	revision = sealed(revision)
 
-	runtime, err := NewRuntimeFromRevision(revision, shared)
+	runtime, err := NewRuntimeFromRevision(revision, shared, entitling(t, revision))
 	require.Nil(t, runtime)
 	require.ErrorContains(t, err, `build model for revision "revision-1"`)
 	require.ErrorContains(t, err, `unsupported model provider "anthropic"`)
@@ -171,7 +172,7 @@ func TestGenerationConfigFromModelConfig(t *testing.T) {
 // endpoint, authenticates with the resolved secret, and carries the revision's
 // generation settings on the wire. It talks only to a local httptest server.
 func TestOpenAICompatibleRuntimeCallsConfiguredEndpoint(t *testing.T) {
-	t.Setenv("TRPC_SERVICE_TEST_MODEL_KEY", "sk-resolved-value")
+	t.Setenv("TEST_MODEL_API_KEY", "sk-resolved-value")
 	// The ambient defaults are present but unreferenced: the revision's own
 	// secret_ref is what authenticates, so stripping the inherited values must
 	// not disturb the explicit path.
@@ -185,14 +186,15 @@ func TestOpenAICompatibleRuntimeCallsConfiguredEndpoint(t *testing.T) {
 		Provider:    ProviderOpenAICompatible,
 		Name:        "test-model",
 		BaseURL:     upstream.server.URL + "/v1",
-		SecretRef:   "env:TRPC_SERVICE_TEST_MODEL_KEY",
+		SecretRef:   "env:TEST_MODEL_API_KEY",
 		Temperature: &temperature,
 		MaxTokens:   321,
 	}
+	revision = sealed(revision)
 
 	sessionService := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, sessionService.Close()) })
-	runtime, err := NewRuntimeFromRevision(revision, sessionService)
+	runtime, err := NewRuntimeFromRevision(revision, sessionService, entitling(t, revision))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
 
@@ -249,10 +251,11 @@ func TestOpenAICompatibleRuntimeWithoutSecretRefSendsNoCredential(t *testing.T) 
 		Name:     "test-model",
 		BaseURL:  upstream.server.URL + "/v1",
 	}
+	revision = sealed(revision)
 
 	sessionService := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, sessionService.Close()) })
-	runtime, err := NewRuntimeFromRevision(revision, sessionService)
+	runtime, err := NewRuntimeFromRevision(revision, sessionService, entitling(t, revision))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
 

@@ -204,6 +204,21 @@ func (r *Registry) Resolve(toolRefs []string, policyRefs []string) ([]agenttool.
 	return resolved, nil
 }
 
+// HasPolicy reports whether ref names a registered policy.
+//
+// It exists for the security manifest, which validates a tenant's entitled
+// policy refs at load time. That check has to happen there and not at first
+// use: by design a caller cannot tell "unknown policy" from "not entitled to
+// it", so a misspelled ref in the manifest would otherwise be a silent,
+// permanent refusal with nothing to read.
+func (r *Registry) HasPolicy(ref string) bool {
+	if r == nil {
+		return false
+	}
+	_, known := r.policies[ref]
+	return known
+}
+
 // validatePolicyRefs rejects a policy list that names something unregistered or
 // names the same policy twice.
 func (r *Registry) validatePolicyRefs(policyRefs []string) error {

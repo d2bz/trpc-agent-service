@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
@@ -418,9 +419,15 @@ func seedResolverTenant(
 
 // buildTestRuntime builds a complete Runtime that owns its Session service, so
 // the resolver is the only owner of every resource it caches.
+//
+// The authorizer entitles nothing, deliberately. These revisions name no secret
+// and no policy, which is exactly the set that needs no entitlement — so the
+// strictest possible authorizer is also the honest one, and any of them that
+// later grows a capability ref fails here rather than quietly acquiring it.
 func buildTestRuntime(revision tenant.AgentRevision) *Runtime {
 	sessionService := sessioninmemory.NewSessionService()
-	runtime, err := newRuntimeFromRevision(revision, sessionService, true, nil)
+	runtime, err := newRuntimeFromRevision(
+		revision, sessionService, true, nil, security.DenyCapabilities())
 	if err != nil {
 		_ = sessionService.Close()
 		panic(err)

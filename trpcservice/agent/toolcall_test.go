@@ -134,7 +134,8 @@ func toolCallRuntime(
 		[]string{servicetool.RefAdd, servicetool.RefEcho},
 		[]string{servicetool.PolicySafeTools},
 	)
-	runtime, err := newRuntimeFromRevision(revision, sessionService, false, sink)
+	runtime, err := newRuntimeFromRevision(
+		revision, sessionService, false, sink, entitling(t, revision))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
 	return runtime
