@@ -204,7 +204,9 @@ curl -X POST http://127.0.0.1:8080/admin/v1/tenants/demo/apps/echo/revisions \
         "secret_ref":"env:TEAM_MODEL_API_KEY",
         "temperature":0.2,
         "max_tokens":256
-      }
+      },
+      "tool_refs":["builtin_add","builtin_echo"],
+      "policy_refs":["builtin.safe-tools"]
     }
   }'
 
@@ -222,6 +224,8 @@ TRPC_SERVICE_MODEL_SECRET_REF='env:TEAM_MODEL_API_KEY' \
 go test -race -timeout 120s \
   -run TestOpenAICompatibleLiveEndpoint ./trpcservice/agent/...
 ```
+
+上面这个 Revision 会把两个内置安全工具交给真实模型：`builtin_add` 做整数加法，`builtin_echo` 原样返回文本；`builtin.safe-tools` 是当前唯一白名单策略。有 `tool_refs` 却没有已知 `policy_refs`、引用未知或重复、或者策略不允许指定工具时，Runtime 会拒绝构建，不会静默减少工具集合。工具调用通过 tRPC-Agent-Go 的 callback 记录结构化 before/after 审计，但不记录参数、结果或错误正文。完整语义、离线两轮 Tool/SSE 测试和当前限制见 [Tool 与 Policy Runtime](docs/tool-policy.md)。
 
 `base_url` 必填，避免上游客户端从进程环境静默选择请求目标。空 `secret_ref` 明确表示无凭据调用，不会继承进程的 OpenAI API Key；当前 `env:` 解析器仍是本地开发能力，尚无租户级变量授权，限制见 [Admin API](docs/admin-api.md#6-已知限制)。
 

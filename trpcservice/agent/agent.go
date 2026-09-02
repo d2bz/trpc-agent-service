@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -23,6 +24,23 @@ const (
 	DemoAgentName = "echo-assistant"
 	DemoModelName = "deterministic-echo"
 )
+
+// maxToolIterations bounds how many rounds of tool calls one run may take. An
+// iteration is one assistant response that contains tool calls, so the bound is
+// on model-tool-model loops, not on the number of tools called.
+//
+// It exists because a run holds a session lease for as long as it lasts. A
+// model that keeps re-issuing tool calls — a loop it cannot see, a tool error
+// it retries forever — would hold that lease and the upstream connection for as
+// long as the model kept talking, and no other turn in that conversation could
+// proceed. The framework's default is unbounded, which is not a safe default
+// for a shared multi-tenant runtime.
+//
+// Four is conservative on purpose. The registered tools answer in one round; a
+// model that calls both, then retries once after a bad-argument error, needs
+// three. Exceeding the bound ends the run with an error rather than truncating
+// the answer silently, so this is a backstop, not a budget to spend.
+const maxToolIterations = 4
 
 type runtimeHTTPAdapter interface {
 	Handler() http.Handler
@@ -72,7 +90,7 @@ func NewDemoRuntime() *Runtime {
 			},
 		},
 	}
-	runtime, err := newRuntimeFromRevision(revision, sessionService, true)
+	runtime, err := newRuntimeFromRevision(revision, sessionService, true, nil)
 	if err != nil {
 		_ = sessionService.Close()
 		panic(fmt.Sprintf("agent: build static demo runtime: %v", err))
@@ -86,13 +104,17 @@ func NewRuntimeFromRevision(
 	revision tenant.AgentRevision,
 	sessionService session.Service,
 ) (*Runtime, error) {
-	return newRuntimeFromRevision(revision, sessionService, false)
+	return newRuntimeFromRevision(revision, sessionService, false, nil)
 }
 
+// newRuntimeFromRevision builds a Runtime. A nil auditSink selects the process
+// default, which is slog; it is a parameter so the tool trail can be read back
+// without redirecting the logger of the whole process.
 func newRuntimeFromRevision(
 	revision tenant.AgentRevision,
 	sessionService session.Service,
 	ownsSessionService bool,
+	auditSink tool.AuditSink,
 ) (*Runtime, error) {
 	if revision.Status != tenant.RevisionStatusPublished {
 		return nil, fmt.Errorf("agent: revision %q is not published", revision.ID)
@@ -112,18 +134,38 @@ func newRuntimeFromRevision(
 	if sessionService == nil {
 		return nil, fmt.Errorf("agent: session service is required")
 	}
+	// Tools and policies are resolved before anything is constructed. A
+	// revision the platform cannot authorize must not reach a model, a Runner
+	// or a protocol adapter — and running this first also means an unbuildable
+	// revision never causes a credential to be resolved.
+	tools, err := tool.Builtin().Resolve(revision.Config.ToolRefs, revision.Config.PolicyRefs)
+	if err != nil {
+		return nil, fmt.Errorf("agent: assemble tools for revision %q: %w", revision.ID, err)
+	}
 	llmModel, err := newModel(revision.Config.Model)
 	if err != nil {
 		return nil, fmt.Errorf("agent: build model for revision %q: %w", revision.ID, err)
 	}
 	appName := fmt.Sprintf("t/%s/a/%s", revision.TenantID, revision.AgentAppID)
-	ag := llmagent.New(
-		revision.Config.AgentName,
+	options := []llmagent.Option{
 		llmagent.WithModel(llmModel),
 		llmagent.WithDescription(revision.Config.Description),
 		llmagent.WithInstruction(revision.Config.Instruction),
 		llmagent.WithGenerationConfig(generationConfig(revision.Config.Model)),
-	)
+	}
+	// A revision with no tools is built exactly as before. The tool options are
+	// not merely inert without tools — the iteration bound and the callbacks
+	// change agent behavior — so a revision that never asked for tools does not
+	// get them.
+	if len(tools) > 0 {
+		options = append(
+			options,
+			llmagent.WithTools(tools),
+			llmagent.WithMaxToolIterations(maxToolIterations),
+			llmagent.WithToolCallbacks(tool.NewAuditCallbacks(auditSink)),
+		)
+	}
+	ag := llmagent.New(revision.Config.AgentName, options...)
 	r := runner.NewRunner(
 		appName,
 		ag,

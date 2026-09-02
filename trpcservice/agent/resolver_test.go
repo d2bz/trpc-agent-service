@@ -420,7 +420,7 @@ func seedResolverTenant(
 // the resolver is the only owner of every resource it caches.
 func buildTestRuntime(revision tenant.AgentRevision) *Runtime {
 	sessionService := sessioninmemory.NewSessionService()
-	runtime, err := newRuntimeFromRevision(revision, sessionService, true)
+	runtime, err := newRuntimeFromRevision(revision, sessionService, true, nil)
 	if err != nil {
 		_ = sessionService.Close()
 		panic(err)

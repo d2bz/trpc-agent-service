@@ -49,6 +49,21 @@ go test ./trpcservice/tenant ./trpcservice/agent
 go test -race ./trpcservice/tenant ./trpcservice/agent
 ```
 
+### D03 Revision Tool/Policy 闭环
+
+1. 创建一个引用 `builtin_add`、`builtin_echo` 和 `builtin.safe-tools` 的 Revision，确认 Runtime 发给模型的函数名和顺序与 Revision 一致。
+2. 使用离线脚本模型：首轮同时请求两个 Tool，确认框架执行后第二次模型请求包含按 call ID 关联的 `sum=5` 与 `text=pong`。
+3. 确认最终文本从真实 OpenAI Adapter 的 `stream:true` SSE 返回，并以 `[DONE]` 结束。
+4. 分别提交未知 Tool、未知 Policy、重复引用、缺少 Policy 和未授权 Tool，确认 Runtime 全部 fail closed。
+5. 检查 before/after 审计只包含可信作用域、Tool、call ID、结果状态和耗时，不包含参数、结果或错误正文。
+6. 让脚本模型持续返回 tool calls，确认只执行 4 轮，第 5 轮在执行 Tool 前终止。
+
+自动化证据：
+
+```bash
+go test -race -count=1 ./trpcservice/tool ./trpcservice/agent
+```
+
 ## 4. 9 月 11 日最终验收场景
 
 | 场景 | 核心操作 | 必须观察到的结果 | 主要验收项 |
