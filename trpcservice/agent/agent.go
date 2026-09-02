@@ -52,8 +52,9 @@ type Runtime struct {
 }
 
 // NewDemoRuntime builds a real tRPC-Agent-Go LLMAgent and Runner without
-// requiring an external model API. It is the first executable vertical slice;
-// later revisions will replace the deterministic model through configuration.
+// requiring an external model API. It stays on the deterministic provider so
+// the bootstrap path needs no endpoint and no credential; a revision selects a
+// real model through its own ModelConfig.
 func NewDemoRuntime() *Runtime {
 	sessionService := sessioninmemory.NewSessionService()
 	revision := tenant.AgentRevision{
@@ -66,7 +67,7 @@ func NewDemoRuntime() *Runtime {
 			Description: "Deterministic bootstrap agent",
 			Instruction: "Return the model response. This bootstrap runtime verifies the service path.",
 			Model: tenant.ModelConfig{
-				Provider: "deterministic",
+				Provider: ProviderDeterministic,
 				Name:     DemoModelName,
 			},
 		},
@@ -108,22 +109,20 @@ func newRuntimeFromRevision(
 	if _, err := revision.Config.Digest(); err != nil {
 		return nil, fmt.Errorf("agent: invalid revision config: %w", err)
 	}
-	if revision.Config.Model.Provider != "deterministic" {
-		return nil, fmt.Errorf(
-			"agent: unsupported bootstrap model provider %q",
-			revision.Config.Model.Provider,
-		)
-	}
 	if sessionService == nil {
 		return nil, fmt.Errorf("agent: session service is required")
+	}
+	llmModel, err := newModel(revision.Config.Model)
+	if err != nil {
+		return nil, fmt.Errorf("agent: build model for revision %q: %w", revision.ID, err)
 	}
 	appName := fmt.Sprintf("t/%s/a/%s", revision.TenantID, revision.AgentAppID)
 	ag := llmagent.New(
 		revision.Config.AgentName,
-		llmagent.WithModel(deterministicModel{name: revision.Config.Model.Name}),
+		llmagent.WithModel(llmModel),
 		llmagent.WithDescription(revision.Config.Description),
 		llmagent.WithInstruction(revision.Config.Instruction),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: true}),
+		llmagent.WithGenerationConfig(generationConfig(revision.Config.Model)),
 	)
 	r := runner.NewRunner(
 		appName,

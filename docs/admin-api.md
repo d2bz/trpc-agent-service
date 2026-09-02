@@ -2,7 +2,7 @@
 
 ## 1. 当前边界
 
-当前接口用于本地开发和验收最小闭环。控制面使用 InMemory Repository，进程重启后只恢复内置 demo 配置；Admin API 尚未接入身份认证，因此服务默认绑定 `127.0.0.1`，不能直接暴露到公网。后续 PostgreSQL Repository 和管理员授权会保持本文的资源语义，但可能增加认证头、分页和审计字段。
+当前接口用于本地开发和验收最小闭环。控制面默认使用 InMemory Repository，也可通过 `TRPC_SERVICE_STORAGE_PROFILE=postgres` 使用 PostgreSQL；Admin API 尚未接入身份认证，因此服务默认绑定 `127.0.0.1`，不能直接暴露到公网。管理员授权会保持本文的资源语义，但可能增加认证头、分页和审计字段。
 
 对话面已经要求 Bearer 凭据（见第 4 节），Admin 面没有。两者的安全边界不同：**Admin 未认证这一条决定了整个进程仍然只能跑在本机**，对话面的认证不改变这个结论。
 
@@ -146,11 +146,20 @@ CORS 预检允许 `Authorization`、`X-Tenant-ID`、`X-Agent-App-ID`、`X-Agent-
 - 主体间共享 Session、显式 Retire/Unpin（`Key.Epoch` 已预留但恒为 0）。Redis Run 租约已实现（见 [Session Run Lease](session-lease.md)），但它只做 Run 入口的合作型互斥，不做写入准入。
 - 静态 API Key 之外的凭据体系：轮转、过期、撤销、按 Principal 的配额与限流。
 - 权重灰度、白名单路由、Runtime TTL/LRU 淘汰和配置失效通知。
-- 生产模型 Provider、Secret Resolver、Tool/Knowledge/Policy 组装。
+- `openai-compatible` 模型 Provider 已支持运行时构造。Revision 的模型配置需要 `base_url`，可用 `secret_ref: "env:VAR_NAME"` 从 Worker 环境解析 API Key；未设置 `secret_ref` 表示无凭据调用。因为 `base_url` 由租户的 Revision 指定，上游 openai-go 从 Worker 进程环境派生的请求头都会被显式删除，具体是且仅是这三个：
+
+  | 请求头 | 环境变量 | 删除时机 |
+  | --- | --- | --- |
+  | `OpenAI-Organization` | `OPENAI_ORG_ID` | 总是 |
+  | `OpenAI-Project` | `OPENAI_PROJECT_ID` | 总是 |
+  | `Authorization` | `OPENAI_API_KEY` | 仅 `secret_ref` 为空时；显式 `secret_ref` 保留自己解析出的那一个 |
+
+  前两个是运营方 OpenAI 账号的标识，Revision schema 不建模这两个值，所以无论是否配置 `secret_ref` 都删除。`OPENAI_WEBHOOK_SECRET` 是 openai-go 的第四个环境默认值，但它不设置请求头，因此不在此列。这只是这一个客户端上的请求头抑制，**不等于**进程级 Secret 隔离：进程环境仍然可读，显式 `env:VAR_NAME` 仍会为引用它的 Revision 解析。Secret Manager、Tool/Knowledge/Policy 组装仍未完成。
 
 ## 6. 已知限制
 
 - **合法凭据可以制造无界内存 Session。** Session 目录和 Session Service 都在内存中，且没有配额或 TTL，一个持有有效 key 的调用方可以用无限多的 `X-Session-ID` 撑爆进程内存。
 - **首轮 OpenAI 历史可以伪造。** 平台只决定 Session 归属，不校验请求体里的 `messages`。新 Session 的第一轮里，调用方可以自行编造一段"历史对话"送进模型上下文。后续轮次会与服务端存储的 Session 事件合并，但首轮注入无法阻止。
 - **Adapter 拒绝的请求也会建立 Pin。** Session ID 和 Revision 在调用上游 Adapter 之前就已确定并写入响应头，因此一个 JSON 格式错误的首轮请求同样会把该 Session 钉在当时的 Revision 上。
+- **`secret_ref` 的 `env:VAR_NAME` 没有租户授权和白名单。** 解析器只检查名字是不是合法的环境变量名，不检查这个 Revision 所属的租户有没有权限引用这个变量。因此任何能发布 Revision 的主体，都可以引用 Worker 进程里的**任意**环境变量，并把解析结果当作 `Authorization` 发往自己在 `base_url` 里指定的地址——上一节删除的是进程环境**默认**派生的请求头，拦不住一次显式的引用。今天之所以安全，只是因为 Admin 面仍然是 loopback-only 且未认证的本地控制面，能发布 Revision 的就是运行这个进程的人。**在把 Admin 面暴露给租户管理员之前，必须先解决这一条**：至少需要按租户的变量白名单，或者直接换成带授权的 Secret Manager 引用。
 - 对话面认证只覆盖 `/v1/chat/completions`。**不能据此认为平台整体达到生产安全标准。**

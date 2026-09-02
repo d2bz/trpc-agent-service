@@ -180,6 +180,51 @@ TRPC_SERVICE_API_KEY=replace-with-your-own-local-key ./start.sh
 
 将请求体加入 `"stream":true` 即可验证 SSE 流式响应，响应头同样带回上述两个字段。创建其他 Tenant、Agent App 和 Revision 的接口、完整路由顺序和错误码见 [Admin API 与动态路由](docs/admin-api.md)。
 
+### 运行真实模型
+
+Revision 也可以把模型 Provider 设为 `openai-compatible`。Worker 启动前先准备 Revision 引用的环境变量，再通过 Admin API 创建并发布新版本：
+
+```bash
+export TEAM_MODEL_API_KEY='replace-with-provider-key'
+./start.sh
+
+curl -X POST http://127.0.0.1:8080/admin/v1/tenants/demo/apps/echo/revisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id":"echo-openai-v1",
+    "revision_no":2,
+    "created_by":"local-admin",
+    "config":{
+      "agent_name":"echo-assistant",
+      "instruction":"Answer the user request.",
+      "model":{
+        "provider":"openai-compatible",
+        "name":"gpt-4o-mini",
+        "base_url":"https://api.openai.com/v1",
+        "secret_ref":"env:TEAM_MODEL_API_KEY",
+        "temperature":0.2,
+        "max_tokens":256
+      }
+    }
+  }'
+
+curl -X POST \
+  http://127.0.0.1:8080/admin/v1/tenants/demo/apps/echo/revisions/echo-openai-v1/publish
+```
+
+之后用一个新的 `X-Session-ID` 调用前面的对话接口；已开始的 Session 仍保持原 Revision。默认测试不会访问外网，真实端点冒烟测试必须显式开启：
+
+```bash
+TRPC_SERVICE_MODEL_INTEGRATION=1 \
+TRPC_SERVICE_MODEL_BASE_URL='https://api.openai.com/v1' \
+TRPC_SERVICE_MODEL_NAME='gpt-4o-mini' \
+TRPC_SERVICE_MODEL_SECRET_REF='env:TEAM_MODEL_API_KEY' \
+go test -race -timeout 120s \
+  -run TestOpenAICompatibleLiveEndpoint ./trpcservice/agent/...
+```
+
+`base_url` 必填，避免上游客户端从进程环境静默选择请求目标。空 `secret_ref` 明确表示无凭据调用，不会继承进程的 OpenAI API Key；当前 `env:` 解析器仍是本地开发能力，尚无租户级变量授权，限制见 [Admin API](docs/admin-api.md#6-已知限制)。
+
 **Admin API 仍未接入任何认证**，任何能访问该端口的人都可以创建租户和发布版本，因此服务只允许绑定回环地址：`127.0.0.1`、`localhost`、`[::1]` 之外的监听地址（包括 `:8080`、`0.0.0.0:8080` 这类通配形式）会在启动时直接拒绝，且没有绕过开关。对话面的认证不改变这个边界，等 Admin 认证落地后才会放开。
 
 自定义监听地址时使用：

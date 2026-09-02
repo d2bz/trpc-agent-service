@@ -184,8 +184,16 @@ const (
 )
 
 type ModelConfig struct {
-	Provider    string   `json:"provider"`
-	Name        string   `json:"name"`
+	Provider string `json:"provider"`
+	Name     string `json:"name"`
+	// BaseURL is the endpoint a remote provider talks to. It is omitempty so a
+	// revision written before this field existed marshals to exactly the same
+	// bytes as before, and therefore keeps the same ConfigDigest: revisions are
+	// immutable and their stored digest is re-checked on read, so a field that
+	// added bytes to old configs would report every one of them as corrupt.
+	BaseURL string `json:"base_url,omitempty"`
+	// SecretRef names a credential; it never carries the value itself. The
+	// runtime resolves it when it builds the model.
 	SecretRef   string   `json:"secret_ref,omitempty"`
 	Temperature *float64 `json:"temperature,omitempty"`
 	MaxTokens   int      `json:"max_tokens,omitempty"`
