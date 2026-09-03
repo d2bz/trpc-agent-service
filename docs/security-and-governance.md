@@ -218,7 +218,7 @@ security 文件是最不能容忍"解析器忽略了它不认识的那部分"的
 
 ## 7. Runtime 构建顺序
 
-`agent.newRuntimeFromRevision` 的检查顺序本身就是安全属性：
+`agent.NewRuntime` / `planRuntime` 的检查顺序本身就是安全属性：
 
 ```text
 1. 状态必须是 published
@@ -227,11 +227,12 @@ security 文件是最不能容忍"解析器忽略了它不认识的那部分"的
 4. RevisionAuthorizer               → security.ErrNotEntitled
 5. Tool Registry 解析
 6. 模型构造与 SecretRef 解析
+7. Storage Router 解析 BackendProfile 并获取 Bundle lease
 ```
 
 **第 3 步**：Published Revision 是不可变的，所以它的 config 必须仍然哈希到创建时记录的值。对不上意味着这一行是在 Repository 之外被改过的，而这正是"评审之后再挪动 `secret_ref` 或 `base_url`"的做法。**空 digest 算不匹配，不算豁免**——无法被核验必须和被核验为错误以同样的方式失败。测试覆盖四种绕过 Repository 的篡改（挪 credential、挪 endpoint、改写 instruction、加 policy），且拒绝信息不回显被篡改的值（`agent.TestRuntimeReverifiesThePublishedDigest`、`TestRuntimeRefusesTamperingThatSurvivesTheDigest`）。
 
-**第 4 步先于第 5、6 步**：一个租户无权运行的 Revision 必须在平台**没有读取那个环境变量**、也没有透露策略是否存在的前提下被拒绝。因此 `secret_ref` 指向未授权变量时，该变量是已设置、已导出为空还是根本不存在，得到的答案完全相同（`agent.TestRuntimeAuthorizesBeforeItReadsTheEnvironment`、`TestRuntimeResolvesTheCredentialOnlyAfterEntitlement`、`TestRuntimeRefusalDoesNotDistinguishRealPoliciesFromInvented`）。
+**第 4 步先于第 5、6、7 步**：一个租户无权运行的 Revision 必须在平台**没有读取那个环境变量**、没有透露策略是否存在、也没有查询或连接租户存储的前提下被拒绝。因此 `secret_ref` 指向未授权变量时，该变量是已设置、已导出为空还是根本不存在，得到的答案完全相同（`agent.TestRuntimeAuthorizesBeforeItReadsTheEnvironment`、`TestRuntimeResolvesTheCredentialOnlyAfterEntitlement`、`TestRuntimeRefusalDoesNotDistinguishRealPoliciesFromInvented`、`TestNewRuntimeRefusesBeforeTouchingStorage`）。
 
 `RevisionAuthorizer` 是**必填、非 variadic、无默认值**的构造参数：谁可以运行一个引用凭据的 Revision，正是那个不能靠"忘了传"来决定的选择。没有能力配置的调用方显式传 `security.DenyCapabilities()`——它不是"关掉授权"，而是最严格的答案。不引用任何 SecretRef / PolicyRef 的 Revision 在它下面照样能跑，因为那恰好就是不需要 entitlement 的那一类（`agent.TestRuntimeRunsCapabilityFreeRevisionsWithNoEntitlement`、`TestRuntimeRequiresAnAuthorizer`）。
 
@@ -240,7 +241,7 @@ Runtime 构建期的 `ErrNotEntitled` 和 `ErrConfigIntegrity` 在 HTTP 层都�
 ## 8. 启动顺序
 
 ```text
-校验监听地址 → security.Load → 校验存储配置 → 开池 / Ping / Migrate → Resolver → HTTP Server
+校验监听地址 → security.Load → 校验存储配置 → 开池 / Ping / Migrate → Storage Router → Runtime Resolver → HTTP Server
 ```
 
 `security.Load` 只读文件和环境，不碰数据库，因此是**最便宜的拒绝**：凭据配错的进程不应该在发现这件事的路上连过共享数据库或跑过一次迁移。它也在存储之前拿到 Tool Registry，因此 manifest 授权的策略是对着**真实存在的**策略校验的。

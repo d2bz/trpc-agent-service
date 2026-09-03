@@ -12,6 +12,7 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 )
@@ -448,6 +449,39 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		writeUnauthenticated(w, "the credential is not valid")
 	case errors.Is(err, identity.ErrForbidden):
 		writeForbidden(w)
+	// Storage routing, and it comes before the invalid_argument case rather than
+	// near the other revision cases below. That is load-bearing, not tidiness:
+	// storagebundle.Profile.Validate wraps both ErrInvalidProfile and
+	// tenant.ErrInvalidArgument, so a profile this process cannot build would
+	// otherwise leave here as a 400 carrying err.Error() — which is the profile
+	// id, the tenant id and whichever internal reason the Factory gave.
+	//
+	// None of that is the caller's. The chat client named no profile; a revision
+	// did, and which storage a revision runs on is platform configuration. So all
+	// six collapse into the same "this revision is not available" a client
+	// already gets for an unpublished or un-entitled one, with no wording that
+	// says which. It is 409 rather than 500 because the platform is working: this
+	// revision is not servable here, and retrying it unchanged will not help.
+	case errors.Is(err, storagebundle.ErrProfileNotFound),
+		errors.Is(err, storagebundle.ErrProfileChanged),
+		errors.Is(err, storagebundle.ErrInvalidProfile),
+		errors.Is(err, storagebundle.ErrUnsupportedBackend),
+		errors.Is(err, storagebundle.ErrPinsNotDurable),
+		errors.Is(err, storagebundle.ErrNotSharedAcrossWorkers):
+		writeAPIError(
+			w, http.StatusConflict, "revision_unavailable", "revision is not available")
+	// A Router and a RuntimeResolver that are shutting down are one answer,
+	// because to a caller they are one fact: this process is going away. 503 with
+	// no retry hint — the next request will reach a different process or none,
+	// and this one cannot say which.
+	//
+	// storagebundle.ErrIncompleteBundle is deliberately absent from both lists.
+	// A Factory that returned a Bundle with nothing in it is a defect in this
+	// platform's own code, and the 500 it falls through to is what says so.
+	case errors.Is(err, storagebundle.ErrRouterClosed),
+		errors.Is(err, platformagent.ErrResolverClosed):
+		writeAPIError(
+			w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime is unavailable")
 	case errors.Is(err, tenant.ErrInvalidArgument):
 		writeAPIError(w, http.StatusBadRequest, "invalid_argument", err.Error())
 	case errors.Is(err, tenant.ErrTenantScope), errors.Is(err, tenant.ErrNotFound):
@@ -468,8 +502,6 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		// an unpublished one, with no wording that says which of the three it was.
 		writeAPIError(
 			w, http.StatusConflict, "revision_unavailable", "revision is not available")
-	case errors.Is(err, platformagent.ErrResolverClosed):
-		writeAPIError(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime is unavailable")
 	default:
 		writeAPIError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 	}

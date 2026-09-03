@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -62,12 +63,23 @@ type Runtime struct {
 	Runner         runner.Runner
 	SessionService session.Service
 
-	openAI             runtimeHTTPAdapter
-	openAIHandler      http.Handler
-	protocolRunner     runner.Runner
-	closeOnce          sync.Once
-	closeErr           error
-	ownsSessionService bool
+	openAI         runtimeHTTPAdapter
+	openAIHandler  http.Handler
+	protocolRunner runner.Runner
+	closeOnce      sync.Once
+	closeErr       error
+
+	// store is this Runtime's claim on the storage it runs against, held from
+	// the moment it is built until Close releases it.
+	//
+	// It is a Lease rather than a boolean because what has to happen at Close
+	// is not a property of this Runtime at all: a shared process store is
+	// borrowed and must survive, a store built for one profile is reference
+	// counted by its Router, and a store this Runtime was handed outright must
+	// be closed exactly once. A flag could only ever encode the last of those,
+	// and every value that is not a flag — a close hook, a second owner — is a
+	// second closing path that does not know about the first.
+	store storagebundle.Lease
 }
 
 // NewDemoRuntime builds a real tRPC-Agent-Go LLMAgent and Runner without
@@ -109,35 +121,129 @@ func NewDemoRuntime() *Runtime {
 		Config:       config,
 		ConfigDigest: digest,
 	}
-	runtime, err := newRuntimeFromRevision(
-		revision, sessionService, true, nil, security.DenyCapabilities())
+	runtime, err := newOwnedRuntime(
+		revision, sessionService, nil, security.DenyCapabilities())
 	if err != nil {
-		_ = sessionService.Close()
+		// No close here: newOwnedRuntime took the session service on call and
+		// has already released it.
 		panic(fmt.Sprintf("agent: build static demo runtime: %v", err))
 	}
 	return runtime
 }
 
-// NewRuntimeFromRevision builds the currently supported runtime from an
-// immutable published revision. The caller retains ownership of sessionService.
+// NewRuntime builds the currently supported runtime from an immutable published
+// revision, on the storage that revision names.
 //
-// authorizer is mandatory and has no default. It is not variadic and there is
-// no allow-everything convenience value, because the choice of who may run a
-// revision that names a credential is exactly the choice that must not be made
-// by omission: every call site states it, and the compiler makes sure a new one
-// does too. A caller with no capability configuration passes
-// security.DenyCapabilities().
+// stores decides what revision.Config.BackendProfileID means. It is not
+// optional and there is no default: which storage a tenant's conversations land
+// in is not a decision that may be made by omission, and a Runtime that ignored
+// a profile reference would be serving a revision the platform never agreed to
+// serve.
+//
+// ctx bounds the storage resolution only. The Runtime that comes back is not
+// tied to it and outlives it; it is released by Close.
+//
+// authorizer is mandatory for the same reason and in the same way. It is not
+// variadic and there is no allow-everything convenience value: every call site
+// states it, and the compiler makes sure a new one does too. A caller with no
+// capability configuration passes security.DenyCapabilities().
+func NewRuntime(
+	ctx context.Context,
+	revision tenant.AgentRevision,
+	stores storagebundle.Resolver,
+	authorizer security.RevisionAuthorizer,
+) (*Runtime, error) {
+	return newRuntime(ctx, revision, stores, nil, authorizer)
+}
+
+// NewRuntimeFromRevision builds a Runtime on one session service the caller
+// already owns and keeps owning.
+//
+// It is the entry point for callers that hold a process store and have no way
+// to build another one. Because it cannot honour a backend profile reference,
+// it refuses one: a revision whose BackendProfileID is set comes back as
+// storagebundle.ErrProfileNotFound rather than being served by this store. That
+// is a behaviour change and the intended one — ignoring the reference is how a
+// tenant's conversations end up in storage its revision did not name.
 func NewRuntimeFromRevision(
 	revision tenant.AgentRevision,
 	sessionService session.Service,
 	authorizer security.RevisionAuthorizer,
 ) (*Runtime, error) {
-	return newRuntimeFromRevision(revision, sessionService, false, nil, authorizer)
+	return newRuntime(
+		context.Background(),
+		revision,
+		storagebundle.Fixed(storagebundle.Bundle{Session: sessionService}),
+		nil,
+		authorizer,
+	)
 }
 
-// newRuntimeFromRevision builds a Runtime. A nil auditSink selects the process
-// default, which is slog; it is a parameter so the tool trail can be read back
-// without redirecting the logger of the whole process.
+// newRuntime builds a Runtime against resolved storage. A nil auditSink selects
+// the process default, which is slog; it is a parameter so the tool trail can be
+// read back without redirecting the logger of the whole process.
+func newRuntime(
+	ctx context.Context,
+	revision tenant.AgentRevision,
+	stores storagebundle.Resolver,
+	auditSink tool.AuditSink,
+	authorizer security.RevisionAuthorizer,
+) (*Runtime, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("agent: context is required")
+	}
+	if stores == nil {
+		return nil, fmt.Errorf("agent: storage resolver is required")
+	}
+	plan, err := planRuntime(revision, auditSink, authorizer)
+	if err != nil {
+		return nil, err
+	}
+	// Storage is acquired here and nowhere earlier. Everything above this line
+	// is a refusal the platform owes without touching anything: a revision that
+	// is not published, not intact or not entitled must not have caused a
+	// connection, a table or a credential read on its way to being refused.
+	store, err := stores.Resolve(
+		ctx,
+		tenant.TenantContext{TenantID: revision.TenantID},
+		revision.Config.BackendProfileID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"agent: resolve session store for revision %q: %w", revision.ID, err)
+	}
+	return assembleRuntime(plan, store)
+}
+
+// newOwnedRuntime builds a Runtime that owns sessions outright.
+//
+// Ownership transfers on call and not on success: an error here has already
+// released sessions, so no caller is left holding a store it has to guess about
+// — and none of them can close it twice.
+func newOwnedRuntime(
+	revision tenant.AgentRevision,
+	sessions session.Service,
+	auditSink tool.AuditSink,
+	authorizer security.RevisionAuthorizer,
+) (*Runtime, error) {
+	store := storagebundle.Own(storagebundle.Bundle{Session: sessions})
+	plan, err := planRuntime(revision, auditSink, authorizer)
+	if err != nil {
+		return nil, errors.Join(err, store.Release())
+	}
+	return assembleRuntime(plan, store)
+}
+
+// runtimePlan is everything a Runtime needs that can be decided before it holds
+// any storage. Building it acquires nothing and closes nothing, so a plan that
+// fails leaves nothing behind.
+type runtimePlan struct {
+	revision tenant.AgentRevision
+	appName  string
+	agent    trpcagent.Agent
+}
+
+// planRuntime checks a revision and builds the agent it describes.
 //
 // The order of the checks below is the security property, not a style:
 //
@@ -147,50 +253,45 @@ func NewRuntimeFromRevision(
 //     still hash to the value recorded when it was created; anything else means
 //     the stored row was edited outside a Repository, and the edit is exactly
 //     how a secret_ref or a base_url would be moved after review.
-//   - The authorizer next, and before both the tool registry and any secret
-//     resolution. A revision its tenant is not entitled to must be refused
+//   - The authorizer next, and before the tool registry, any secret resolution
+//     and any storage. A revision its tenant is not entitled to must be refused
 //     without the platform revealing whether the policy exists or whether the
 //     environment variable does — and without reading the variable at all.
-func newRuntimeFromRevision(
+func planRuntime(
 	revision tenant.AgentRevision,
-	sessionService session.Service,
-	ownsSessionService bool,
 	auditSink tool.AuditSink,
 	authorizer security.RevisionAuthorizer,
-) (*Runtime, error) {
+) (runtimePlan, error) {
 	if revision.Status != tenant.RevisionStatusPublished {
-		return nil, fmt.Errorf("agent: revision %q is not published", revision.ID)
+		return runtimePlan{}, fmt.Errorf("agent: revision %q is not published", revision.ID)
 	}
 	if err := (tenant.TenantContext{TenantID: revision.TenantID}).Validate(); err != nil {
-		return nil, fmt.Errorf("agent: invalid runtime tenant: %w", err)
+		return runtimePlan{}, fmt.Errorf("agent: invalid runtime tenant: %w", err)
 	}
 	if err := tenant.ValidateResourceID("app id", revision.AgentAppID); err != nil {
-		return nil, fmt.Errorf("agent: invalid runtime app: %w", err)
+		return runtimePlan{}, fmt.Errorf("agent: invalid runtime app: %w", err)
 	}
 	if err := tenant.ValidateResourceID("revision id", revision.ID); err != nil {
-		return nil, fmt.Errorf("agent: invalid runtime revision: %w", err)
+		return runtimePlan{}, fmt.Errorf("agent: invalid runtime revision: %w", err)
 	}
 	digest, err := revision.Config.Digest()
 	if err != nil {
-		return nil, fmt.Errorf("agent: invalid revision config: %w", err)
+		return runtimePlan{}, fmt.Errorf("agent: invalid revision config: %w", err)
 	}
 	// An empty stored digest is a mismatch, not an exemption. A revision that
 	// carries no fingerprint cannot be checked against one, and "unverifiable"
 	// has to fail the same way "wrong" does.
 	if revision.ConfigDigest == "" || revision.ConfigDigest != digest {
-		return nil, fmt.Errorf(
+		return runtimePlan{}, fmt.Errorf(
 			"agent: revision %q: %w", revision.ID, tenant.ErrConfigIntegrity)
 	}
-	if sessionService == nil {
-		return nil, fmt.Errorf("agent: session service is required")
-	}
 	if authorizer == nil {
-		return nil, fmt.Errorf("agent: revision authorizer is required")
+		return runtimePlan{}, fmt.Errorf("agent: revision authorizer is required")
 	}
 	if err := authorizer.AuthorizeRevision(revision.TenantID, revision.Config); err != nil {
 		// Wrapped with the revision id and nothing else. The refusal must read
 		// the same whichever reference caused it.
-		return nil, fmt.Errorf("agent: revision %q: %w", revision.ID, err)
+		return runtimePlan{}, fmt.Errorf("agent: revision %q: %w", revision.ID, err)
 	}
 	// Tools and policies are resolved before anything is constructed. A
 	// revision the platform cannot authorize must not reach a model, a Runner
@@ -198,13 +299,14 @@ func newRuntimeFromRevision(
 	// unbuildable revision never causes a credential to be resolved.
 	tools, err := tool.Builtin().Resolve(revision.Config.ToolRefs, revision.Config.PolicyRefs)
 	if err != nil {
-		return nil, fmt.Errorf("agent: assemble tools for revision %q: %w", revision.ID, err)
+		return runtimePlan{}, fmt.Errorf(
+			"agent: assemble tools for revision %q: %w", revision.ID, err)
 	}
 	llmModel, err := newModel(revision.Config.Model)
 	if err != nil {
-		return nil, fmt.Errorf("agent: build model for revision %q: %w", revision.ID, err)
+		return runtimePlan{}, fmt.Errorf(
+			"agent: build model for revision %q: %w", revision.ID, err)
 	}
-	appName := fmt.Sprintf("t/%s/a/%s", revision.TenantID, revision.AgentAppID)
 	options := []llmagent.Option{
 		llmagent.WithModel(llmModel),
 		llmagent.WithDescription(revision.Config.Description),
@@ -223,22 +325,42 @@ func newRuntimeFromRevision(
 			llmagent.WithToolCallbacks(tool.NewAuditCallbacks(auditSink)),
 		)
 	}
-	ag := llmagent.New(revision.Config.AgentName, options...)
-	r := runner.NewRunner(
-		appName,
-		ag,
-		runner.WithSessionService(sessionService),
-	)
+	return runtimePlan{
+		revision: revision,
+		appName:  fmt.Sprintf("t/%s/a/%s", revision.TenantID, revision.AgentAppID),
+		agent:    llmagent.New(revision.Config.AgentName, options...),
+	}, nil
+}
+
+// assembleRuntime builds the Runner and the protocol adapter over a store this
+// Runtime now holds.
+//
+// Every failure from here on releases that store. This is the half of the build
+// that owns something, so it is also the half that has to hand it back — a
+// leaked lease is not a leaked object, it is a Router.Close that never returns.
+func assembleRuntime(plan runtimePlan, store storagebundle.Lease) (*Runtime, error) {
+	revision := plan.revision
+	if store == nil {
+		return nil, fmt.Errorf(
+			"agent: storage resolver returned no lease for revision %q", revision.ID)
+	}
+	sessions := store.Bundle().Session
+	if sessions == nil {
+		return nil, errors.Join(
+			fmt.Errorf("agent: session service is required"),
+			store.Release(),
+		)
+	}
 	runtime := &Runtime{
-		TenantID:           revision.TenantID,
-		AgentAppID:         revision.AgentAppID,
-		RevisionID:         revision.ID,
-		AppName:            appName,
-		ModelName:          revision.Config.Model.Name,
-		Agent:              ag,
-		Runner:             r,
-		SessionService:     sessionService,
-		ownsSessionService: ownsSessionService,
+		TenantID:       revision.TenantID,
+		AgentAppID:     revision.AgentAppID,
+		RevisionID:     revision.ID,
+		AppName:        plan.appName,
+		ModelName:      revision.Config.Model.Name,
+		Agent:          plan.agent,
+		Runner:         runner.NewRunner(plan.appName, plan.agent, runner.WithSessionService(sessions)),
+		SessionService: sessions,
+		store:          store,
 	}
 	// The adapter reads userID and sessionID from the request payload, so it
 	// receives the identity-enforcing wrapper instead of the real Runner.
@@ -293,6 +415,15 @@ func (r *Runtime) validate() error {
 		r.SessionService == nil || r.openAI == nil || r.openAIHandler == nil {
 		return fmt.Errorf("agent: runtime execution unit is incomplete")
 	}
+	// The storage claim, checked separately from the execution unit because it
+	// is not another part of one. A Runtime with every other field set runs
+	// perfectly well — right up until whoever does hold that store closes it,
+	// because nothing was counting this Runtime as a holder. Close is the only
+	// thing that releases a lease, so a Runtime that never had one is a Runtime
+	// whose storage lifetime nothing bounds.
+	if r.store == nil {
+		return fmt.Errorf("agent: runtime holds no storage lease")
+	}
 	return nil
 }
 
@@ -315,9 +446,13 @@ func (r *Runtime) validateFor(revision tenant.AgentRevision) error {
 	return nil
 }
 
-// Close releases the protocol adapter, the Runner, and any Session service
-// owned by this Runtime, in that order. It is safe for concurrent use and
-// idempotent: every call returns the error produced by the first close.
+// Close releases the protocol adapter, the Runner, and this Runtime's claim on
+// its storage, in that order. It is safe for concurrent use and idempotent:
+// every call returns the error produced by the first close.
+//
+// The store goes last because the two above it may still be writing to it: a
+// Runner that is stopping flushes the turn it was serving, and a session
+// service released before that flush would drop it.
 func (r *Runtime) Close() error {
 	if r == nil {
 		return nil
@@ -330,8 +465,8 @@ func (r *Runtime) Close() error {
 		if r.Runner != nil {
 			closeErr = errors.Join(closeErr, r.Runner.Close())
 		}
-		if r.ownsSessionService && r.SessionService != nil {
-			closeErr = errors.Join(closeErr, r.SessionService.Close())
+		if r.store != nil {
+			closeErr = errors.Join(closeErr, r.store.Release())
 		}
 		r.closeErr = closeErr
 	})

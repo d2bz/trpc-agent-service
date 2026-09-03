@@ -236,3 +236,10 @@ Agent 基础运行时、内置编排、通用 Session/Memory 接口、模型适�
 - **Runtime 的构建顺序本身是一条安全属性。** 发布态 → 身份/形状 → 重算并逐字节比对 `config_digest` → entitlement → Tool Registry → 模型/Secret。entitlement 先于 Secret 解析，意味着未授权的引用被拒时那个环境变量根本没有被读取。
 - **`start.sh` 首次启动生成 `data/admin-api-key`（0600），重启复用，只打印路径、从不打印 key**；显式设置 `TRPC_SERVICE_ADMIN_API_KEY` 或 `TRPC_SERVICE_SECURITY_CONFIG_FILE` 时不生成。
 - **明确未实现：** JWT/OIDC、动态 RBAC、清单热加载、凭据轮转/过期/撤销、持久化管理操作审计、生产 Secret Manager、预算/审批/Guardrail。`base_url` 仍不是受 entitlement 约束的能力，`config_digest` 仍是不带密钥的 SHA-256。完整边界见[身份、权限与密钥治理](security-and-governance.md)。
+
+## 19. 2026-09-03 StorageBundle 与 Runtime 生命周期
+
+- 新增 `trpcservice/storagebundle`：Profile 以 `(tenant_id, profile_id)` 标识，ID 即不可变版本；配置只保存 PostgreSQL DSN/Redis URL 的 `env:` 引用，不保存连接明文。内存 Source 拒绝覆盖并在输入、输出两侧深拷贝。
+- Router 每次解析 Profile 并核对 fingerprint，按租户键 singleflight 懒构建 Bundle。默认 Bundle 由进程存储栈拥有、Router 只借用；默认和动态 Bundle 的租约都参与关闭等待，动态 Bundle 由 Router 逆序关闭。
+- Runtime 不再用 `ownsSessionService` 布尔推测所有权，而是持有类型化 Bundle lease。安全检查和模型构造通过后才解析存储；关闭顺序为 Adapter → Runner → Bundle lease，进程顺序为 Runtime Resolver → Router → storage stack。
+- 生产当前仍使用 `NoProfiles()`，只服务空 `BackendProfileID` 对应的进程默认 Bundle。合法的命名 Profile 可以进入不可变 Revision，但运行时会以不泄漏原因的 `409 revision_unavailable` 明确拒绝，不再被静默忽略；非法 Profile ID 在创建 Revision 时直接拒绝。BackendProfile CRUD、发布期存在性检查、fingerprint 固化到 Revision、Secret 解析、动态 PostgreSQL/Redis 和 TTL/LRU 仍待实现。

@@ -11,6 +11,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -278,12 +279,18 @@ func serveChatCompletionWithContext(
 
 // recordingRuntime builds a Runtime that passes validation and reports the order
 // in which its owned resources are closed.
+//
+// Its store is an owning lease, so "session" appears in the recorded order at
+// the point a Runtime that owns its store would close it. A Runtime over a
+// borrowed or Router-issued lease records nothing there, which is the property
+// TestRuntimeCloseKeepsSharedSessionService covers from the other side.
 func recordingRuntime(
 	recorder *closeRecorder,
 	adapterErr error,
 	runnerErr error,
 	sessionErr error,
 ) *Runtime {
+	sessions := &closeRecordingSessionService{recorder: recorder, closeErr: sessionErr}
 	return &Runtime{
 		TenantID:   "tenant-a",
 		AgentAppID: "assistant",
@@ -295,16 +302,13 @@ func recordingRuntime(
 			recorder: recorder,
 			closeErr: runnerErr,
 		},
-		SessionService: &closeRecordingSessionService{
-			recorder: recorder,
-			closeErr: sessionErr,
-		},
+		SessionService: sessions,
 		openAI: &closeRecordingAdapter{
 			recorder: recorder,
 			closeErr: adapterErr,
 		},
-		openAIHandler:      http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
-		ownsSessionService: true,
+		openAIHandler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		store:         storagebundle.Own(storagebundle.Bundle{Session: sessions}),
 	}
 }
 

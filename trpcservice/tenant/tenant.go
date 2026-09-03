@@ -226,6 +226,25 @@ func (c RevisionConfig) Validate() error {
 	if c.Model.Temperature != nil && (*c.Model.Temperature < 0 || *c.Model.Temperature > 2) {
 		return fmt.Errorf("%w: temperature must be between 0 and 2", ErrInvalidArgument)
 	}
+	// The empty id means "this process's default store" and is the overwhelming
+	// majority of revisions, so it stays legal. Anything else is a resource id
+	// and is held to the same rules as every other one: it becomes a lookup key,
+	// a cache key and a singleflight key in storagebundle, and the only place it
+	// can be refused once and for all is before it is stored.
+	//
+	// Not TrimSpace'd first. A config carrying "  " is carrying a non-empty id
+	// that no store will ever answer for, and treating it as absent here would
+	// silently serve the default to a revision that asked for something else.
+	//
+	// A revision already stored with an illegal id now fails this check on the
+	// way back out, which is the intended direction: it was never servable —
+	// storagebundle refuses it at resolve time — so the failure moves earlier
+	// rather than appearing where it did not exist before.
+	if c.BackendProfileID != "" {
+		if err := ValidateResourceID("backend profile id", c.BackendProfileID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

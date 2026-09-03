@@ -15,7 +15,7 @@ Redis 后端仍然只有工厂能构造，没有任何进程配置能启用它�
 | 集成测试 | `trpcservice/sessionbackend/integration_test.go` | 默认跳过，需显式开关 |
 | 本地依赖 | `deploy/docker-compose.session.yml` | PostgreSQL + Redis，仅监听 `127.0.0.1` |
 
-工厂刻意做得很小：只有后端名、该后端的一个连接串，以及集成测试为了共享服务器所必需的命名空间开关。其余上游选项一律保持默认。这次没有做、也不应该在这一层做的：后端能力表（`BackendCapabilities`）、存储捆绑（`StorageBundle`）、后端注册表、控制面 Repository。它们属于后续切片，现在加进来只会变成一份会漂移的上游选项副本。
+工厂刻意做得很小：只有后端名、该后端的一个连接串，以及集成测试为了共享服务器所必需的命名空间开关。其余上游选项一律保持默认。租户 Profile、存储捆绑与生命周期现已实现在它上层的 `trpcservice/storagebundle`，并未塞回这个低层工厂；后端能力表、后端注册表和 BackendProfile 控制面 Repository 仍属于后续切片。这样 `sessionbackend` 继续只回答“怎样构造一个上游 Session Service”，不会变成一份会漂移的上游选项副本。
 
 ## 2. 依赖版本与 Go 版本要求
 
@@ -279,7 +279,7 @@ Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis）�
 8. 构造 Repository 与 Directory（共用同一个池，两者都只借用、都不关闭）；再构造上游 Session 服务（它自己持有并拥有另一个池）。
 9. 最后才 `SeedDemo`——它要写控制面，必须在迁移之后。
 
-关闭顺序是它的严格逆序：HTTP 优雅关闭（在 `waitForStop` 里）→ Resolver（等待在途 runtime 交还租约）→ Session 服务 → 共享连接池。启动中途失败时只关闭已经建成的那些资源，同样逆序；**关闭错误用 `errors.Join` 合并进进程退出错误，不再是打条日志就丢掉**——一个"关闭时没刷完"的 Session 服务，一周后表现为"每段会话最后一轮不见了"。
+关闭顺序是它的严格逆序：HTTP 优雅关闭（在 `waitForStop` 里）→ Runtime Resolver（等待在途 runtime 交还租约并关闭缓存）→ Storage Router（等待全部 Bundle lease）→ Session 服务 → 共享连接池。启动中途失败时只关闭已经建成的那些资源，同样逆序；**关闭错误用 `errors.Join` 合并进进程退出错误，不再是打条日志就丢掉**——一个"关闭时没刷完"的 Session 服务，一周后表现为"每段会话最后一轮不见了"。
 
 ### 8.4 快速开始
 
@@ -300,7 +300,7 @@ TRPC_SERVICE_POSTGRES_SCHEMA=trpc_service \
 
 ### 8.5 这一层的测试
 
-- `cmd/trpc-service/storage_test.go`：不触网。覆盖默认 profile、`inmemory` 忽略遗留 DSN、缺失/空白 DSN、非法 profile、非法与超长 schema、连接串解析错误不泄漏密码（含 percent-encoded 拼写）、以及启动中途失败时按逆序关闭且关闭错误不被吞掉——失败注入用的是一个只有五个函数的 seam，不是 mock 框架。
+- `cmd/trpc-service/storage_test.go`：不触网。覆盖默认 profile、`inmemory` 忽略遗留 DSN、缺失/空白 DSN、非法 profile、非法与超长 schema、连接串解析错误不泄漏密码（含 percent-encoded 拼写）、以及启动中途失败时按逆序关闭且关闭错误不被吞掉——失败注入使用 `storageDeps` 的八个具体构造函数，不引入 mock 框架。
 - `cmd/trpc-service/integration_test.go`：默认跳过，门控与 §7 相同（`TRPC_SERVICE_SESSION_INTEGRATION=1` 加 `TRPC_SERVICE_POSTGRES_DSN`）。每个用例建一个一次性 schema 并在结束时 `DROP ... CASCADE`（上游只建表不删表，这是唯一会回收那 6 张表的地方）。断言走真实的 profile 构造路径：两族迁移和上游 6 张表都在、Pin 与真实会话历史跨"重启"存活、重启后的 `SeedDemo` 不会把已发布的 `echo-v2` 改回 `echo-v1`。
 
 ```bash

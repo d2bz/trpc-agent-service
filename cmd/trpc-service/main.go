@@ -15,11 +15,9 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
-	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
@@ -70,10 +68,13 @@ func main() {
 //     than a half-built process.
 //   - Cleanup is registered by deferring, which makes the shutdown order the
 //     reverse of the startup order for free: HTTP drain inside waitForStop,
-//     then the resolver's leases, then the session store, then the shared pool.
-//     The resolver waits for in-flight runtimes, and a runtime still writing to
-//     a session store that had already been closed would lose the last turn of
-//     the conversation it was serving.
+//     then the RuntimeResolver, then the storage Router, then the session store
+//     and the shared pool. Each step waits for the one above it to let go. The
+//     resolver waits for in-flight runtimes; the Router waits for the storage
+//     leases those runtimes hold, including the borrowed lease on the process
+//     default; and only then is the session store closed. A runtime still
+//     writing to a session store that had already been closed would lose the
+//     last turn of the conversation it was serving.
 func run(addr string) error {
 	return runWith(addr, os.Getenv, defaultStorageDeps())
 }
@@ -124,31 +125,20 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 		return err
 	}
 
-	resolver, err := platformagent.NewRuntimeResolver(
-		stack.repository,
-		func(
-			_ context.Context,
-			revision tenant.AgentRevision,
-		) (*platformagent.Runtime, error) {
-			// The same authorizer value the Admin API checks against. One
-			// instance, not two equivalent ones: a revision that Admin accepted
-			// and a Runtime later refused — or the reverse — would be a
-			// disagreement about what this tenant may do, and there is no
-			// correct way to resolve one at request time.
-			return platformagent.NewRuntimeFromRevision(
-				revision, stack.sessions, securityCfg.Revisions)
-		},
-	)
+	runtimes, err := openRuntimeStack(storageCfg, stack, securityCfg.Revisions)
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, resolver.Close()) }()
+	// Registered after the stack's own defer, so it runs before it: the
+	// Runtimes and their storage Bundles are released while the store they hold
+	// is still open. The order inside is runtimeStack.close's, not this line's.
+	defer func() { err = errors.Join(err, runtimes.close()) }()
 
 	// One run service for the whole process. HTTP is its first caller and the IM
 	// channels will be the next; the lease, the pin and the Runtime lease are
 	// sequenced here once, so a second entry point cannot sequence them
 	// differently.
-	runs, err := sessionrun.NewService(resolver, stack.directory, stack.coordinator)
+	runs, err := sessionrun.NewService(runtimes.resolver, stack.directory, stack.coordinator)
 	if err != nil {
 		return err
 	}

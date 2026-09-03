@@ -425,11 +425,11 @@ func seedResolverTenant(
 // strictest possible authorizer is also the honest one, and any of them that
 // later grows a capability ref fails here rather than quietly acquiring it.
 func buildTestRuntime(revision tenant.AgentRevision) *Runtime {
-	sessionService := sessioninmemory.NewSessionService()
-	runtime, err := newRuntimeFromRevision(
-		revision, sessionService, true, nil, security.DenyCapabilities())
+	// newOwnedRuntime takes the session service on the way in, so a failure has
+	// already closed it and closing it again here would be a double close.
+	runtime, err := newOwnedRuntime(
+		revision, sessioninmemory.NewSessionService(), nil, security.DenyCapabilities())
 	if err != nil {
-		_ = sessionService.Close()
 		panic(err)
 	}
 	return runtime

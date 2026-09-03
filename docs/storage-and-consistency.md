@@ -2,7 +2,35 @@
 
 ## 1. 统一后端路由
 
-平台不重新定义 tRPC-Agent-Go 的 Session、Memory、Knowledge 和 Artifact 接口，而是在其上增加租户级 Backend Profile、能力检查和生命周期管理。
+平台不重新定义 tRPC-Agent-Go 的 Session 接口，而是在其上增加租户级 Backend Profile、路由和生命周期管理。当前实现见 `trpcservice/storagebundle`，它已经把“Revision 选择什么存储”和“Runtime 如何持有存储”从进程启动配置中分离出来。
+
+### 1.1 当前实现
+
+```go
+type Profile struct {
+    TenantID string
+    ID       string // ID 就是不可变版本
+    Session  SessionSpec
+}
+
+type Bundle struct {
+    Session session.Service
+}
+```
+
+`Profile` 只保存 `env:VAR_NAME` 形式的连接引用与命名空间参数，不保存 DSN、URL 或密钥明文。`Router` 以 `(tenant_id, profile_id)` 为键，通过 singleflight 懒构建并缓存 `Bundle`；每次命中都重新解析 Profile 并比对 SHA-256 fingerprint，同一 ID 下内容变化时返回 `ErrProfileChanged`，不静默重建。内存 Profile Source 在写入和读出两侧都做深拷贝，并拒绝覆盖已有 ID。
+
+空 `BackendProfileID` 只在 Router 内解释为进程默认 Bundle。默认 Bundle 仍由 `storageStack` 所有，Router 不关闭它，但默认与动态 Bundle 的租约都会计入活跃引用。Runtime 从构建成功起一直持有租约，关闭顺序固定为 `OpenAI Adapter -> Runner -> Bundle lease`；进程关闭顺序固定为 `RuntimeResolver -> Storage Router -> storageStack`。Router 关闭后拒绝新解析，等待构建和全部租约结束，再逆序关闭自己构建的动态 Bundle。
+
+Runtime 在接触 Profile Source 或 Factory 之前依次完成发布态、身份、`config_digest`、租户 entitlement、Tool/Policy 和模型配置检查。因此未授权、摘要被篡改或模型无效的 Revision 不会触发存储解析或连接。Factory 还继承进程级约束：非持久 Pin 不能搭配持久 Session，多 Worker 不能搭配 InMemory Session。
+
+### 1.2 当前边界与扩展方向
+
+当前 `Bundle` 只有已经被 Runtime 消费的 `Session` 字段，不为 Memory、Knowledge、Artifact 预留无语义的 nil 字段；以后有真实消费者时按字段名扩展。生产装配目前使用 `NoProfiles()`，所以只服务空 Profile ID 对应的进程默认 Bundle；内存 Profile Source 与动态 InMemory Factory 已通过并发和生命周期测试，但尚未接入 Admin CRUD。Profile 结构已经能描述 PostgreSQL/Redis 的 SecretRef；Factory 会先拒绝“持久 Session + 非持久 Pin”的错误组合，在 Pin 已持久时对尚未实现的 PostgreSQL/Redis 返回 `ErrUnsupportedBackend`，不会解析连接引用或偷偷回退默认存储。
+
+Revision 当前只记录 `BackendProfileID`，尚未持久化 Profile fingerprint；“同 ID 永远同内容”由 Profile Source 契约和进程内 Router 检查保证。BackendProfile 不可变持久化、发布时把 fingerprint 固定进 Revision、动态 PostgreSQL/Redis Factory、TTL/LRU 淘汰和配置失效通知属于后续切片。
+
+完整目标仍包括能力矩阵：
 
 ```go
 type BackendCapabilities struct {
@@ -14,16 +42,9 @@ type BackendCapabilities struct {
     Pagination        bool
     VectorFilter      bool
 }
-
-type StorageBundle struct {
-    Session   session.Service
-    Memory    memory.Service
-    Knowledge knowledge.Knowledge
-    Artifact  artifact.Service
-}
 ```
 
-Runtime Manager 根据 `(tenant_id, backend_profile_version)` 构造 `StorageBundle`，复用连接池并按引用计数关闭。配置发布前检查 Agent 所需能力与后端能力是否匹配。例如生产多节点 Agent 不能选择 InMemory Session；要求严格同会话并发的租户不能使用缺少必要协调能力的组合。
+能力矩阵用于在配置发布前检查 Agent 所需能力与后端能力是否匹配。例如生产多节点 Agent 不能选择 InMemory Session；要求严格同会话并发的租户不能使用缺少必要协调能力的组合。该矩阵尚未实现，不能把 Factory 当前的两条进程约束等同于完整能力协商。
 
 ## 2. 数据放置
 

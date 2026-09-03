@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/stretchr/testify/require"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
@@ -137,8 +138,13 @@ func toolCallRuntime(
 		[]string{servicetool.RefAdd, servicetool.RefEcho},
 		[]string{servicetool.PolicySafeTools},
 	)
-	runtime, err := newRuntimeFromRevision(
-		revision, sessionService, false, sink, entitling(t, revision))
+	runtime, err := newRuntime(
+		context.Background(),
+		revision,
+		storagebundle.Fixed(storagebundle.Bundle{Session: sessionService}),
+		sink,
+		entitling(t, revision),
+	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
 	return runtime

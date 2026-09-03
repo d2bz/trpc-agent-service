@@ -18,6 +18,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -933,6 +934,18 @@ type platformTestOptions struct {
 	// prove that a refusal happened *before* the repository, by handing the
 	// platform one that fails the test if it is called at all.
 	repository tenant.Repository
+
+	// stores is the storage resolver runtimes are built against. It is nil for
+	// the tests whose revisions name no backend profile, which then get the
+	// compatibility path over the one process session service — the same wiring
+	// as before this field existed.
+	//
+	// A test that sets it is asking to be wired the way the binary is: through a
+	// Router, where a profile reference is resolved rather than refused outright.
+	// It owns the Router and must register its Close before calling in here, so
+	// that the resolver's Cleanup — registered later, and therefore run first —
+	// has already let go of every lease by the time the Router waits for them.
+	stores storagebundle.Resolver
 }
 
 // chatDirectory is what the platform is handed: a directory, plus whatever a
@@ -980,7 +993,7 @@ func newPlatformTestServerWith(
 	resolver, err := platformagent.NewRuntimeResolver(
 		repository,
 		func(
-			_ context.Context,
+			ctx context.Context,
 			revision tenant.AgentRevision,
 		) (*platformagent.Runtime, error) {
 			// Explicitly capability-denying: every revision these tests publish
@@ -990,6 +1003,9 @@ func newPlatformTestServerWith(
 			authorizer := opts.revisions
 			if authorizer == nil {
 				authorizer = security.DenyCapabilities()
+			}
+			if opts.stores != nil {
+				return platformagent.NewRuntime(ctx, revision, opts.stores, authorizer)
 			}
 			return platformagent.NewRuntimeFromRevision(revision, sessionService, authorizer)
 		},
