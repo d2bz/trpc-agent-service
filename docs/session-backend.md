@@ -2,9 +2,9 @@
 
 本文记录 `trpcservice/sessionbackend` 这一次 Spike 的验证结论。目的只有一个：在写共享 Session 之前，先把上游 PostgreSQL 与 Redis Session 实现的真实行为测出来，把它们与内存实现的语义差异写成事实，而不是等到平台层依赖了某个假设才发现。
 
-**当前状态是 `partial`。** Spike 本身只交付了一个构造函数和它的测试。之后 `cmd/trpc-service` 接了一个进程级存储 profile：默认（不设 `TRPC_SERVICE_STORAGE_PROFILE`，或设为 `inmemory`）仍然启动 InMemory Session，进程不建立任何连接；设为 `postgres` 时，控制面、Session Directory 和上游 Session 存储会一起切到同一个 PostgreSQL 的同一个 schema。见 [§8 进程存储 Profile](#8-进程存储-profile)。
+**当前状态是 `partial`。** Spike 本身先交付了低层构造函数和测试；之后 `cmd/trpc-service` 接入进程级存储 profile，以及上层 `storagebundle` 的租户 BackendProfile。默认（不设 `TRPC_SERVICE_STORAGE_PROFILE`，或设为 `inmemory`）仍启动 InMemory 控制面、Pin 与默认 Session；设为 `postgres` 时三者一起切到同一个 PostgreSQL schema。只有后者具备持久 Pin，因而可安全运行租户动态 PostgreSQL/Redis Session Profile。见 [§8 进程存储 Profile](#8-进程存储-profile)和[多后端、数据同步与幂等设计](storage-and-consistency.md#1-统一后端路由)。
 
-Redis 后端仍然只有工厂能构造，没有任何进程配置能启用它——本文第 4 节以后关于 Redis 的"支持"指的是"工厂能构造出来并通过集成测试"，不指"平台已经在用"。
+Redis 不作为整套控制面的进程 profile，但已可通过租户 BackendProfile 启用为 Session 后端；ProfileRepository 与 Pin 仍由进程的 PostgreSQL profile 提供。Redis 的真实往返、动态路由和多 Worker 组合都由门控集成测试覆盖。
 
 ## 1. 交付范围
 
@@ -15,7 +15,7 @@ Redis 后端仍然只有工厂能构造，没有任何进程配置能启用它�
 | 集成测试 | `trpcservice/sessionbackend/integration_test.go` | 默认跳过，需显式开关 |
 | 本地依赖 | `deploy/docker-compose.session.yml` | PostgreSQL + Redis，仅监听 `127.0.0.1` |
 
-工厂刻意做得很小：只有后端名、该后端的一个连接串，以及集成测试为了共享服务器所必需的命名空间开关。其余上游选项一律保持默认。租户 Profile、存储捆绑与生命周期现已实现在它上层的 `trpcservice/storagebundle`，并未塞回这个低层工厂；后端能力表、后端注册表和 BackendProfile 控制面 Repository 仍属于后续切片。这样 `sessionbackend` 继续只回答“怎样构造一个上游 Session Service”，不会变成一份会漂移的上游选项副本。
+工厂刻意做得很小：只有后端名、该后端的一个连接串，以及共享服务器所需的命名空间开关。其余上游选项保持默认。租户 Profile、ProfileRepository、存储捆绑、SecretRef 授权解析和生命周期实现在上层 `trpcservice/storagebundle` 与 `tenant/postgres`，没有塞回这个低层工厂；完整后端能力矩阵与注册扩展仍是后续工作。这样 `sessionbackend` 继续只回答“怎样构造一个上游 Session Service”，不会变成一份会漂移的上游选项副本。
 
 ## 2. 依赖版本与 Go 版本要求
 
@@ -180,7 +180,7 @@ Spike 之后交付了一把 Run 租约（`trpcservice/sessionlease`，见 [Sessi
 
 真正的单写者语义需要在存储层做条件写（例如 Redis Lua 脚本做 token 比较后再写，或 PostgreSQL 用带版本号的条件 UPDATE），这超出上游 Session 接口的能力，必须由平台层自建。本次 Spike 不做，租约切片同样没有做——`Lease.Fence()` 只是观测句柄，不参与写入准入。
 
-同样不在本次 Spike 范围内的：PostgreSQL 控制面 Repository、跨进程 Session Directory、Redis 租约、双 Worker、Inbox/Outbox、真实 IM 接入。其中前四项已由后续切片交付（见 [验收矩阵](acceptance.md) 的 I10、I11）；Inbox/Outbox 与真实 IM 接入**仍然没有**实现。
+同样不在本次 Spike 范围内的能力已由后续切片逐步补齐：PostgreSQL 控制面 Repository、跨进程 Session Directory、Redis 租约、双 Worker 和租户 BackendProfile 已交付（见 [验收矩阵](acceptance.md) 的 I10、I11、I15）；Inbox/Outbox 与真实 IM 接入**仍然没有**实现。
 
 ### 6.1 持久 Session 与进程内 Pin 的重启不变量破裂
 
@@ -199,7 +199,7 @@ Spike 之后交付了一把 Run 租约（`trpcservice/sessionlease`，见 [Sessi
 
 **这一格已经由 §8 的进程存储 profile 关掉——只关掉了这一格。** profile 不提供"只持久化 Session"这个选项：三者绑在同一个 DSN 和同一个 schema 上，要么一起在内存里，要么一起在 PostgreSQL 里，上表右列因此无法被配置出来。
 
-多个进程指向同一个 schema 时，控制面与 Pin 是一致的。对同一个会话的并发写入，现在由 Run 租约在**入口**串行化（`TRPC_SERVICE_SESSION_COORDINATION=redis`，见 [Session Run Lease](session-lease.md)）：第二个 Worker 拿不到租约，收到 `409 session_busy`，持有者失效后按 TTL 接管。这是合作型互斥，**不是**存储层的写入准入——已经在写的旧 Worker 不会被原子拒绝。仍然没有解决的：fencing/CAS 写入准入、等待队列、租户级路由、Redis 存储 profile。该限制的当前表述见[验收矩阵](acceptance.md#已知限制)。
+多个进程指向同一个 schema 时，控制面与 Pin 是一致的。对同一个会话的并发写入，现在由 Run 租约在**入口**串行化（`TRPC_SERVICE_SESSION_COORDINATION=redis`，见 [Session Run Lease](session-lease.md)）：第二个 Worker 拿不到租约，收到 `409 session_busy`，持有者失效后按 TTL 接管。租户级 Router 与 PostgreSQL/Redis 动态 Session Profile 也已接入生产装配。仍然没有解决的是 fencing/CAS 写入准入和等待队列：Run 租约是合作型互斥，**不是**存储层的写入准入，已经在写的旧 Worker不会被原子拒绝。该限制的当前表述见[验收矩阵](acceptance.md#已知限制)。
 
 ## 7. 集成测试的运行方式
 

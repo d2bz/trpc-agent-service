@@ -250,7 +250,7 @@ func blocksFor(fn func(), d time.Duration) (blocked bool, done <-chan struct{}) 
 
 func TestNewRouterRequiresItsCollaborators(t *testing.T) {
 	sessions := &countingSessionService{}
-	factory := NewSessionFactory(ProcessConstraints{})
+	factory := testFactory(t, ProcessConstraints{})
 
 	router, err := NewRouter(Options{Default: Bundle{Session: sessions}, Factory: factory})
 	require.ErrorContains(t, err, "profile source is required")
@@ -827,7 +827,7 @@ func TestRouterSurfacesFactoryConstraintRefusals(t *testing.T) {
 		// A process that coordinates with other Workers and has no durable
 		// pins: both a shared in-memory store and a durable one are refused,
 		// for opposite reasons.
-		Factory: NewSessionFactory(ProcessConstraints{MultiWorker: true}),
+		Factory: testFactory(t, ProcessConstraints{MultiWorker: true}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, router.Close()) })

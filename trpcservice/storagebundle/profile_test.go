@@ -10,7 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// inMemoryProfile is the profile this slice can actually build.
+// inMemoryProfile is the profile that needs nothing outside the process: no
+// credential to resolve, no target to reach.
 func inMemoryProfile(tenantID string, id string) Profile {
 	return Profile{
 		TenantID: tenantID,
@@ -199,6 +200,27 @@ func TestProfileValidateRejectsIdentityBackendAndShape(t *testing.T) {
 				},
 			},
 			"schema",
+		},
+		{
+			// Each namespace is well within its own limit and the pair is not.
+			// It has to be refused here, at create time: a Profile is immutable
+			// and cannot be deleted, so one accepted with namespaces upstream
+			// cannot fit into an index name spends its id forever on content
+			// that can never produce a Bundle.
+			"postgres schema and table prefix too long together",
+			Profile{
+				TenantID: "tenant-a",
+				ID:       "p1",
+				Session: SessionSpec{
+					Backend: sessionbackend.BackendPostgres,
+					Postgres: &PostgresSpec{
+						DSNRef:      "env:DSN",
+						Schema:      "tenant_a_sessions_production",
+						TablePrefix: "conversations",
+					},
+				},
+			},
+			"too long together",
 		},
 		{
 			"redis without its settings",

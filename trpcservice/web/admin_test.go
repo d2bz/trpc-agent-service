@@ -823,10 +823,9 @@ func TestAdminRefusesUnentitledRevisionsIdentically(t *testing.T) {
 				"/admin/v1/tenants/tenant-a/apps/assistant/revisions", body,
 				adminHeaders(adminKeyTenantA), http.StatusForbidden,
 			)
-			require.JSONEq(t, `{"error":{
-				"code":"not_entitled",
-				"message":"this tenant is not entitled to a capability the revision references"
-			}}`, response.Body.String())
+			// The same literal the profile gate is checked against, so the two
+			// halves of the control plane cannot answer this differently.
+			require.JSONEq(t, notEntitledBody, response.Body.String())
 			// Nothing about the rejected reference reaches the caller.
 			require.NotContains(t, response.Body.String(), "TEST_")
 			require.NotContains(t, response.Body.String(), "policy")
@@ -971,7 +970,7 @@ func requireNoCORS(t *testing.T, header http.Header) {
 
 // mustEntitle builds an entitlement table through the same constructor the
 // process uses, so a fixture cannot express a grant the manifest could not.
-func mustEntitle(t *testing.T, grants ...security.Grant) security.RevisionAuthorizer {
+func mustEntitle(t *testing.T, grants ...security.Grant) security.CapabilityAuthorizer {
 	t.Helper()
 	entitlements, err := security.NewEntitlements(grants...)
 	require.NoError(t, err)

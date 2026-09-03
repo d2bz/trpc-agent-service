@@ -170,7 +170,7 @@ func TestFixedRefusesAnUnusableScope(t *testing.T) {
 	router, err := NewRouter(Options{
 		Default: Bundle{Session: sessions},
 		Source:  NoProfiles(),
-		Factory: NewSessionFactory(ProcessConstraints{}),
+		Factory: testFactory(t, ProcessConstraints{}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, router.Close()) })
@@ -268,7 +268,7 @@ func TestResolverInterfaceIsSatisfiedByBothImplementations(t *testing.T) {
 	router, err := NewRouter(Options{
 		Default: Bundle{Session: &countingSessionService{}},
 		Source:  NoProfiles(),
-		Factory: NewSessionFactory(ProcessConstraints{}),
+		Factory: testFactory(t, ProcessConstraints{}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, router.Close()) })

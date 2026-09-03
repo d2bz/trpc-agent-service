@@ -18,17 +18,27 @@ type Bundle struct {
 }
 ```
 
-`Profile` 只保存 `env:VAR_NAME` 形式的连接引用与命名空间参数，不保存 DSN、URL 或密钥明文。`Router` 以 `(tenant_id, profile_id)` 为键，通过 singleflight 懒构建并缓存 `Bundle`；每次命中都重新解析 Profile 并比对 SHA-256 fingerprint，同一 ID 下内容变化时返回 `ErrProfileChanged`，不静默重建。内存 Profile Source 在写入和读出两侧都做深拷贝，并拒绝覆盖已有 ID。
+`Profile` 只保存 `env:VAR_NAME` 形式的连接引用与命名空间参数，不保存 DSN、URL 或密钥明文。`ProfileRepository` 在 InMemory 与 PostgreSQL 两种控制面下提供相同的 Create/Get/List 契约：Profile ID 就是版本，不允许覆盖或删除；每租户最多 32 个；写入保存 SHA-256 fingerprint，读取时重新计算并核验，内容或租户身份被库外修改时 fail closed。生产进程让 Admin API 与 Router 共用同一个 Repository，因此控制面刚创建的 Profile 立即能被数据面解析。
+
+`Router` 以 `(tenant_id, profile_id)` 为键，通过 singleflight 懒构建并缓存 `Bundle`；每次命中都重新解析 Profile 并比对 fingerprint，同一 ID 下内容变化时返回 `ErrProfileChanged`，不静默重建。空 `BackendProfileID` 才表示使用进程默认 Bundle；非空 ID 必须在当前租户中真实存在，并在创建 Revision 和发布时提前检查。
 
 空 `BackendProfileID` 只在 Router 内解释为进程默认 Bundle。默认 Bundle 仍由 `storageStack` 所有，Router 不关闭它，但默认与动态 Bundle 的租约都会计入活跃引用。Runtime 从构建成功起一直持有租约，关闭顺序固定为 `OpenAI Adapter -> Runner -> Bundle lease`；进程关闭顺序固定为 `RuntimeResolver -> Storage Router -> storageStack`。Router 关闭后拒绝新解析，等待构建和全部租约结束，再逆序关闭自己构建的动态 Bundle。
 
 Runtime 在接触 Profile Source 或 Factory 之前依次完成发布态、身份、`config_digest`、租户 entitlement、Tool/Policy 和模型配置检查。因此未授权、摘要被篡改或模型无效的 Revision 不会触发存储解析或连接。Factory 还继承进程级约束：非持久 Pin 不能搭配持久 Session，多 Worker 不能搭配 InMemory Session。
 
-### 1.2 当前边界与扩展方向
+### 1.2 动态 Factory 与安全边界
 
-当前 `Bundle` 只有已经被 Runtime 消费的 `Session` 字段，不为 Memory、Knowledge、Artifact 预留无语义的 nil 字段；以后有真实消费者时按字段名扩展。生产装配目前使用 `NoProfiles()`，所以只服务空 Profile ID 对应的进程默认 Bundle；内存 Profile Source 与动态 InMemory Factory 已通过并发和生命周期测试，但尚未接入 Admin CRUD。Profile 结构已经能描述 PostgreSQL/Redis 的 SecretRef；Factory 会先拒绝“持久 Session + 非持久 Pin”的错误组合，在 Pin 已持久时对尚未实现的 PostgreSQL/Redis 返回 `ErrUnsupportedBackend`，不会解析连接引用或偷偷回退默认存储。
+Factory 支持 InMemory、PostgreSQL 和 Redis 三种 Session 后端，顺序固定为：Profile 形状与进程约束 → 逐个 SecretRef 的租户 entitlement → 环境解析 → 有界 probe → 上游 Session constructor。未授权引用不会读取环境；解析后的连接值只存在于构建路径，不写回 Profile 或 Bundle。错误返回前先整体替换 DSN/URL，再用 `sessionbackend.Scrub` 处理驱动改写的密码片段；发生替换就切断原错误链，避免调用方通过 unwrap 取回凭据。
 
-Revision 当前只记录 `BackendProfileID`，尚未持久化 Profile fingerprint；“同 ID 永远同内容”由 Profile Source 契约和进程内 Router 检查保证。BackendProfile 不可变持久化、发布时把 fingerprint 固定进 Revision、动态 PostgreSQL/Redis Factory、TTL/LRU 淘汰和配置失效通知属于后续切片。
+一次动态构建默认最多等待 15 秒。上游 constructor 不接收 Context，因此超时只能让 Router 停止等待，不能强杀正在执行的 goroutine；迟到的 Service 会由该 goroutine 自行关闭。PostgreSQL probe 还会按“目标数据库 + schema + table prefix”获取 session-level advisory lock，直到 constructor 真正返回才释放，防止两个 Worker 首次并发执行上游 `CREATE TABLE IF NOT EXISTS`。Redis 不创建 schema，只做连通性 probe。
+
+Factory 继承进程级不变量：非持久 Pin 不能搭配持久 Session，多 Worker 不能搭配 InMemory Session；任何不安全组合都明确拒绝，不回退默认后端。
+
+### 1.3 当前边界与扩展方向
+
+当前 `Bundle` 只有已经被 Runtime 消费的 `Session` 字段，不为 Memory、Knowledge、Artifact 预留无语义的 nil 字段；以后有真实消费者时按字段名扩展。Router 目前不做 TTL/LRU：成功构建的动态 Bundle 一直存活到进程关闭。每租户 32 个 Profile 的硬上限使资源占用有界，但后续若允许更多 Profile，必须同时引入连接预算和可证明不影响活跃 Runtime 的淘汰协议。
+
+Revision 只记录 `BackendProfileID`，不复制 Profile fingerprint。不可变 Repository、存储行 fingerprint 与 Router 进程内比对共同覆盖正常操作和意外漂移；fingerprint 不是认证器，一个能同时越过 Repository 修改 `spec` 并重算 fingerprint 的数据库写入方仍能在全进程重启后绕过它。防御这种威胁应使用数据库写权限隔离或签名配置，而不是在发布时修改 Revision 的不可变 Config/digest。
 
 完整目标仍包括能力矩阵：
 

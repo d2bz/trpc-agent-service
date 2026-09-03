@@ -57,12 +57,35 @@ var ErrInvalidConfig = errors.New("sessionbackend: invalid configuration")
 // redacted replaces a secret that would otherwise reach a caller's log.
 const redacted = "[REDACTED]"
 
-// maxNamespaceLen bounds a table prefix and a schema name. Upstream allows 64
-// characters, but PostgreSQL truncates identifiers at 63 bytes and the longest
-// upstream table name ("session_track_events") already spends 20 of them, so a
-// prefix upstream accepts can still collide after truncation. 32 leaves room
-// for the suffix and is far above any real prefix.
+// maxNamespaceLen bounds a table prefix and a schema name individually.
+// Upstream allows 64 characters, but PostgreSQL truncates identifiers at 63
+// bytes and the longest upstream table name ("session_track_events") already
+// spends 20 of them, so a prefix upstream accepts can still collide after
+// truncation. 32 leaves room for the table suffix and is far above any real
+// prefix.
+//
+// It bounds each namespace on its own and says nothing about the two together.
+// Generated index names spend both at once and are what actually runs out of
+// room first; validateGeneratedIndexNames is the check for that.
 const maxNamespaceLen = 32
+
+// maxIdentifierLen is PostgreSQL's identifier limit. NAMEDATALEN is 64, so a
+// name longer than 63 bytes is truncated to 63 — with a NOTICE, not an error,
+// which is what makes an over-long generated name a silent fault rather than a
+// failed statement.
+const maxIdentifierLen = 63
+
+// longestGeneratedIndexTail is the longest "<table>_<suffix>" pair upstream
+// builds an index name from, across the index set its migration creates:
+// session_summaries carries a unique_active index, and no other pair in that
+// set is longer.
+//
+// It is a literal rather than a computation over upstream's tables because
+// those live in an internal package this module cannot import. An upstream
+// release that adds a longer pair would make this bound too generous, which is
+// why the pair is asserted against upstream's own naming in this package's
+// tests rather than only being written down here.
+const longestGeneratedIndexTail = "session_summaries_unique_active"
 
 // identifierPattern mirrors the upstream SQL identifier rule. Upstream applies
 // it through a Must-style helper that panics, so Config.Validate has to reject
@@ -183,10 +206,58 @@ func (c PostgresConfig) validate() error {
 	if strings.TrimSpace(c.DSN) == "" {
 		return fmt.Errorf("%w: postgres backend requires a DSN", ErrInvalidConfig)
 	}
-	if err := validateIdentifier("postgres table prefix", strings.TrimSuffix(c.TablePrefix, "_")); err != nil {
+	prefix := strings.TrimSuffix(c.TablePrefix, "_")
+	if err := validateIdentifier("postgres table prefix", prefix); err != nil {
 		return err
 	}
-	return validateIdentifier("postgres schema", c.Schema)
+	if err := validateIdentifier("postgres schema", c.Schema); err != nil {
+		return err
+	}
+	return validateGeneratedIndexNames(c.Schema, prefix)
+}
+
+// validateGeneratedIndexNames rejects a schema and table prefix whose generated
+// index names PostgreSQL would truncate.
+//
+// This is a joint bound, and it is the reason it exists at all: the per-field
+// limit above is checked against each namespace on its own, but upstream spends
+// both of them in one identifier. It builds every index as
+//
+//	idx_<schema>_<prefix>_<table>_<suffix>
+//
+// and never measures the result. PostgreSQL truncates an identifier over 63
+// bytes to 63 bytes with a NOTICE rather than an error, so CREATE INDEX
+// succeeds under a shortened name — and then upstream's own post-migration
+// verification looks for the name it asked for, does not find it, and fails the
+// whole constructor with "required unique index(es) invalid".
+//
+// Rejecting it here rather than at build time is the point. A Profile is
+// immutable and cannot be deleted, so a Profile accepted with namespaces that
+// are too long together is a Profile that occupies an id forever and can never
+// produce a Bundle. The caller has to hear it as a bad request.
+func validateGeneratedIndexNames(schema, prefix string) error {
+	// The fixed part of the longest name upstream generates: "idx_", the
+	// separator before each namespace it actually spends, and the longest
+	// "<table>_<suffix>" pair in its index set.
+	fixed := len("idx_") + len(longestGeneratedIndexTail)
+	if schema != "" {
+		fixed++
+	}
+	if prefix != "" {
+		fixed++
+	}
+	if fixed+len(schema)+len(prefix) <= maxIdentifierLen {
+		return nil
+	}
+	// The budget is reported rather than the values: these fields are
+	// tenant-supplied and the error is answered to an API caller. What a caller
+	// needs is how much room they have, not their own input read back.
+	return fmt.Errorf(
+		"%w: postgres schema and table prefix are too long together "+
+			"(max %d characters between them, so the generated index names fit "+
+			"PostgreSQL's %d-character limit)",
+		ErrInvalidConfig, maxIdentifierLen-fixed, maxIdentifierLen,
+	)
 }
 
 func (c RedisConfig) validate() error {
@@ -198,14 +269,14 @@ func (c RedisConfig) validate() error {
 	}
 	if len(c.KeyPrefix) > maxNamespaceLen {
 		return fmt.Errorf(
-			"%w: redis key prefix is %d characters (max %d)",
-			ErrInvalidConfig, len(c.KeyPrefix), maxNamespaceLen,
+			"%w: redis key prefix is too long (max %d characters)",
+			ErrInvalidConfig, maxNamespaceLen,
 		)
 	}
 	if !keyPrefixPattern.MatchString(c.KeyPrefix) {
 		return fmt.Errorf(
-			"%w: invalid redis key prefix %q (letters, digits, '_', '.', ':' and '-' only)",
-			ErrInvalidConfig, c.KeyPrefix,
+			"%w: invalid redis key prefix (letters, digits, '_', '.', ':' and '-' only)",
+			ErrInvalidConfig,
 		)
 	}
 	return nil
@@ -214,20 +285,28 @@ func (c RedisConfig) validate() error {
 // validateIdentifier rejects a table prefix or schema upstream would either
 // refuse or, worse, accept into a generated SQL identifier. Empty is allowed:
 // both knobs are optional.
+//
+// The rejected value is named by field and by rule, never quoted back. These
+// fields are filled from a tenant-supplied storage profile and answered to an
+// admin API caller, and an operator who pastes a DSN or a key into the wrong
+// field of a request would otherwise read it back out of the 400 — where it
+// lands in an access log, a proxy trace and a bug report. The field name and
+// the rule are what a caller needs to fix the request; they already know what
+// they sent.
 func validateIdentifier(what, value string) error {
 	if value == "" {
 		return nil
 	}
 	if len(value) > maxNamespaceLen {
 		return fmt.Errorf(
-			"%w: %s is %d characters (max %d)",
-			ErrInvalidConfig, what, len(value), maxNamespaceLen,
+			"%w: %s is too long (max %d characters)",
+			ErrInvalidConfig, what, maxNamespaceLen,
 		)
 	}
 	if !identifierPattern.MatchString(value) {
 		return fmt.Errorf(
-			"%w: invalid %s %q (must start with a letter or '_' and contain only letters, digits and '_')",
-			ErrInvalidConfig, what, value,
+			"%w: invalid %s (must start with a letter or '_' and contain only letters, digits and '_')",
+			ErrInvalidConfig, what,
 		)
 	}
 	return nil

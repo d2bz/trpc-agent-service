@@ -118,10 +118,12 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 | 8/26 | 方案评审、图表渲染、交叉检查、提交演练并冻结 `1.0-rc1` |
 | 8/27 | 提交方案文档；演示多租户 Admin → Runtime → Runner → Session 链路 |
 | 8/28-8/31 | PostgreSQL 控制面、Gateway、共享 Redis/PostgreSQL Session、Runtime 淘汰和双 Worker 验证 |
-| 9/1-9/4 | 多 Worker、并发协调、Redis/PostgreSQL、PGVector、Artifact、迁移和幂等 |
-| 9/5-9/7 | 企业微信、飞书、媒体/限流/重试和端到端测试 |
-| 9/8-9/9 | Guardrail、权限、预算、审计、OpenTelemetry、故障恢复和 K8s |
-| 9/10 | 全量回归、容量测试、演示脚本和缺陷修复 |
+| 9/1-9/3 | Session Run Lease、双 Worker、StorageBundle、租户 BackendProfile 与动态 PostgreSQL/Redis |
+| 9/4 | Inbox/Outbox、Channel 公共链路、幂等与重试骨架 |
+| 9/5-9/6 | 周末，不安排开发任务 |
+| 9/7 | 企业微信、飞书、身份映射、群聊规则、媒体/限流与端到端测试 |
+| 9/8 | Memory/Summary、迁移验证、Guardrail/预算/审计、OpenTelemetry、故障恢复与部署收口 |
+| 9/9-9/10 | 冻结功能开发；全量联调、容量测试、演示脚本和缺陷修复 |
 | 9/11 | 正式验收 |
 | 9/12-9/14 | 验收后修复、材料整理和最终提交 |
 

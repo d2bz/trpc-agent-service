@@ -13,6 +13,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -50,11 +51,21 @@ const resourceIDSyntax = "1-128 characters of [A-Za-z0-9._-] starting with a let
 // comparison somewhere in a handler.
 type PlatformServer struct {
 	repository tenant.Repository
-	runs       *sessionrun.Service
-	chat       identity.Authenticator
-	admin      identity.AdminAuthenticator
-	revisions  security.RevisionAuthorizer
-	handler    http.Handler
+	// profiles is the control plane's storage-profile half. It is a second
+	// repository rather than a method on the first because a profile is not a
+	// tenant resource in the way an app is: the data plane resolves one through
+	// the same value, as a ProfileSource, and the two halves are stored and
+	// tested as one contract.
+	profiles storagebundle.ProfileRepository
+	runs     *sessionrun.Service
+	chat     identity.Authenticator
+	admin    identity.AdminAuthenticator
+	// capabilities answers both questions this API asks about what a tenant may
+	// reach: whether a revision may run, and whether one secret reference may be
+	// named. They are one value on purpose — a process that answered them from
+	// two tables could entitle a credential through the gap between them.
+	capabilities security.CapabilityAuthorizer
+	handler      http.Handler
 }
 
 // NewPlatformServer builds the server. Every dependency is a parameter,
@@ -66,16 +77,22 @@ type PlatformServer struct {
 // Nothing has a permissive default and nothing may be nil. A control plane that
 // started with no way to authenticate, or with no opinion on which revisions
 // may run, is a control plane whose safety depends on nobody finding it; a
-// process that started with no run service would be coordinating nothing.
+// process that started with no run service would be coordinating nothing, and
+// one with no profile repository would have an admin route that stores storage
+// arrangements nowhere.
 func NewPlatformServer(
 	repository tenant.Repository,
+	profiles storagebundle.ProfileRepository,
 	runs *sessionrun.Service,
 	chatAuthenticator identity.Authenticator,
 	adminAuthenticator identity.AdminAuthenticator,
-	revisionAuthorizer security.RevisionAuthorizer,
+	capabilityAuthorizer security.CapabilityAuthorizer,
 ) (*PlatformServer, error) {
 	if repository == nil {
 		return nil, fmt.Errorf("web: tenant repository is required")
+	}
+	if profiles == nil {
+		return nil, fmt.Errorf("web: backend profile repository is required")
 	}
 	if runs == nil {
 		return nil, fmt.Errorf("web: run service is required")
@@ -86,15 +103,16 @@ func NewPlatformServer(
 	if adminAuthenticator == nil {
 		return nil, fmt.Errorf("web: admin authenticator is required")
 	}
-	if revisionAuthorizer == nil {
+	if capabilityAuthorizer == nil {
 		return nil, fmt.Errorf("web: revision authorizer is required")
 	}
 	server := &PlatformServer{
-		repository: repository,
-		runs:       runs,
-		chat:       chatAuthenticator,
-		admin:      adminAuthenticator,
-		revisions:  revisionAuthorizer,
+		repository:   repository,
+		profiles:     profiles,
+		runs:         runs,
+		chat:         chatAuthenticator,
+		admin:        adminAuthenticator,
+		capabilities: capabilityAuthorizer,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)

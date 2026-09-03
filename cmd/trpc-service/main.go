@@ -125,7 +125,7 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 		return err
 	}
 
-	runtimes, err := openRuntimeStack(storageCfg, stack, securityCfg.Revisions)
+	runtimes, err := openRuntimeStack(storageCfg, stack, getenv, securityCfg.Revisions)
 	if err != nil {
 		return err
 	}
@@ -145,6 +145,9 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 
 	api, err := web.NewPlatformServer(
 		stack.repository,
+		// The same repository the Router resolves through, so a profile this
+		// API accepts is one the data plane can already see.
+		stack.profiles,
 		runs,
 		securityCfg.Chat,
 		securityCfg.Admin,

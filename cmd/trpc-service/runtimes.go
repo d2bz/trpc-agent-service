@@ -31,18 +31,33 @@ type runtimeStack struct {
 // the storageStack, which has to be able to release it on a startup failure at
 // a point where no Router exists yet.
 //
-// Dynamic profiles are NoProfiles here. This process has no profile storage, so
-// it cannot honour a reference to one, and a revision that names a profile is
-// refused rather than served by the default store it did not ask for.
+// Dynamic profiles come from stack.profiles — the same repository the Admin API
+// writes through, not a second view of it. A profile that was just created is
+// therefore resolvable immediately, and there is no window in which the two
+// halves of this process disagree about what a tenant published.
+//
+// The Factory is handed the process's own getenv and the process's own
+// capability table, for the same reason: a factory reading a different
+// environment, or asking a different entitlement table, would resolve
+// credentials that the Admin API never agreed this tenant could name.
 func openRuntimeStack(
 	cfg storageConfig,
 	stack *storageStack,
-	revisions security.RevisionAuthorizer,
+	getenv func(string) string,
+	capabilities security.CapabilityAuthorizer,
 ) (*runtimeStack, error) {
+	factory, err := storagebundle.NewSessionFactory(storagebundle.FactoryOptions{
+		Constraints: processConstraints(cfg),
+		Secrets:     capabilities,
+		Getenv:      getenv,
+	})
+	if err != nil {
+		return nil, err
+	}
 	router, err := storagebundle.NewRouter(storagebundle.Options{
 		Default: storagebundle.Bundle{Session: stack.sessions},
-		Source:  storagebundle.NoProfiles(),
-		Factory: storagebundle.NewSessionFactory(processConstraints(cfg)),
+		Source:  stack.profiles,
+		Factory: factory,
 	})
 	if err != nil {
 		return nil, err
@@ -57,12 +72,13 @@ func openRuntimeStack(
 			// cancelled when the resolver closes, so a build that is waiting on
 			// storage stops when the process stops rather than after it.
 			//
-			// revisions is the same authorizer value the Admin API checks
-			// against. One instance, not two equivalent ones: a revision that
-			// Admin accepted and a Runtime later refused — or the reverse —
-			// would be a disagreement about what this tenant may do, and there
-			// is no correct way to resolve one at request time.
-			return platformagent.NewRuntime(ctx, revision, router, revisions)
+			// capabilities is the same authorizer value the Admin API checks
+			// against, and the same one the Factory above resolves secret
+			// references with. One instance, not three equivalent ones: a
+			// revision that Admin accepted and a Runtime later refused — or the
+			// reverse — would be a disagreement about what this tenant may do,
+			// and there is no correct way to resolve one at request time.
+			return platformagent.NewRuntime(ctx, revision, router, capabilities)
 		},
 	)
 	if err != nil {

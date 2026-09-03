@@ -64,8 +64,10 @@ type Config struct {
 	Chat identity.Authenticator
 	// Admin authenticates control-plane traffic.
 	Admin identity.AdminAuthenticator
-	// Revisions decides which capabilities a tenant's revisions may name.
-	Revisions RevisionAuthorizer
+	// Revisions decides which capabilities a tenant may name: in a revision
+	// config, and in a backend storage profile. It is one value rather than two
+	// so both questions are answered from the same table.
+	Revisions CapabilityAuthorizer
 	// Description is a value-free one-line summary for the startup log. It
 	// reports presence and counts, never contents.
 	Description string

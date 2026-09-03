@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,27 @@ type createRevisionRequest struct {
 	Config     tenant.RevisionConfig `json:"config"`
 }
 
+// createBackendProfileRequest is the whole of what a caller may say about a
+// backend profile: the id it is filed under, and the storage it describes.
+//
+// The tenant is absent because it is the path, and the rest of what a stored
+// profile carries — the fingerprint, the author, the creation time — is
+// provenance rather than content. A body that states one of those is refused by
+// DisallowUnknownFields, for the reason createRevisionRequest documents: a
+// field that is accepted and then overwritten is a field that means something
+// other than what it says.
+type createBackendProfileRequest struct {
+	ID      string                    `json:"id"`
+	Session storagebundle.SessionSpec `json:"session"`
+}
+
+// listBackendProfilesResponse wraps the list in an object rather than answering
+// with a bare JSON array, so a later page cursor or count can be added without
+// changing the shape of every existing client's parse.
+type listBackendProfilesResponse struct {
+	Profiles []storagebundle.ProfileRecord `json:"profiles"`
+}
+
 type publishRevisionResponse struct {
 	App      tenant.AgentApp      `json:"app"`
 	Revision tenant.AgentRevision `json:"revision"`
@@ -69,6 +91,12 @@ const adminTenantsPrefix = adminPathPrefix + "/v1/tenants"
 
 // adminMediaTypeJSON is what an admin write request must declare.
 const adminMediaTypeJSON = "application/json"
+
+// backendProfilesSegment is the collection a tenant's storage profiles live
+// under. It is a sibling of "apps" rather than a child of one: a profile is a
+// tenant's storage arrangement, and several apps' revisions may name the same
+// one.
+const backendProfilesSegment = "backend-profiles"
 
 // handleAdmin is the control-plane trust boundary.
 //
@@ -143,6 +171,21 @@ func (s *PlatformServer) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.getAgentApp(w, r, segments[0], segments[2])
+	case len(segments) == 2 && segments[1] == backendProfilesSegment:
+		switch r.Method {
+		case http.MethodPost:
+			s.createBackendProfile(w, r, admin, segments[0])
+		case http.MethodGet:
+			s.listBackendProfiles(w, r, segments[0])
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
+	case len(segments) == 3 && segments[1] == backendProfilesSegment:
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		s.getBackendProfile(w, r, segments[0], segments[2])
 	case len(segments) == 4 && segments[1] == "apps" && segments[3] == "revisions":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -311,6 +354,151 @@ func (s *PlatformServer) getAgentApp(
 	writeJSON(w, http.StatusOK, item)
 }
 
+// createBackendProfile stores one immutable storage arrangement for a tenant.
+//
+// The order of the three steps is the whole security argument, and it is the
+// same order the Factory uses when it later builds against this profile:
+//
+//  1. Validate the shape. A profile that could never be built is refused with
+//     the reason, which is the caller's own submission read back to them.
+//  2. Authorize every credential it names, against the same entitlement table
+//     and by the same exact string a model key goes through. Without this a
+//     tenant could name another tenant's DSN variable and get a working
+//     connection out of it — a second, unentitled channel to the process
+//     environment that no revision check would ever see.
+//  3. Only then store it.
+//
+// Nothing here reads an environment variable and nothing connects. This handler
+// cannot tell whether the reference it just authorized names a variable that is
+// set, which is exactly the property that keeps it from being a probe for the
+// process environment.
+func (s *PlatformServer) createBackendProfile(
+	w http.ResponseWriter,
+	r *http.Request,
+	admin identity.AdminIdentity,
+	tenantID string,
+) {
+	var request createBackendProfileRequest
+	if !decodeAdminJSON(w, r, &request) {
+		return
+	}
+	// The tenant is the path's, never the body's: there is no field to disagree
+	// with the scope allowsAdminTenant already decided.
+	profile := storagebundle.Profile{
+		TenantID: tenantID,
+		ID:       request.ID,
+		Session:  request.Session,
+	}
+	if err := profile.Validate(); err != nil {
+		writeProfileError(w, err)
+		return
+	}
+	if err := s.authorizeProfileSecrets(tenantID, profile); err != nil {
+		writeNotEntitled(w)
+		return
+	}
+	created, err := s.profiles.CreateProfile(
+		r.Context(),
+		tenant.TenantContext{TenantID: tenantID},
+		profile,
+		// Authorship is the authenticated principal, never a request field.
+		admin.PrincipalID,
+	)
+	if err != nil {
+		writeProfileError(w, err)
+		return
+	}
+	w.Header().Set("Location", fmt.Sprintf(
+		"/admin/v1/tenants/%s/%s/%s", tenantID, backendProfilesSegment, created.ID))
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *PlatformServer) listBackendProfiles(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID string,
+) {
+	records, err := s.profiles.ListProfiles(r.Context(), tenant.TenantContext{TenantID: tenantID})
+	if err != nil {
+		writeProfileError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, listBackendProfilesResponse{Profiles: records})
+}
+
+func (s *PlatformServer) getBackendProfile(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID string,
+	profileID string,
+) {
+	record, err := s.profiles.GetProfile(
+		r.Context(), tenant.TenantContext{TenantID: tenantID}, profileID)
+	if err != nil {
+		writeProfileError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
+}
+
+// authorizeProfileSecrets checks every credential a profile names against the
+// process entitlement table.
+//
+// It is one loop in one place because three call sites ask the same question —
+// creating a profile, creating a revision that names one, publishing one — and
+// a fourth backend added to Profile.SecretRefs has to reach all three at once.
+//
+// The error is security.ErrNotEntitled and says nothing about which reference
+// was refused, so a caller cannot tell a variable this process has from one it
+// does not.
+func (s *PlatformServer) authorizeProfileSecrets(
+	tenantID string,
+	profile storagebundle.Profile,
+) error {
+	for _, ref := range profile.SecretRefs() {
+		if err := s.capabilities.AuthorizeSecretRef(tenantID, ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkBackendProfileReference resolves the profile a revision config names and
+// checks that this tenant may use it.
+//
+// Both halves are refusals a revision has earned. The profile has to exist in
+// this tenant — a reference to one that is not there is a revision that can
+// never be served, and finding that out at publish time, or worse at the first
+// chat request, is finding it out at the point where an operator can least tell
+// whether the platform or the configuration is wrong. And the credentials it
+// names have to be entitled to this tenant a second time, at this second gate,
+// because a profile created while a grant existed must not keep working as a
+// way into a credential the grant no longer covers.
+//
+// An empty reference means this process's default store and needs neither.
+//
+// It returns the error instead of writing it: the two call sites owe their
+// callers different words for the same fault, because one is refusing a field
+// of the request in front of it and the other is refusing a revision that was
+// stored some time ago.
+func (s *PlatformServer) checkBackendProfileReference(
+	ctx context.Context,
+	tenantID string,
+	config tenant.RevisionConfig,
+) error {
+	if config.BackendProfileID == "" {
+		return nil
+	}
+	// Scoped to the caller's own tenant, so this can only ever confirm the
+	// existence of a profile the caller administers.
+	record, err := s.profiles.GetProfile(
+		ctx, tenant.TenantContext{TenantID: tenantID}, config.BackendProfileID)
+	if err != nil {
+		return err
+	}
+	return s.authorizeProfileSecrets(tenantID, record.Profile)
+}
+
 // createRevision stores a draft revision, authored by the caller.
 //
 // The entitlement check happens here, before the write, so a revision naming a
@@ -318,6 +506,11 @@ func (s *PlatformServer) getAgentApp(
 // at publish would let a draft accumulate refs that look accepted and then fail
 // much later, at the point where an operator is least able to tell whether the
 // configuration or the platform is wrong.
+//
+// A backend_profile_id is checked immediately after, and in that order: the
+// revision's own capabilities decide whether this caller may store anything at
+// all, and only a caller who has cleared that gets an answer about which
+// profiles its tenant owns.
 func (s *PlatformServer) createRevision(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -329,8 +522,25 @@ func (s *PlatformServer) createRevision(
 	if !decodeAdminJSON(w, r, &request) {
 		return
 	}
-	if err := s.revisions.AuthorizeRevision(tenantID, request.Config); err != nil {
+	if err := s.capabilities.AuthorizeRevision(tenantID, request.Config); err != nil {
 		writeNotEntitled(w)
+		return
+	}
+	if err := s.checkBackendProfileReference(r.Context(), tenantID, request.Config); err != nil {
+		if errors.Is(err, security.ErrNotEntitled) {
+			writeNotEntitled(w)
+			return
+		}
+		if errors.Is(err, storagebundle.ErrProfileNotFound) {
+			// The request named it, so this is a 400 about a field the caller
+			// controls — and it is not a disclosure, because the lookup was
+			// scoped to the caller's own tenant.
+			writeAPIError(w, http.StatusBadRequest, "invalid_argument", fmt.Sprintf(
+				"backend_profile_id %q is not a backend profile of this tenant",
+				request.Config.BackendProfileID))
+			return
+		}
+		writeProfileError(w, err)
 		return
 	}
 	created, err := s.repository.CreateRevision(
@@ -379,12 +589,18 @@ func (s *PlatformServer) getRevision(
 // says. The revision is immutable, so reading it first is not a race: what is
 // read is what will be published, and what a Runtime will later build from.
 //
-// The order is entitlement, then tool registry — the same order Runtime uses.
-// Entitlement is about what this tenant is allowed to reach at all, and it
-// answers identically whether or not the ref names anything real; the registry
-// check is about whether a revision this tenant may run is internally coherent,
-// and it can afford to say what is wrong because by then nothing is being
-// disclosed to someone who should not know it.
+// The order is entitlement, then tool registry, then storage — the same order
+// Runtime uses. Entitlement is about what this tenant is allowed to reach at
+// all, and it answers identically whether or not the ref names anything real;
+// the registry and storage checks are about whether a revision this tenant may
+// run is internally coherent, and they can afford to say what is wrong because
+// by then nothing is being disclosed to someone who should not know it.
+//
+// Storage is checked again here rather than trusted from create time. A profile
+// is looked up by an id that was legal when the draft was written, and between
+// then and now the grant behind its credentials may have been withdrawn — a
+// revision that named a profile while it was entitled must not become a way to
+// keep using it afterwards.
 func (s *PlatformServer) publishRevision(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -398,7 +614,7 @@ func (s *PlatformServer) publishRevision(
 		writeDomainError(w, err)
 		return
 	}
-	if err := s.revisions.AuthorizeRevision(tenantID, revision.Config); err != nil {
+	if err := s.capabilities.AuthorizeRevision(tenantID, revision.Config); err != nil {
 		writeNotEntitled(w)
 		return
 	}
@@ -410,6 +626,25 @@ func (s *PlatformServer) publishRevision(
 		// saying so is the difference between a fixable error and a mystery.
 		writeAPIError(
 			w, http.StatusBadRequest, "invalid_revision", "revision cannot be served: "+err.Error())
+		return
+	}
+	if err := s.checkBackendProfileReference(r.Context(), tenantID, revision.Config); err != nil {
+		if errors.Is(err, security.ErrNotEntitled) {
+			writeNotEntitled(w)
+			return
+		}
+		if errors.Is(err, storagebundle.ErrProfileNotFound) {
+			// Same code as the tool-registry refusal above, because it is the
+			// same fault: a revision this tenant may run, naming something this
+			// platform cannot give it. The id is the caller's own and the lookup
+			// was scoped to the caller's own tenant, so naming it discloses
+			// nothing.
+			writeAPIError(w, http.StatusBadRequest, "invalid_revision", fmt.Sprintf(
+				"revision cannot be served: backend profile %q is not a backend profile of this tenant",
+				revision.Config.BackendProfileID))
+			return
+		}
+		writeProfileError(w, err)
 		return
 	}
 	app, published, err := s.repository.PublishRevision(r.Context(), scope, appID, revisionID)
@@ -507,6 +742,66 @@ func writeDomainError(w http.ResponseWriter, err error) {
 	}
 }
 
+// writeProfileError maps a control-plane profile failure, and is deliberately
+// not writeDomainError.
+//
+// The two disagree about the same sentinels, and each is right for its own
+// caller. To a chat client, storagebundle.ErrProfileNotFound means a published
+// revision points at storage this process cannot give it: the client named no
+// profile, it can do nothing about the one that is missing, and telling it which
+// is missing would leak another tenant's control-plane configuration — so
+// writeDomainError collapses it into a 409 "revision is not available". To an
+// admin asking this tenant's own profile collection for an id, the same sentinel
+// means exactly what a missing resource always means, and the honest answer is
+// the same 404 a missing tenant or app gets.
+//
+// tenant.ErrConfigIntegrity splits the same way and for the same reason. Here it
+// is a 500: the request was well formed, no edit to it would help, and a stored
+// row that no longer matches its own fingerprint is this platform's fault to fix.
+//
+// Sharing one mapper would force one of the two answers to be wrong. Keeping
+// them apart also keeps the profile-shaped sentinels out of the chat path, where
+// a new one added to this list must not silently start changing what a chat
+// client is told.
+func writeProfileError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, storagebundle.ErrProfileNotFound):
+		writeNotFound(w)
+	case errors.Is(err, storagebundle.ErrInvalidProfile):
+		// The message is the caller's own submission read back to them. It
+		// carries no credential: Profile.Validate refuses a malformed secret
+		// reference without echoing it, and sessionbackend.Config.Validate names
+		// the field and the rule rather than the value.
+		writeAPIError(w, http.StatusBadRequest, "invalid_argument", err.Error())
+	case errors.Is(err, storagebundle.ErrProfileLimit):
+		// Its own code, because it is the one refusal here that no change to the
+		// request can fix and no retry will clear: profiles are immutable and
+		// there is no delete, so the budget is spent for good.
+		writeAPIError(w, http.StatusConflict, "profile_limit", err.Error())
+	case errors.Is(err, security.ErrNotEntitled):
+		writeNotEntitled(w)
+	case errors.Is(err, tenant.ErrInvalidArgument):
+		writeAPIError(w, http.StatusBadRequest, "invalid_argument", err.Error())
+	case errors.Is(err, tenant.ErrTenantScope), errors.Is(err, tenant.ErrNotFound):
+		// Same writer as the tenant-scope short-circuit in handleAdmin, so a
+		// refused cross-tenant read and a genuinely missing tenant stay identical.
+		writeNotFound(w)
+	case errors.Is(err, tenant.ErrAlreadyExists):
+		// The id is the version, so this is the ordinary answer to "publish new
+		// storage", not an edge case: a profile is never replaced, a different
+		// arrangement is a different id.
+		writeAPIError(w, http.StatusConflict, "already_exists", err.Error())
+	case errors.Is(err, tenant.ErrTenantInactive):
+		writeAPIError(w, http.StatusForbidden, "tenant_inactive", err.Error())
+	default:
+		// tenant.ErrConfigIntegrity lands here, and so does every storage
+		// failure. Neither is the caller's, and neither message is theirs to
+		// read: a driver error spliced into a body would carry SQL text and
+		// column values with it.
+		writeAPIError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+	}
+}
+
 // writeNotFound is the one not-found answer this package gives.
 //
 // A tenant admin reaching for another tenant gets exactly this, and so does a
@@ -528,8 +823,8 @@ func writeForbidden(w http.ResponseWriter) {
 	writeAPIError(w, http.StatusForbidden, "forbidden", "this credential is not allowed")
 }
 
-// writeNotEntitled refuses a revision that names a capability its tenant does
-// not hold.
+// writeNotEntitled refuses a configuration that names a capability its tenant
+// does not hold.
 //
 // The wording is fixed and says nothing about which ref was rejected. That is
 // the whole design: a caller must get the same answer for a secret_ref whose
@@ -537,12 +832,19 @@ func writeForbidden(w http.ResponseWriter) {
 // knows and one it has never heard of. Any difference between those cases would
 // make this endpoint a probe for the process environment and the tool registry
 // of a platform the caller does not administer.
+//
+// It says "configuration" rather than "revision" because every gate that
+// refuses shares it, and not all of them are looking at a revision: creating a
+// backend profile is refused here too, and a message naming a revision would be
+// describing a request that has none. Keeping it one function is what keeps
+// them identical — the moment a gate words its refusal differently, the
+// difference is what a caller reads the answer for.
 func writeNotEntitled(w http.ResponseWriter) {
 	writeAPIError(
 		w,
 		http.StatusForbidden,
 		"not_entitled",
-		"this tenant is not entitled to a capability the revision references",
+		"this tenant is not entitled to a capability the configuration references",
 	)
 }
 

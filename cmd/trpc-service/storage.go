@@ -14,6 +14,7 @@ import (
 	sessiondirpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	redislease "github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease/redis"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	tenantpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tenant/postgres"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -363,7 +364,17 @@ type namedCloser struct {
 // those has to close them, in the right order, on the shutdown path and on
 // every partial startup failure alike. That is this type's whole job.
 type storageStack struct {
-	repository  tenant.Repository
+	repository tenant.Repository
+	// profiles is the control plane's backend-profile storage, and it is the
+	// same value on both ends of this process: the Admin API creates profiles
+	// through it and the Router resolves them through it, as a ProfileSource.
+	// Two values built over one database would be one bug away from a Router
+	// that cannot see what the Admin API just accepted.
+	//
+	// It owns nothing. Under the postgres profile it borrows the shared pool
+	// like the repository does; under the in-memory profile it borrows the
+	// repository itself as its tenant gate.
+	profiles    storagebundle.ProfileRepository
 	directory   sessiondir.Directory
 	sessions    session.Service
 	coordinator sessionlease.Coordinator
@@ -433,10 +444,15 @@ func (s *storageStack) close() error {
 // go-redis. A fake supplies a nil pool and a nil client, and every step that
 // would touch one is replaced alongside, so nothing dereferences them.
 type storageDeps struct {
-	openPool        func(ctx context.Context, cfg storageConfig) (*pgxpool.Pool, func() error, error)
-	ping            func(ctx context.Context, pool *pgxpool.Pool) error
-	migrate         func(ctx context.Context, pool *pgxpool.Pool) error
-	newControlPlane func(pool *pgxpool.Pool) (tenant.Repository, sessiondir.Directory, error)
+	openPool func(ctx context.Context, cfg storageConfig) (*pgxpool.Pool, func() error, error)
+	ping     func(ctx context.Context, pool *pgxpool.Pool) error
+	migrate  func(ctx context.Context, pool *pgxpool.Pool) error
+	// newControlPlane builds the three views of the control plane that share one
+	// pool. They are built together rather than one at a time because they are
+	// one thing: a profile's foreign key points at the repository's tenants
+	// table, so a process that built them separately could point them at
+	// different databases.
+	newControlPlane func(pool *pgxpool.Pool) (controlPlane, error)
 	newSessions     func(cfg sessionbackend.Config) (session.Service, error)
 	openRedis       func(ctx context.Context, cfg storageConfig) (goredis.UniversalClient, func() error, error)
 	pingRedis       func(ctx context.Context, client goredis.UniversalClient) error
@@ -494,8 +510,17 @@ func openInMemoryStorage(
 	if err != nil {
 		return nil, err
 	}
+	repository := tenant.NewMemoryRepository()
+	// Gated by the repository it was just built beside, which is what makes the
+	// in-memory stack hold the same rule the postgres one holds with a foreign
+	// key: a profile cannot belong to a tenant this control plane never created.
+	profiles, err := storagebundle.NewMemoryProfileRepository(repository)
+	if err != nil {
+		return nil, errors.Join(err, sessions.Close())
+	}
 	stack := &storageStack{
-		repository: tenant.NewMemoryRepository(),
+		repository: repository,
+		profiles:   profiles,
 		directory:  sessiondir.NewMemoryDirectory(),
 		sessions:   sessions,
 	}
@@ -551,11 +576,12 @@ func openPostgresStorage(ctx context.Context, cfg storageConfig, deps storageDep
 		return fail(err)
 	}
 
-	repository, directory, err := deps.newControlPlane(pool)
+	plane, err := deps.newControlPlane(pool)
 	if err != nil {
 		return fail(err)
 	}
-	stack.repository, stack.directory = repository, directory
+	stack.repository, stack.profiles, stack.directory =
+		plane.repository, plane.profiles, plane.directory
 
 	sessions, err := deps.newSessions(cfg.sessionConfig())
 	if err != nil {
@@ -750,18 +776,31 @@ func newLeaseCoordinator(
 	}
 }
 
-// newPostgresControlPlane wraps the shared pool in the two components. Neither
-// constructor connects and neither takes ownership of the pool.
-func newPostgresControlPlane(
-	pool *pgxpool.Pool,
-) (tenant.Repository, sessiondir.Directory, error) {
+// controlPlane is the three views one pool is wrapped in. It is a struct rather
+// than three return values so that a fourth view — or a change to which of them
+// is which — does not silently re-order the tuple every caller unpacks.
+type controlPlane struct {
+	repository tenant.Repository
+	profiles   storagebundle.ProfileRepository
+	directory  sessiondir.Directory
+}
+
+// newPostgresControlPlane wraps the shared pool in the three components. No
+// constructor connects and none takes ownership of the pool.
+func newPostgresControlPlane(pool *pgxpool.Pool) (controlPlane, error) {
 	repository, err := tenantpostgres.New(pool)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create control-plane repository: %w", err)
+		return controlPlane{}, fmt.Errorf("create control-plane repository: %w", err)
+	}
+	// The same pool, so the profile table's foreign key points at the tenants
+	// table this repository reads, and one Migrate created both.
+	profiles, err := tenantpostgres.NewProfileRepository(pool)
+	if err != nil {
+		return controlPlane{}, fmt.Errorf("create backend profile repository: %w", err)
 	}
 	directory, err := sessiondirpostgres.New(pool)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create session directory: %w", err)
+		return controlPlane{}, fmt.Errorf("create session directory: %w", err)
 	}
-	return repository, directory, nil
+	return controlPlane{repository: repository, profiles: profiles, directory: directory}, nil
 }

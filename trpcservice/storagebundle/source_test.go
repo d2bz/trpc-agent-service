@@ -8,9 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// NoProfiles is what production runs on in this slice, and it is a real answer
-// rather than a placeholder: a process with no profile storage cannot honour a
-// profile reference, so every lookup is a refusal.
+// NoProfiles is a real answer rather than a placeholder: a process with no
+// profile storage cannot honour a profile reference, so every lookup is a
+// refusal — including the ids that look like they might be special.
 func TestNoProfilesRefusesEveryLookup(t *testing.T) {
 	source := NoProfiles()
 

@@ -183,9 +183,9 @@ security 文件是最不能容忍"解析器忽略了它不认识的那部分"的
 
 ## 6. 租户 Entitlement
 
-`tenant_entitlements` 按**租户**而不是按凭据组织：能不能引用一个能力，是"跑这个 Revision 的租户"的属性，而不是"碰巧创建它的人"的属性。
+`tenant_entitlements` 按**租户**而不是按凭据组织：能不能引用一个能力，是“使用这个 Revision 或 BackendProfile 的租户”的属性，而不是“碰巧创建它的人”的属性。
 
-- `allowed_secret_refs`：该租户的 Revision 可以在 `model.secret_ref` 里引用哪些 `env:VAR_NAME`。
+- `allowed_secret_refs`：该租户的 Revision 可在 `model.secret_ref`、BackendProfile 可在 PostgreSQL `dsn_ref` 或 Redis `url_ref` 中引用哪些 `env:VAR_NAME`。
 - `allowed_policy_refs`：可以在 `policy_refs` 里引用哪些策略。
 - 匹配是**精确字符串**，没有通配符、大小写折叠或规范化。
 - 条目内重复、租户重复都拒绝。
@@ -200,19 +200,21 @@ security 文件是最不能容忍"解析器忽略了它不认识的那部分"的
 
 没有第一条，把某个租户授权到它自己的模型 key，就足以让它发布一个 `secret_ref` 指向 admin key 的 Revision，并让 Runtime 把这个 key 发到它自己选定的 `base_url`。检查按**精确名字**进行——一条比它所保护的查找更聪明的匹配规则，是一条带缺口的规则（`security.TestLoadRefusesToEntitleATenantToAPlatformVariable`、`TestEntitlementSeparationMatchesExactNamesOnly`）。
 
-### 6.2 三个执行点，同一个 authorizer 实例
+### 6.2 多个执行点，同一个 authorizer 实例
 
 | 位置 | 时机 |
 | --- | --- |
-| `POST .../revisions` | 写库**之前** |
-| `POST .../revisions/{id}/publish` | 读出存储的 Revision 之后，发布之前 |
-| Runtime 构建 | digest 校验之后，Tool Registry 和 Secret 解析之前 |
+| `POST .../backend-profiles` | Profile 校验之后、写库之前；不读取环境 |
+| `POST .../revisions` | Revision 自身 entitlement 之后，解析它引用的 Profile 并再次检查其 SecretRef，全部发生在写库之前 |
+| `POST .../revisions/{id}/publish` | 读出存储的 Revision 后，重新检查 Revision 与 Profile，发布之前 |
+| Runtime 构建 | digest 校验之后，Tool Registry、模型 Secret 解析与 Storage Router 之前 |
+| 动态 Storage Factory | 进程约束之后、读取 Profile 指向的环境变量之前 |
 
-`cmd/trpc-service/main.go` 把 `securityCfg.Revisions` **同一个实例**同时交给 `web.NewPlatformServer` 和 Runtime 工厂。不是两个等价的值：Admin 接受而 Runtime 拒绝（或者反过来）是一次关于"这个租户能做什么"的分歧，而这种分歧在请求期没有正确的解法。
+`cmd/trpc-service/main.go` 把 `securityCfg.Revisions` **同一个实例**同时交给 `web.NewPlatformServer`、Runtime 和 Storage Factory。不是三个等价的值：Admin 接受而数据面拒绝（或者反过来）是一次关于“这个租户能做什么”的分歧，而这种分歧在请求期没有正确的解法。
 
 创建时就检查（而不是只在 publish 检查），是为了不让一个 draft 攒着看起来被接受的引用，然后在运维最难判断"是配置错了还是平台错了"的地方失败。
 
-拒绝一律是同一个 `403 not_entitled`，措辞固定，不说明是哪个引用被拒。对"环境变量存在"和"不存在"、"策略已注册"和"从没听说过"都给出同一个答案——任何差异都会让这个端点变成对进程环境和 Tool Registry 的探针（`web.TestAdminRefusesUnentitledRevisionsIdentically`）。
+Admin 拒绝一律是同一个 `403 not_entitled`，措辞固定，不说明是哪个引用被拒。对“环境变量存在”和“不存在”、“策略已注册”和“从没听说过”都给出同一个答案；Profile 创建和 Revision 的两次门禁都不会读取环境。Runtime/Factory 的拒绝再统一塌缩为 `409 revision_unavailable`，不把平台配置原因告诉对话调用方。
 
 `publish` 上 entitlement 先于 Tool Registry 检查，顺序和 Runtime 一致。Registry 失败返回 `400 invalid_revision` 并说明原因：走到这一步的调用方对它引用的每个 ref 都已被授权，剩下的故障在 Revision 自身，此时说清楚是"可修复的错误"和"谜"的区别。
 
@@ -273,7 +275,7 @@ demo profile 下 `TRPC_SERVICE_ADMIN_API_KEY` 没有默认值，所以 `start.sh
 - **持久化审计。** 没有任何管理操作审计：谁在什么时候创建了租户、发布了哪个 Revision，都只有 `created_by` 这一个字段，没有独立、不可篡改、可查询、有保留期的 Audit Store。Tool 审计仍然只写结构化 `slog`。
 - **生产 Secret Manager。** `secretref` 只解析 `env:VAR_NAME`。Vault / KMS / Kubernetes Secret 引用、租户级密钥托管和密钥轮转都未实现。
 - **预算、审批与 Guardrail。** 没有 token / 成本预算，没有危险操作二次确认，没有 Plugin/Guardrail 治理链路。
-- **全链路日志脱敏。** 已实现的是若干具体位置的不回显（SecretRef 错误、manifest 错误、Tool 审计不含参数/结果/错误正文、DSN 经 `sessionbackend.Scrub`），不是一条覆盖全进程的脱敏管道。
+- **全链路日志脱敏。** 已实现的是若干明确边界的不回显：SecretRef 与 manifest 错误不带值、Tool 审计不含参数/结果/错误正文、进程默认连接错误经 `sessionbackend.Scrub`、动态 BackendProfile 错误先整体替换解析后的 DSN/URL 再清理驱动改写的密码片段，并在发生替换时切断 unwrap 链。这仍不是一条覆盖上游内部日志、metrics、trace 和 stderr 的进程级脱敏管道。
 - **`config_digest` 是无密钥摘要。** 它防住的是"能写库但没有本二进制"的写者。同时能改行**并重算指纹**的写者可以改掉 `base_url` 并让本进程照常构建——`base_url` 不是可授权能力，没有任何 manifest 字段授予或收回一个 endpoint，所以 digest 是它唯一的防线。这条残余风险以数据库写权限为界，要关闭需要 keyed digest 或对 config 的签名，而不是在构建函数里再加一个检查（`agent.TestRuntimeDigestDoesNotDefendAgainstAWriterWhoCanRecomputeIt`）。
 - **传输安全。** 进程只服务明文 HTTP，因此只能绑定回环地址，且没有绕过开关。TLS 由外部反向代理终止。
 

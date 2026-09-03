@@ -102,6 +102,31 @@ func (p Profile) Fingerprint() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// SecretRefs returns every credential reference this Profile names, in no
+// particular order. It returns nothing for a backend that names none.
+//
+// It exists so the entitlement check has one definition. Three places have to
+// ask "which credentials does this profile want": the admin API when a profile
+// is created, the admin API again when a revision names one, and the Factory
+// before it reads a single environment variable. A switch copied into each of
+// them is a switch that grows a fourth backend in two of the three.
+//
+// The references themselves are names, not values, so this discloses nothing a
+// Profile did not already carry in the clear. It reads both sub-structs rather
+// than switching on Backend: a Profile carrying settings for a backend it does
+// not name is refused by Validate, and requiring the entitlement for both is
+// the fail-closed answer to one that is checked here first.
+func (p Profile) SecretRefs() []string {
+	var refs []string
+	if p.Session.Postgres != nil && p.Session.Postgres.DSNRef != "" {
+		refs = append(refs, p.Session.Postgres.DSNRef)
+	}
+	if p.Session.Redis != nil && p.Session.Redis.URLRef != "" {
+		refs = append(refs, p.Session.Redis.URLRef)
+	}
+	return refs
+}
+
 // clone returns a Profile that shares no memory with p.
 //
 // SessionSpec keeps its backend settings behind pointers, so copying a Profile

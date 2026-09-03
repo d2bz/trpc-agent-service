@@ -18,6 +18,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -968,11 +969,24 @@ func (s *stubStorage) deps() storageDeps {
 		migrate: func(context.Context, *pgxpool.Pool) error {
 			return s.step("migrate")
 		},
-		newControlPlane: func(*pgxpool.Pool) (tenant.Repository, sessiondir.Directory, error) {
+		newControlPlane: func(*pgxpool.Pool) (controlPlane, error) {
 			if err := s.step("new control plane"); err != nil {
-				return nil, nil, err
+				return controlPlane{}, err
 			}
-			return tenant.NewMemoryRepository(), sessiondir.NewMemoryDirectory(), nil
+			// Built as one thing, like the real constructor: the profile
+			// repository is gated by the tenant table returned beside it, so a
+			// test cannot end up with a stack whose two halves disagree about
+			// which tenants exist.
+			repository := tenant.NewMemoryRepository()
+			profiles, err := storagebundle.NewMemoryProfileRepository(repository)
+			if err != nil {
+				return controlPlane{}, err
+			}
+			return controlPlane{
+				repository: repository,
+				profiles:   profiles,
+				directory:  sessiondir.NewMemoryDirectory(),
+			}, nil
 		},
 		newSessions: func(sessionbackend.Config) (session.Service, error) {
 			if err := s.step("new sessions"); err != nil {

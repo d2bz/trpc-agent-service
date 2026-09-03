@@ -31,6 +31,9 @@ ADMIN_KEY="$(cat data/admin-api-key)"
 | `GET` | `/admin/v1/tenants/{tenant_id}` | 读取 Tenant | 该租户 |
 | `POST` | `/admin/v1/tenants/{tenant_id}/apps` | 创建 Agent App | 该租户 |
 | `GET` | `/admin/v1/tenants/{tenant_id}/apps/{app_id}` | 读取 Agent App 和当前路由 | 该租户 |
+| `POST` | `/admin/v1/tenants/{tenant_id}/backend-profiles` | 创建不可变 Backend Profile | 该租户 |
+| `GET` | `/admin/v1/tenants/{tenant_id}/backend-profiles` | 按 ID 排序列出 Backend Profile | 该租户 |
+| `GET` | `/admin/v1/tenants/{tenant_id}/backend-profiles/{profile_id}` | 读取 Backend Profile | 该租户 |
 | `POST` | `/admin/v1/tenants/{tenant_id}/apps/{app_id}/revisions` | 创建不可变 draft Revision | 该租户 |
 | `GET` | `/admin/v1/tenants/{tenant_id}/apps/{app_id}/revisions/{revision_id}` | 读取 Revision | 该租户 |
 | `POST` | `/admin/v1/tenants/{tenant_id}/apps/{app_id}/revisions/{revision_id}/publish` | 发布新版本或把已发布旧版本切回默认 | 该租户 |
@@ -47,8 +50,8 @@ Admin 的任何响应都**不带** `Access-Control-Allow-*` 头，也没有预�
 
 | 角色 | 租户绑定 | 可做 |
 | --- | --- | --- |
-| `platform_admin` | 不属于任何租户 | 创建租户；管理任意租户的 App / Revision |
-| `tenant_admin` | 绑定且仅绑定一个租户 | 管理自己租户的 App / Revision |
+| `platform_admin` | 不属于任何租户 | 创建租户；管理任意租户的 App / Revision / Backend Profile |
+| `tenant_admin` | 绑定且仅绑定一个租户 | 管理自己租户的 App / Revision / Backend Profile |
 
 `tenant_admin` 调用 `POST /admin/v1/tenants` 返回 `403 forbidden`——"我不能建租户"对这个调用方不是秘密。而 `tenant_admin` 访问**别的租户**返回 `404`，与"资源真的不存在"逐字节相同，并且在**任何 Repository 调用之前**返回：状态码或措辞只要差一个词，这个接口就成了枚举租户是否存在的 oracle；先查库再拒绝则会让一个租户的管理员驱使本进程代表另一个租户查库。
 
@@ -78,9 +81,11 @@ Admin 的任何响应都**不带** `Access-Control-Allow-*` 头，也没有预�
 | 方法不被该路由接受（含 `OPTIONS`） | `405` | `method_not_allowed` |
 | `tenant_admin` 创建租户 | `403` | `forbidden` |
 | Revision 引用了本租户未被授权的 SecretRef 或 PolicyRef | `403` | `not_entitled` |
+| Backend Profile 引用了本租户未被授权的 SecretRef | `403` | `not_entitled` |
 | 请求体非法、未知字段、多于一个 JSON 值、非法资源 ID | `400` | `invalid_json` / `invalid_argument` |
 | `publish` 时 Tool/Policy 组合不可服务 | `400` | `invalid_revision` |
 | 重复 ID 或 Revision 编号 | `409` | `already_exists` |
+| Backend Profile 达到每租户 32 个上限 | `409` | `profile_limit` |
 | 租户被停用 | `403` | `tenant_inactive` |
 | Revision 未发布、未被授权或 digest 不匹配 | `409` | `revision_unavailable` |
 
@@ -165,6 +170,45 @@ Revision 引用的 `model.secret_ref` 和 `policy_refs` 必须先被**该租户*
 
 默认 demo profile 只授权 `demo` 租户使用 `builtin.safe-tools`，**不授权任何 SecretRef**。要让某个租户引用模型 key，需要提供自定义 manifest，示例见 [README 运行真实模型](../README.md#运行真实模型)，规则见[身份、权限与密钥治理](security-and-governance.md#6-租户-entitlement)。
 
+### 3.3 Backend Profile
+
+Backend Profile 是租户级的存储版本。ID 即版本，创建后不能 Update 或 Delete；切换配置需要创建新 ID，再让新的 Revision 引用它。请求体不允许声明 `tenant_id`、`fingerprint`、`created_by` 或 `created_at`：租户来自路径，作者来自认证凭据，其余字段由服务端产生。每租户最多 32 个 Profile。
+
+创建一个无需 SecretRef 的 InMemory Profile：
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/v1/tenants/team-a/backend-profiles \
+  -H "Authorization: Bearer ${ADMIN_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"session-local-v1","session":{"backend":"inmemory"}}'
+```
+
+PostgreSQL 和 Redis Profile 只保存引用，不保存连接值：
+
+```json
+{
+  "id": "session-postgres-v1",
+  "session": {
+    "backend": "postgres",
+    "postgres": {
+      "dsn_ref": "env:TEAM_A_SESSION_DSN",
+      "schema": "team_a",
+      "table_prefix": "sessions"
+    }
+  }
+}
+```
+
+`TEAM_A_SESSION_DSN` 必须先出现在该租户的 `allowed_secret_refs` 中。创建 Profile、创建引用它的 Revision和发布时都会重新检查 entitlement，但不会读取环境或连接数据库；只有 Runtime 第一次解析这个 Profile 时才读取连接值。动态 Factory 会在 15 秒预算内 probe 后端，PostgreSQL 首次建表还会按目标获取 advisory lock。解析后的 DSN/URL 不进入响应；底层错误若回显连接值，会在 Factory 边界被整体替换并切断原错误链。
+
+Revision 通过 `config.backend_profile_id` 引用 Profile。空值继续使用进程默认 Bundle：
+
+```json
+{
+  "backend_profile_id": "session-postgres-v1"
+}
+```
+
 ## 4. 动态对话路由
 
 对话路径仍为上游兼容的 `/v1/chat/completions`。租户、主体和 Session 归属全部由服务端从凭据推导，请求体中的 `user` 字段被忽略。
@@ -204,6 +248,7 @@ OPTIONS 预检直接返回（不认证）
 → 校验 X-Tenant-ID 断言（不一致 403）
 → 校验 X-Agent-App-ID 并检查授权（越权 403）
 → 校验或生成 X-Session-ID
+→ Session Run Service 获取合作型租约（冲突 409，不可用 503）
 → Session Directory 查 Pin；没有 Pin 则解析候选 Revision 并原子 EnsurePin
 → Runtime Resolver 按 (tenant, app, pinned revision) 加载或复用 Runtime
 → 写入响应头，注入可信 RunContext
@@ -221,6 +266,8 @@ OPTIONS 预检直接返回（不认证）
 | `X-Tenant-ID` 断言不符，或 App 不在凭据授权内 | `403` | `forbidden` |
 | 缺少或非法 `X-Agent-App-ID` | `400` | `missing_route` |
 | 非法 `X-Session-ID` | `400` | `invalid_session_id` |
+| 同一 Session 已在另一个 Run 中 | `409`（带 `Retry-After: 2`） | `session_busy` |
+| Run 租约后端不可用 | `503` | `coordination_unavailable` |
 | 已 Pin 的 Session 收到不同的 `X-Agent-Revision-ID` | `409` | `pin_conflict` |
 | Resolver 已关闭 | `503` | `runtime_unavailable` |
 
@@ -234,7 +281,7 @@ CORS 预检允许 `Authorization`、`X-Tenant-ID`、`X-Agent-App-ID`、`X-Agent-
 
 - 管理操作审计：谁在什么时候创建了租户、发布了哪个 Revision，目前只有 Revision 上的 `created_by` 一个字段，没有独立、不可篡改、可查询的 Audit Store。
 - 静态 API Key 之外的凭据体系：JWT/OIDC、动态 RBAC、轮转、过期、撤销、按 Principal 的配额与限流。Security Manifest 只在启动时读一次，改文件必须重启进程。
-- PostgreSQL Repository、事务、分页和跨节点配置通知。
+- BackendProfile 列表以及 Tenant/App/Revision 查询都没有分页；跨节点配置通知尚未实现，Worker 目前在解析时读取 PostgreSQL 真相源，并依靠本进程缓存生命周期。
 - 跨进程 Session 目录：默认 profile 下 Pin 只在单进程内存中，多节点部署会各自 Pin；`postgres` profile 下 Pin 落库，这一条才不成立。
 - 主体间共享 Session、显式 Retire/Unpin（`Key.Epoch` 已预留但恒为 0）。Redis Run 租约已实现（见 [Session Run Lease](session-lease.md)），但它只做 Run 入口的合作型互斥，不做写入准入。
 - 权重灰度、白名单路由、Runtime TTL/LRU 淘汰和配置失效通知。
@@ -252,9 +299,9 @@ CORS 预检允许 `Authorization`、`X-Tenant-ID`、`X-Agent-App-ID`、`X-Agent-
 
 - **`base_url` 不是一项受 entitlement 约束的能力。** `secret_ref` 和 `policy_refs` 现在都要经过租户 entitlement（见 [安全与治理](security-and-governance.md) 第 6 节），但 Revision 指向哪个上游地址不受任何白名单约束。租户只能引用自己被授权的那些变量，却可以把解析出来的凭据发往它自己指定的 `base_url`。也就是说，entitlement 决定的是"哪个 Secret 会泄露给谁"，不是"会不会泄露"。
 - **`config_digest` 是不带密钥的 SHA-256。** 发布态 Revision 在构建 Runtime 时会重算并逐字节比对指纹，因此绕过 Admin 面直接改库会在下一次构建时被拒；但指纹的计算方式是公开的、无密钥的，一个既能改数据行、又能顺手重算指纹的写入方仍然可以把流量改道。这一条由 `agent.TestRuntimeDigestDoesNotDefendAgainstAWriterWhoCanRecomputeIt` 显式记录，不是遗漏。要真正封死需要签名（HMAC 或非对称签名），密钥不能与数据行同源。
-- **静态 Admin Key 没有轮转、过期和撤销。** 认证只回答"这个 Bearer 是不是清单里的某一条"，撤销一把 key 的唯一手段是改清单并重启进程。也没有管理操作审计：`created_by` 记录了是谁创建了 Revision，但没有独立的、不可篡改的操作流水。
+- **静态 Admin Key 没有轮转、过期和撤销。** 认证只回答"这个 Bearer 是不是清单里的某一条"，撤销一把 key 的唯一手段是改清单并重启进程。也没有管理操作审计：`created_by` 记录了是谁创建了 Revision 或 BackendProfile，但没有独立的、不可篡改的操作流水。
 - **Admin 面走明文 HTTP，只监听回环地址。** 传输层加密预期由反向代理提供；进程本身不做 TLS，也不校验来源网段之外的任何东西。把它暴露到回环之外时，前置代理是必须的，不是可选的。
-- **合法凭据可以制造无界内存 Session。** Session 目录和 Session Service 都在内存中，且没有配额或 TTL，一个持有有效 key 的调用方可以用无限多的 `X-Session-ID` 撑爆进程内存。
+- **合法凭据可以制造无界 Session。** Session 没有总量配额或清理 TTL，一个持有有效 key 的调用方可以使用无限多的 `X-Session-ID`；InMemory profile 消耗进程内存，PostgreSQL/Redis profile 则持续占用外部存储。
 - **首轮 OpenAI 历史可以伪造。** 平台只决定 Session 归属，不校验请求体里的 `messages`。新 Session 的第一轮里，调用方可以自行编造一段"历史对话"送进模型上下文。后续轮次会与服务端存储的 Session 事件合并，但首轮注入无法阻止。
 - **Adapter 拒绝的请求也会建立 Pin。** Session ID 和 Revision 在调用上游 Adapter 之前就已确定并写入响应头，因此一个 JSON 格式错误的首轮请求同样会把该 Session 钉在当时的 Revision 上。
 - **Tool 循环有轮数上限，没有总时长上限。** 每个 Run 最多执行 4 轮 tool calls，但慢模型、慢 Tool 或单轮大量并行 Tool 仍可能长期持有 Session Lease。结构化审计目前只写日志，不是持久化 Audit Store。

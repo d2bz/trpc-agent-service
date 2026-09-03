@@ -75,7 +75,20 @@ erDiagram
 
 Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 固定记录 `revision_id`。同一个 Session 默认沿用 `pinned_revision_id`；只有创建新 Session epoch、显式解除 Pin 或紧急安全回滚使 Pin 失效后，后续 Run 才重新选择 Revision。
 
-### 3.3 Channel Binding 与身份映射
+### 3.3 Backend Profile
+
+`backend_profiles` 保存租户可复用的 Session 存储配置。Profile ID 本身就是版本：同一 `(tenant_id, id)` 永远只对应一份内容，控制面只有 Create/Get/List，没有 Update/Delete；切换存储必须创建新 ID 并由新 Revision 引用。
+
+| 字段 | 说明 |
+| --- | --- |
+| `tenant_id/id` | 租户分区键与不可变 Profile 版本 |
+| `spec` | Session backend 与命名空间参数；连接信息只保存 `env:VAR_NAME` SecretRef |
+| `fingerprint` | 规范化 Profile JSON 的 SHA-256；每次读取重新计算并核验 |
+| `created_by/created_at` | 认证后的 Admin Principal 与创建时间 |
+
+每租户最多创建 32 个 Profile，以约束 Router 常驻连接池数量。创建 Profile、创建引用它的 Revision、发布该 Revision以及 Runtime 真正构建存储时，都会按租户检查 Profile 中的 SecretRef；只有最后一步解析环境变量并连接后端。PostgreSQL 表以 `(tenant_id, id)` 为主键并外键引用 `tenants`，内存实现也复用同一 Tenant Repository 作为写入门禁。
+
+### 3.4 Channel Binding 与身份映射
 
 `channel_bindings` 表示一个外部 IM 账号绑定到一个租户 Agent：
 
@@ -90,7 +103,7 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 
 `external_principals` 使用唯一键 `(tenant_id, channel_binding_id, principal_type, external_id_hash)`，把外部用户、群或会话映射为内部 `principal_id`。跨通道身份默认不自动合并。
 
-### 3.4 Session、Event 与 Summary
+### 3.5 Session、Event 与 Summary
 
 平台为每个 Session 保存目录信息，正文由租户选择的 tRPC-Agent-Go Session Backend 持久化：
 
@@ -124,14 +137,14 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 
 `session_summaries` 使用唯一键 `(tenant_id, session_id, filter_key, source_end_sequence, summary_version)`，其中 `source_end_sequence` 表示 Summary 覆盖到哪个 Event，防止旧任务覆盖新结果。
 
-### 3.5 Memory、Knowledge 与 Artifact
+### 3.6 Memory、Knowledge 与 Artifact
 
 - `memories`：记录 `tenant_id`、`agent_app_id`、`subject_type`、`subject_id`、正文/引用、提取来源、版本、向量引用、保留时间和状态。单聊通常以用户为 subject；群聊默认只写群共享 Memory，不读取个人私密 Memory。
 - `knowledge_bases`：保存租户、名称、Embedding 配置、Vector Backend、索引版本和状态。
 - `knowledge_documents`：保存源文件、内容摘要、解析版本、Embedding 版本、索引状态和 Artifact 引用。向量库只保存 chunk 和向量，源文档仍可用于重建索引。
 - `artifacts`：保存租户、对象键、内容类型、大小、摘要、加密/扫描状态、保留时间和访问策略。对象键必须以租户 ID 分区。
 
-### 3.6 Inbox、Run、Outbox 与 Audit
+### 3.7 Inbox、Run、Outbox 与 Audit
 
 `inbox_messages` 对入站消息建立持久幂等：
 
@@ -173,6 +186,9 @@ accepted → queued → running → succeeded
 ```sql
 CREATE UNIQUE INDEX uq_agent_revision_no
     ON agent_revisions (tenant_id, agent_app_id, revision_no);
+
+ALTER TABLE backend_profiles
+    ADD CONSTRAINT backend_profiles_pkey PRIMARY KEY (tenant_id, id);
 
 CREATE UNIQUE INDEX uq_channel_external_account
     ON channel_bindings (tenant_id, channel_type, external_account_id);

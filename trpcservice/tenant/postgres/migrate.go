@@ -95,6 +95,28 @@ var migrations = []string{
 			REFERENCES agent_apps (tenant_id, id),
 		CONSTRAINT agent_revisions_revision_no_check CHECK (revision_no > 0)
 	)`,
+
+	// Backend profiles are immutable: there is no UPDATE and no DELETE against
+	// this table anywhere in this package, and the id is the version. The
+	// columns reflect that — spec and fingerprint are written once, together,
+	// and read back as a pair so a row that was edited out of band is caught
+	// before a Runtime is built from it.
+	//
+	// The fingerprint is stored rather than only derived. It is not an
+	// authenticator, since anything able to edit the spec can edit the column
+	// beside it; it catches the accident — a partial restore, a manual UPDATE,
+	// a half-applied migration — which is the failure that actually happens.
+	`CREATE TABLE IF NOT EXISTS backend_profiles (
+		tenant_id   text        NOT NULL,
+		id          text        NOT NULL,
+		spec        jsonb       NOT NULL,
+		fingerprint text        NOT NULL,
+		created_by  text        NOT NULL,
+		created_at  timestamptz NOT NULL,
+		CONSTRAINT backend_profiles_pkey PRIMARY KEY (tenant_id, id),
+		CONSTRAINT backend_profiles_tenant_fkey FOREIGN KEY (tenant_id)
+			REFERENCES tenants (id)
+	)`,
 }
 
 // Migrate creates the control-plane tables if they are not already there.

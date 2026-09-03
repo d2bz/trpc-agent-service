@@ -17,10 +17,18 @@
 //     Router lease is a reference count. There is no ownership boolean and no
 //     close hook to pass around.
 //
-// What this package does not do, on purpose: it stores no profile of its own
-// (there is no CRUD here), it resolves no secret reference into a connection
-// string, and it evicts nothing. A profile that is built stays built until the
-// Router is closed.
+// Two things are concentrated here rather than spread across the callers.
+// Profiles are stored through one interface, ProfileRepository, whose in-memory
+// implementation lives in this package and whose PostgreSQL one lives beside
+// the tenant tables it is gated by — a profile cannot exist without a tenant,
+// and the foreign key is where that is said. And a credential reference becomes
+// a connection string in exactly one place, the Factory: the reference is
+// checked against the tenant's entitlements before the environment is read, and
+// the value never leaves the build — not in a Profile, not in a Bundle, and not
+// in an error.
+//
+// What this package does not do, on purpose: it evicts nothing. A profile that
+// is built stays built until the Router is closed.
 package storagebundle
 
 import (

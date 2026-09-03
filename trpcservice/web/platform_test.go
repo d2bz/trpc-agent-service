@@ -569,6 +569,7 @@ func TestPlatformRejectsRuntimeWithoutOpenAIHandler(t *testing.T) {
 	require.NoError(t, err)
 	server, err := NewPlatformServer(
 		repository,
+		newTestProfiles(t, repository),
 		runs,
 		newTestAuthenticator(t),
 		newTestAdminAuthenticator(t),
@@ -600,27 +601,32 @@ func TestNewPlatformServerRequiresEveryDependency(t *testing.T) {
 	authenticator := newTestAuthenticator(t)
 	admin := newTestAdminAuthenticator(t)
 	revisions := security.DenyCapabilities()
+	profiles := newTestProfiles(t, repository)
 
-	_, err = NewPlatformServer(nil, runs, authenticator, admin, revisions)
+	_, err = NewPlatformServer(nil, profiles, runs, authenticator, admin, revisions)
 	require.ErrorContains(t, err, "tenant repository is required")
+	// A control plane with a backend-profile route and nowhere to put a profile
+	// would accept a storage arrangement and lose it.
+	_, err = NewPlatformServer(repository, nil, runs, authenticator, admin, revisions)
+	require.ErrorContains(t, err, "backend profile repository is required")
 	// The lease, the pin and the Runtime now live behind one service, so this is
 	// the single check that stands where three used to. The dependencies it
 	// holds are checked where they are consumed; see
 	// TestNewServiceRequiresEveryDependency in the sessionrun package.
-	_, err = NewPlatformServer(repository, nil, authenticator, admin, revisions)
+	_, err = NewPlatformServer(repository, profiles, nil, authenticator, admin, revisions)
 	require.ErrorContains(t, err, "run service is required")
-	_, err = NewPlatformServer(repository, runs, nil, admin, revisions)
+	_, err = NewPlatformServer(repository, profiles, runs, nil, admin, revisions)
 	require.ErrorContains(t, err, "chat authenticator is required")
 	// A control plane with no way to authenticate is a control plane whose only
 	// protection is that nobody has found the port yet.
-	_, err = NewPlatformServer(repository, runs, authenticator, nil, revisions)
+	_, err = NewPlatformServer(repository, profiles, runs, authenticator, nil, revisions)
 	require.ErrorContains(t, err, "admin authenticator is required")
 	// And one with no opinion on which revisions may run would let every tenant
 	// name every capability the process can reach.
-	_, err = NewPlatformServer(repository, runs, authenticator, admin, nil)
+	_, err = NewPlatformServer(repository, profiles, runs, authenticator, admin, nil)
 	require.ErrorContains(t, err, "revision authorizer is required")
 
-	server, err := NewPlatformServer(repository, runs, authenticator, admin, revisions)
+	server, err := NewPlatformServer(repository, profiles, runs, authenticator, admin, revisions)
 	require.NoError(t, err)
 	require.NotNil(t, server.Handler())
 }
@@ -898,6 +904,7 @@ const chatPath = "/v1/chat/completions"
 type platformTestServer struct {
 	handler    http.Handler
 	repository tenant.Repository
+	profiles   storagebundle.ProfileRepository
 	resolver   *platformagent.RuntimeResolver
 	sessions   session.Service
 	directory  *sessiondir.MemoryDirectory
@@ -928,7 +935,13 @@ type platformTestOptions struct {
 	// revisions is the entitlement table. It is nil for the tests whose
 	// revisions name no capability at all, which then get the deny-everything
 	// authorizer rather than a permissive one.
-	revisions security.RevisionAuthorizer
+	revisions security.CapabilityAuthorizer
+
+	// profiles replaces the control plane's backend-profile storage. It is nil
+	// for the tests that never touch one, which then get a repository gated by
+	// the same tenant table the rest of the platform runs on — the same wiring
+	// the binary uses under the inmemory profile.
+	profiles storagebundle.ProfileRepository
 
 	// repository replaces the in-memory control plane. It exists so a test can
 	// prove that a refusal happened *before* the repository, by handing the
@@ -1036,22 +1049,43 @@ func newPlatformTestServerWith(
 	if revisions == nil {
 		revisions = security.DenyCapabilities()
 	}
+	profiles := opts.profiles
+	if profiles == nil {
+		profiles = newTestProfiles(t, repository)
+	}
 	runs, err := sessionrun.NewService(resolver, chat, coordinator)
 	require.NoError(t, err)
 	server, err := NewPlatformServer(
-		repository, runs, newTestAuthenticator(t), newTestAdminAuthenticator(t),
+		repository, profiles, runs, newTestAuthenticator(t), newTestAdminAuthenticator(t),
 		revisions,
 	)
 	require.NoError(t, err)
 	return &platformTestServer{
 		handler:    server.Handler(),
 		repository: repository,
+		profiles:   profiles,
 		resolver:   resolver,
 		sessions:   sessionService,
 		directory:  directory,
 		leases:     coordinator,
 		leaseStore: store,
 	}
+}
+
+// newTestProfiles is the profile storage the platform runs on when a test does
+// not supply its own: an in-memory repository gated by the same tenant table,
+// which is exactly how the binary wires the inmemory profile.
+//
+// It is a function rather than a field default so that every server gets its
+// own, and a test that seeds a profile cannot leak it into the next one.
+func newTestProfiles(
+	t *testing.T,
+	tenants storagebundle.TenantGate,
+) storagebundle.ProfileRepository {
+	t.Helper()
+	profiles, err := storagebundle.NewMemoryProfileRepository(tenants)
+	require.NoError(t, err)
+	return profiles
 }
 
 // newTestAdminAuthenticator grants the three control-plane roles these tests

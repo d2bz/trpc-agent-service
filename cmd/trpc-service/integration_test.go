@@ -54,6 +54,18 @@ const (
 	// here than elsewhere: upstream creates its six session tables but never
 	// drops them.
 	schemaPrefix = "trpc_service_boot_"
+
+	// profileSchemaPrefix is the same thing, shorter, for the tests that put a
+	// tenant's own tables in the schema beside the platform's.
+	//
+	// The length is the reason it exists. Upstream builds its index names as
+	// "idx_<schema>_<prefix>_<table>_<suffix>" and PostgreSQL truncates an
+	// identifier at 63 bytes, so a schema and a table prefix have 26 characters
+	// between them — see sessionbackend.validateGeneratedIndexNames. A schema
+	// named with schemaPrefix is 26 on its own and leaves a table prefix
+	// nothing, which is a property of the fixture rather than of the code under
+	// test.
+	profileSchemaPrefix = "trpc_bp_"
 )
 
 func requireIntegration(t *testing.T) string {
@@ -92,15 +104,22 @@ func quoteIdentifier(name string) string {
 }
 
 // createSchema makes an empty schema and schedules its removal.
+func createSchema(t *testing.T, dsn string) string {
+	t.Helper()
+	return createSchemaNamed(t, dsn, schemaPrefix)
+}
+
+// createSchemaNamed is createSchema with the namespace chosen by the caller,
+// for tests whose schema name has to leave room for something else.
 //
 // Cleanup order matters and is LIFO. The admin pool is registered first so it
 // closes last, and the drop is registered second so it runs after every stack
 // the test opened has been closed — DROP SCHEMA never waits on a live
 // connection. CASCADE is what removes the upstream session tables, which
 // nothing else drops.
-func createSchema(t *testing.T, dsn string) string {
+func createSchemaNamed(t *testing.T, dsn, prefix string) string {
 	t.Helper()
-	schema := schemaPrefix + uuid.New().String()[:8]
+	schema := prefix + uuid.New().String()[:8]
 
 	config, err := pgxpool.ParseConfig(dsn)
 	require.NoError(t, err)
@@ -138,16 +157,7 @@ func createSchema(t *testing.T, dsn string) string {
 // hand-assembled stack would hide.
 func bootstrap(t *testing.T, dsn, schema string) *storageStack {
 	t.Helper()
-	// In-memory coordination: this test restarts one process against one schema,
-	// so there is no second Worker to coordinate with, and the whole file has to
-	// keep running with nothing but PostgreSQL available. The redis backend has
-	// its own gated suite.
-	cfg := storageConfig{
-		profile:      profilePostgres,
-		dsn:          dsn,
-		schema:       schema,
-		coordination: coordinationInMemory,
-	}
+	cfg := bootstrapConfig(dsn, schema)
 	require.NoError(t, cfg.validate())
 
 	ctx, cancel := setupContext()
@@ -157,6 +167,25 @@ func bootstrap(t *testing.T, dsn, schema string) *storageStack {
 	require.NotNil(t, stack)
 	t.Cleanup(func() { require.NoError(t, stack.close()) })
 	return stack
+}
+
+// bootstrapConfig is the configuration every stack in these gated tests boots
+// from. It is a function rather than a literal inside bootstrap because a
+// runtime stack opened over one of these stacks has to derive its process
+// constraints from the same value: a second literal would let the two drift,
+// and the drift would silently change which backends a tenant profile may name.
+//
+// In-memory coordination: these tests restart one process against one schema,
+// so there is no second Worker to coordinate with, and this file has to keep
+// running with nothing but PostgreSQL available. The redis backend has its own
+// gated suite.
+func bootstrapConfig(dsn, schema string) storageConfig {
+	return storageConfig{
+		profile:      profilePostgres,
+		dsn:          dsn,
+		schema:       schema,
+		coordination: coordinationInMemory,
+	}
 }
 
 // TestIntegrationBootstrapCreatesEverySchemaItNeeds proves the profile is

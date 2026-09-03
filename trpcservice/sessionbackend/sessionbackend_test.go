@@ -202,7 +202,7 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 			cfg: Config{Backend: BackendPostgres, Postgres: PostgresConfig{
 				DSN: "postgres://u:p@127.0.0.1:55432/db", TablePrefix: strings.Repeat("a", maxNamespaceLen+1),
 			}},
-			want: "postgres table prefix is 33 characters",
+			want: "postgres table prefix is too long (max 32 characters)",
 		},
 		"schema with a space": {
 			cfg: Config{Backend: BackendPostgres, Postgres: PostgresConfig{
@@ -226,7 +226,16 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 			cfg: Config{Backend: BackendRedis, Redis: RedisConfig{
 				URL: "redis://127.0.0.1:56379/0", KeyPrefix: strings.Repeat("k", maxNamespaceLen+1),
 			}},
-			want: "redis key prefix is 33 characters",
+			want: "redis key prefix is too long (max 32 characters)",
+		},
+		// Each of these passes the per-field limit and fails the joint one:
+		// upstream spends both namespaces in one generated index name.
+		"schema and table prefix too long together": {
+			cfg: Config{Backend: BackendPostgres, Postgres: PostgresConfig{
+				DSN:    "postgres://u:p@127.0.0.1:55432/db",
+				Schema: strings.Repeat("s", 20), TablePrefix: strings.Repeat("p", 20),
+			}},
+			want: "postgres schema and table prefix are too long together",
 		},
 	}
 	for name, tc := range cases {
@@ -242,6 +251,185 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 			require.Error(t, err)
 			require.ErrorIs(t, err, ErrInvalidConfig)
 			require.Nil(t, service)
+		})
+	}
+}
+
+// longestUpstreamIndexTail returns the longest "<table>_<suffix>" pair in the
+// index set upstream's postgres migration creates.
+//
+// The set is restated here because it lives in an internal package this module
+// cannot import. That restatement is the risk the two tests below exist to
+// bound: the joint length check is arithmetic against upstream's naming rule,
+// and arithmetic against a rule nobody can import goes stale silently.
+func longestUpstreamIndexTail() string {
+	pairs := []struct{ table, suffix string }{
+		{"session_states", "unique_active"},
+		{"session_states", "expires"},
+		{"session_events", "lookup"},
+		{"session_events", "expires"},
+		{"session_track_events", "lookup"},
+		{"session_track_events", "expires"},
+		{"session_summaries", "unique_active"},
+		{"session_summaries", "expires"},
+		{"app_states", "unique_active"},
+		{"app_states", "expires"},
+		{"user_states", "unique_active"},
+		{"user_states", "expires"},
+	}
+	longest := ""
+	for _, pair := range pairs {
+		if tail := pair.table + "_" + pair.suffix; len(tail) > len(longest) {
+			longest = tail
+		}
+	}
+	return longest
+}
+
+// The constant the joint bound is computed from has to be the worst case, or
+// the bound is too generous and lets through exactly the config it exists to
+// refuse.
+func TestLongestGeneratedIndexTailIsTheWorstCaseUpstreamBuilds(t *testing.T) {
+	require.Equal(t, longestUpstreamIndexTail(), longestGeneratedIndexTail)
+	require.Equal(t, 63, maxIdentifierLen, "PostgreSQL's NAMEDATALEN-1")
+}
+
+// The joint bound is exact, so both sides of it are asserted. One character
+// under is a deployment that works and must not be refused; one character over
+// is the fault, and it is worth restating what that fault is, because it is not
+// a failed statement:
+//
+// upstream builds "idx_<schema>_<prefix>_<table>_<suffix>" and never measures
+// it. PostgreSQL truncates a name over 63 bytes to 63 bytes with a NOTICE, so
+// CREATE INDEX succeeds under a shortened name; upstream then verifies the name
+// it asked for, does not find it, and fails the whole constructor. Against a
+// tenant profile that is worse than a rejected request, because the profile is
+// immutable: the id is spent and can never produce a Bundle.
+func TestValidateBoundsSchemaAndTablePrefixTogether(t *testing.T) {
+	const dsn = "postgres://u:p@127.0.0.1:55432/db"
+
+	// The name upstream generates from the two namespaces, so the test measures
+	// the same string PostgreSQL would.
+	indexName := func(schema, prefix string) string {
+		name := longestGeneratedIndexTail
+		if prefix != "" {
+			name = prefix + "_" + name
+		}
+		if schema != "" {
+			name = schema + "_" + name
+		}
+		return "idx_" + name
+	}
+	postgres := func(schema, prefix string) Config {
+		return Config{Backend: BackendPostgres, Postgres: PostgresConfig{
+			DSN: dsn, Schema: schema, TablePrefix: prefix,
+		}}
+	}
+
+	t.Run("both namespaces", func(t *testing.T) {
+		// 63 - len("idx_") - 2 separators - len(the longest tail).
+		const budget = 26
+		schema, prefix := strings.Repeat("s", 13), strings.Repeat("p", budget-13)
+
+		require.Len(t, indexName(schema, prefix), maxIdentifierLen,
+			"the fit changed; this test no longer sits on the boundary")
+		require.NoError(t, postgres(schema, prefix).Validate(),
+			"a name that fits exactly is a working deployment")
+
+		over := prefix + "p"
+		require.Len(t, indexName(schema, over), maxIdentifierLen+1)
+		err := postgres(schema, over).Validate()
+		require.ErrorIs(t, err, ErrInvalidConfig)
+		require.Contains(t, err.Error(), "max 26 characters between them")
+		require.NotContains(t, err.Error(), schema, "the error echoes a tenant-supplied value")
+		require.NotContains(t, err.Error(), over, "the error echoes a tenant-supplied value")
+	})
+
+	// The schema-only case is this process's own store, which names a schema and
+	// no prefix. It has one character more to spend, and the per-field limit of
+	// 32 is above it — so a 28-character schema passes every other check in this
+	// package and still breaks the constructor.
+	t.Run("schema only", func(t *testing.T) {
+		const budget = 27
+		schema := strings.Repeat("s", budget)
+		require.Len(t, indexName(schema, ""), maxIdentifierLen)
+		require.NoError(t, postgres(schema, "").Validate())
+
+		over := schema + "s"
+		require.Less(t, len(over), maxNamespaceLen+1, "this case must clear the per-field limit")
+		err := postgres(over, "").Validate()
+		require.ErrorIs(t, err, ErrInvalidConfig)
+		require.Contains(t, err.Error(), "max 27 characters between them")
+	})
+
+	// A trailing underscore is upstream's separator, not part of the prefix, so
+	// it must not be counted twice.
+	t.Run("a trailing underscore is not spent twice", func(t *testing.T) {
+		const budget = 26
+		schema, prefix := strings.Repeat("s", 13), strings.Repeat("p", budget-13)
+		require.NoError(t, postgres(schema, prefix+"_").Validate())
+	})
+}
+
+// These fields are filled from a tenant's storage profile and their refusal is
+// answered to an admin API caller as a 400. An operator who pastes a DSN, a URL
+// or a password into the wrong field must not read it back out of the error:
+// that body reaches an access log, a proxy trace and a bug report, and the
+// caller already knows what they sent.
+func TestValidateNeverEchoesTheRejectedValue(t *testing.T) {
+	const pasted = "postgres://admin:hunter2@db.internal:5432/sessions"
+
+	for name, cfg := range map[string]Config{
+		"pasted into the table prefix": {
+			Backend: BackendPostgres,
+			Postgres: PostgresConfig{
+				DSN: "postgres://u:p@127.0.0.1:55432/db", TablePrefix: pasted,
+			},
+		},
+		"pasted into the schema": {
+			Backend: BackendPostgres,
+			Postgres: PostgresConfig{
+				DSN: "postgres://u:p@127.0.0.1:55432/db", Schema: pasted,
+			},
+		},
+		"pasted into the key prefix": {
+			Backend: BackendRedis,
+			Redis: RedisConfig{
+				URL: "redis://127.0.0.1:56379/0", KeyPrefix: pasted,
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := cfg.Validate()
+			require.ErrorIs(t, err, ErrInvalidConfig)
+			require.NotContains(t, err.Error(), pasted)
+			require.NotContains(t, err.Error(), "hunter2")
+			// Still says which field broke which rule, or the caller cannot fix
+			// the request.
+			require.Regexp(t, `(table prefix|schema|key prefix)`, err.Error())
+		})
+	}
+
+	// A value short enough to reach the pattern check rather than the length
+	// check takes the other branch, and must not echo either.
+	for name, cfg := range map[string]Config{
+		"short secret in the schema": {
+			Backend: BackendPostgres,
+			Postgres: PostgresConfig{
+				DSN: "postgres://u:p@127.0.0.1:55432/db", Schema: "hunter2!",
+			},
+		},
+		"short secret in the key prefix": {
+			Backend: BackendRedis,
+			Redis: RedisConfig{
+				URL: "redis://127.0.0.1:56379/0", KeyPrefix: "hunter2 ",
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := cfg.Validate()
+			require.ErrorIs(t, err, ErrInvalidConfig)
+			require.NotContains(t, err.Error(), "hunter2")
 		})
 	}
 }

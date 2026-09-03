@@ -229,7 +229,7 @@ func newWorker(
 	runs, err := sessionrun.NewService(resolver, directory, leases)
 	require.NoError(t, err)
 	api, err := web.NewPlatformServer(
-		stack.repository, runs, authenticator, adminAuthenticator,
+		stack.repository, stack.profiles, runs, authenticator, adminAuthenticator,
 		security.DenyCapabilities(),
 	)
 	require.NoError(t, err)

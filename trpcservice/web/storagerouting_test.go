@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storagebundle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
@@ -73,24 +74,48 @@ func TestAdminRefusesAMalformedBackendProfileID(t *testing.T) {
 		adminHeaders(adminKeyTenantA), http.StatusNotFound)
 }
 
-// A well-formed profile id is control-plane data, so it is created and published
-// like any other field — and then the data plane decides whether this process
-// can honour it.
+// The control plane accepts a profile and a revision that names it; the data
+// plane then decides whether this process can actually run it.
 //
-// This process cannot: it runs the production source, which has no profiles at
-// all. What the caller gets is the same "revision is not available" it gets for
-// an unpublished or un-entitled revision, with nothing in it about profiles,
-// storage, or which of the three it was. A chat client named no profile; a
-// revision did, and which storage a revision runs on is platform configuration
-// the caller does not administer.
+// This process cannot. Its session pins live in memory, so a durable tenant
+// profile would keep the conversation and lose the revision it was pinned to,
+// and the Factory refuses it. What the caller gets is the same "revision is not
+// available" it gets for an unpublished or un-entitled revision, with nothing in
+// it about profiles, storage, or which of the three it was. A chat client named
+// no profile; a revision did, and which storage a revision runs on is platform
+// configuration the caller does not administer.
+//
+// The Router here resolves through the same repository the Admin API wrote to,
+// which is how the binary wires it. That is what makes this a data-plane refusal
+// of a profile that really exists rather than a control plane that has no
+// profile storage at all.
 func TestPlatformRefusesARevisionNamingAProfileThisProcessCannotServe(t *testing.T) {
 	const profileID = "tenant-a-postgres"
+	const dsnRef = "env:TENANT_A_SESSION_DSN"
+
+	repository := tenant.NewMemoryRepository()
+	profiles := newTestProfiles(t, repository)
 	platform := newPlatformTestServerWith(t, platformTestOptions{
-		stores: productionRouter(t),
+		repository: repository,
+		profiles:   profiles,
+		revisions: mustEntitle(t, security.Grant{
+			TenantID:   "tenant-a",
+			SecretRefs: []string{dsnRef},
+		}),
+		stores: productionRouter(t, profiles),
 	})
 	seedTenantAndApp(t, platform.handler, "tenant-a", appAssistant)
 
-	// Created and published: the control plane accepts the reference.
+	// The control plane accepts the profile: it is well formed, and this tenant
+	// is entitled to the credential it names.
+	requireStatus(
+		t, platform.handler, http.MethodPost,
+		"/admin/v1/tenants/tenant-a/backend-profiles",
+		fmt.Sprintf(`{"id":%q,"session":{"backend":"postgres","postgres":{"dsn_ref":%q}}}`,
+			profileID, dsnRef),
+		adminHeaders(adminKeyTenantA), http.StatusCreated,
+	)
+	// And the revision that names it, which is created and published.
 	requireStatus(
 		t, platform.handler, http.MethodPost,
 		"/admin/v1/tenants/tenant-a/apps/assistant/revisions",
@@ -129,7 +154,8 @@ func TestPlatformRefusesARevisionNamingAProfileThisProcessCannotServe(t *testing
 // next request reaches a different one or none. Neither carries a retry hint
 // this process is in any position to give.
 func TestPlatformReportsAClosedStorageRouterAsUnavailable(t *testing.T) {
-	router := productionRouter(t)
+	// No profiles: this revision names none, so nothing is ever resolved.
+	router := productionRouter(t, storagebundle.NoProfiles())
 	platform := newPlatformTestServerWith(t, platformTestOptions{stores: router})
 	seedTenantAppRevision(t, platform.handler, "tenant-a", appAssistant, "revision-1", 1, "echo-v1")
 
@@ -295,21 +321,40 @@ func TestStorageRefusalsAreIndistinguishableFromOtherRevisionRefusals(t *testing
 	require.Contains(t, unpublished.Body.String(), `"code":"revision_unavailable"`)
 }
 
-// productionRouter is the storage arrangement the binary boots with: one process
-// default, no dynamic profiles, and the session factory this slice ships.
+// productionRouter is the storage arrangement the binary boots with under the
+// inmemory profile: one process default, the tenant profiles source it is
+// given, and the session factory openRuntimeStack builds.
 //
 // Its Close is registered here, before the caller builds a platform around it,
 // so the resolver's own Cleanup — registered later and therefore run first —
 // has already released every lease by the time this one waits for them.
-func productionRouter(t *testing.T) *storagebundle.Router {
+func productionRouter(t *testing.T, source storagebundle.ProfileSource) *storagebundle.Router {
 	t.Helper()
 	sessions := sessioninmemory.NewSessionService()
 	t.Cleanup(func() { require.NoError(t, sessions.Close()) })
 
+	factory, err := storagebundle.NewSessionFactory(storagebundle.FactoryOptions{
+		// The zero value is this process: in-memory pins, one Worker. A durable
+		// tenant profile is therefore refused, which is the case these tests are
+		// about.
+		Constraints: storagebundle.ProcessConstraints{},
+		// Entitling nothing, and an environment that fails the test if it is
+		// read. Neither is reached: the constraint above refuses a durable
+		// backend before a reference is authorized and before a variable is
+		// looked up, and wiring both as tripwires is what makes that observable
+		// rather than assumed.
+		Secrets: security.DenyCapabilities(),
+		Getenv: func(name string) string {
+			t.Errorf("the session factory read environment variable %q", name)
+			return ""
+		},
+	})
+	require.NoError(t, err)
+
 	router, err := storagebundle.NewRouter(storagebundle.Options{
 		Default: storagebundle.Bundle{Session: sessions},
-		Source:  storagebundle.NoProfiles(),
-		Factory: storagebundle.NewSessionFactory(storagebundle.ProcessConstraints{}),
+		Source:  source,
+		Factory: factory,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, router.Close()) })

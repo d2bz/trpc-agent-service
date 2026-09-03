@@ -96,6 +96,8 @@ const (
 	constraintRevisionsPrimaryKey = "agent_revisions_pkey"
 	constraintRevisionsRevisionNo = "agent_revisions_revision_no_key"
 	constraintRevisionsAgentApp   = "agent_revisions_agent_app_fkey"
+	constraintProfilesPrimaryKey  = "backend_profiles_pkey"
+	constraintProfilesTenant      = "backend_profiles_tenant_fkey"
 )
 
 // defaultRouteWeight is the whole-traffic weight a publish writes into the

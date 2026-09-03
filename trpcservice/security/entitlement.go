@@ -1,12 +1,15 @@
 // Package security loads the process security configuration and answers the
-// one authorization question the data plane asks of it: may this revision use
-// the capabilities it names?
+// one authorization question every trust boundary in the process asks of it:
+// may this tenant use the capabilities its configuration names? The
+// configuration is a revision config at one boundary and a backend storage
+// profile at another, and both are answered from one table — a second table
+// would be a gap to entitle a credential through.
 //
 // The package is deliberately small and static. It has no RBAC engine, no
 // schema language and no hot reload: the manifest is read once at startup,
 // validated as a whole, and turned into three values — a chat authenticator, an
-// admin authenticator and a RevisionAuthorizer — that never change for the life
-// of the process.
+// admin authenticator and a CapabilityAuthorizer — that never change for the
+// life of the process.
 package security
 
 import (
@@ -18,15 +21,19 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
-// ErrNotEntitled reports a revision naming a capability its tenant is not
-// entitled to.
+// ErrNotEntitled reports a configuration naming a capability its tenant is not
+// entitled to. The configuration is a revision config or a backend storage
+// profile, and the sentinel does not say which: one message covers both
+// questions this package answers, because wording that told a revision's
+// refusal from a profile's would be a difference a caller could measure.
 //
 // It is a single sentinel with a single message, and the message names neither
 // the rejected reference nor anything about it. That is the whole point of the
 // check: a caller who could tell "unknown policy" from "known but not yours",
 // or "this env var exists" from "it does not", would have a probe for the tool
 // registry and the process environment built out of nothing but refusals.
-var ErrNotEntitled = errors.New("security: revision is not entitled to a referenced capability")
+var ErrNotEntitled = errors.New(
+	"security: configuration is not entitled to a referenced capability")
 
 // RevisionAuthorizer decides whether a revision may use the capabilities its
 // config names. It is consulted before the tool registry and before any secret
@@ -41,6 +48,33 @@ type RevisionAuthorizer interface {
 	// config that names no secret and no policy needs no entitlement and is
 	// always allowed.
 	AuthorizeRevision(tenantID string, config tenant.RevisionConfig) error
+}
+
+// SecretRefAuthorizer decides whether a tenant may name one secret reference
+// outside a revision config.
+//
+// A revision is not the only thing that can name a credential: a backend
+// storage profile names the reference holding its database DSN or its Redis
+// URL, and that reference has to go through the same table, by the same exact
+// string, as a model key would. Without this the profile would be an
+// unentitled second channel to the process environment — one tenant naming
+// another tenant's variable and getting a working connection out of it.
+type SecretRefAuthorizer interface {
+	// AuthorizeSecretRef reports whether tenantID may name ref. An empty
+	// reference is never entitled: there is no capability to grant, and the
+	// caller that asked has a reference it should have rejected earlier.
+	AuthorizeSecretRef(tenantID string, ref string) error
+}
+
+// CapabilityAuthorizer answers both capability questions the control plane
+// asks. It is the interface the admin API, the runtime builder and the storage
+// factory are wired with, so all of them consult one table: a process that
+// answered "may this revision run" from one value and "may this tenant name
+// this DSN" from another could entitle a credential through the gap between
+// them.
+type CapabilityAuthorizer interface {
+	RevisionAuthorizer
+	SecretRefAuthorizer
 }
 
 // Entitlements is the process entitlement table: which secret references and
@@ -148,6 +182,10 @@ func quoteID(id string) string {
 // explicit to pass. A revision that names no secret_ref and no policy_refs
 // still runs under it, which is exactly the set of revisions that need no
 // entitlement to begin with.
+//
+// A backend profile that names no credential is stored under it for the same
+// reason, but that decision is not made here: AuthorizeSecretRef has no empty
+// case, so a profile with nothing to check is one its caller never asks about.
 func DenyCapabilities() *Entitlements {
 	return &Entitlements{}
 }
@@ -174,19 +212,44 @@ func (e *Entitlements) AuthorizeRevision(
 	if config.Model.SecretRef == "" && len(config.PolicyRefs) == 0 {
 		return nil
 	}
+	if config.Model.SecretRef != "" {
+		if err := e.AuthorizeSecretRef(tenantID, config.Model.SecretRef); err != nil {
+			return err
+		}
+	}
 	// Looked up after the empty case, so a tenant that has no entitlements at
 	// all is refused by the same path — and with the same error — as a tenant
 	// that has some but not this one.
 	granted := e.byTenant[tenantID]
-	if config.Model.SecretRef != "" {
-		if _, allowed := granted.secretRefs[config.Model.SecretRef]; !allowed {
-			return ErrNotEntitled
-		}
-	}
 	for _, ref := range config.PolicyRefs {
 		if _, allowed := granted.policyRefs[ref]; !allowed {
 			return ErrNotEntitled
 		}
+	}
+	return nil
+}
+
+// AuthorizeSecretRef implements SecretRefAuthorizer.
+//
+// It is the same lookup AuthorizeRevision makes for a model key, against the
+// same per-tenant table, by the same exact string — which is the point. The
+// reserved-namespace rule and the platform-credential rule are enforced when
+// the table is built, so no reference that reaches this map can name one of
+// this process's own credentials however it was spelled.
+//
+// There is no empty case here. A revision that names nothing is asking for
+// nothing, but an empty reference handed to this method is a caller that
+// validated too little, and answering "allowed" would turn that mistake into
+// an entitlement.
+func (e *Entitlements) AuthorizeSecretRef(tenantID string, ref string) error {
+	if e == nil || ref == "" {
+		// A nil table entitles nothing, and says so the same way a populated one
+		// would, so a caller that forgot to build the table cannot accidentally
+		// get the permissive answer.
+		return ErrNotEntitled
+	}
+	if _, allowed := e.byTenant[tenantID].secretRefs[ref]; !allowed {
+		return ErrNotEntitled
 	}
 	return nil
 }
