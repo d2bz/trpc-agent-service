@@ -18,6 +18,7 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
@@ -143,14 +144,21 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 	}
 	defer func() { err = errors.Join(err, resolver.Close()) }()
 
+	// One run service for the whole process. HTTP is its first caller and the IM
+	// channels will be the next; the lease, the pin and the Runtime lease are
+	// sequenced here once, so a second entry point cannot sequence them
+	// differently.
+	runs, err := sessionrun.NewService(resolver, stack.directory, stack.coordinator)
+	if err != nil {
+		return err
+	}
+
 	api, err := web.NewPlatformServer(
 		stack.repository,
-		resolver,
+		runs,
 		securityCfg.Chat,
 		securityCfg.Admin,
 		securityCfg.Revisions,
-		stack.directory,
-		stack.coordinator,
 	)
 	if err != nil {
 		return err

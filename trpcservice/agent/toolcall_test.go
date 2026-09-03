@@ -63,12 +63,15 @@ func TestToolCallRoundTripReachesTheModelAndTheClient(t *testing.T) {
 	require.Equal(t, "pong", decodeToolResult(t, results["call-echo-1"])["text"])
 
 	// The trail sees both calls from both sides, under the trusted scope of the
-	// authenticated request rather than anything in the body.
+	// authenticated request rather than anything in the body — including the
+	// platform request id, which arrives here the same way the rest of the scope
+	// does: read off the run context, through a real tool call, not passed in.
 	events := sink.recorded()
 	require.Len(t, events, 4)
 	for _, event := range events {
 		require.True(t, event.ScopeValid, "%+v", event)
 		require.Equal(t, servicetool.AuditScope{
+			RequestID:   "request-1",
 			TenantID:    "tenant-a",
 			AppID:       "assistant",
 			PrincipalID: "principal-1",

@@ -19,6 +19,20 @@ const userIDPrefix = "u/"
 // platform writes it once, before any protocol adapter sees the request, and
 // everything downstream reads identity from here instead of from the payload.
 type RunContext struct {
+	// RequestID is the platform's own identifier for this run, minted at the
+	// entry layer. It is never read from a client: it labels the framework
+	// events of the run and the tool audit records it produces, so a value the
+	// caller chose would let one caller file its traffic under another's
+	// identifier — or under none, by sending an empty one.
+	//
+	// Those two are the whole of what it reaches today. Carrying it into request
+	// logging and traces is a separate piece of work; this field is what that
+	// work will read, not evidence that it has happened.
+	//
+	// It is required rather than optional. A scope carrying no request id is a
+	// run nothing downstream can be correlated with, and "sometimes present"
+	// is the property that makes a correlation id useless.
+	RequestID   string
 	TenantID    string
 	AppID       string
 	PrincipalID string
@@ -29,6 +43,9 @@ type RunContext struct {
 // Validate rejects a scope that cannot address exactly one conversation of one
 // revision.
 func (c RunContext) Validate() error {
+	if err := tenant.ValidateResourceID("request id", c.RequestID); err != nil {
+		return err
+	}
 	if err := tenant.ValidateResourceID("tenant id", c.TenantID); err != nil {
 		return err
 	}

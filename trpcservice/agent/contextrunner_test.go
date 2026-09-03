@@ -16,6 +16,7 @@ import (
 
 func testRunContext() identity.RunContext {
 	return identity.RunContext{
+		RequestID:   "request-1",
 		TenantID:    "tenant-a",
 		AppID:       "assistant",
 		PrincipalID: "principal-1",
@@ -110,6 +111,117 @@ func TestContextRunnerIgnoresProtocolSuppliedIdentity(t *testing.T) {
 	}}, inner.recorded())
 }
 
+// Whatever run options arrive, the run ends up labelled with the platform's id.
+//
+// Two upstream facts make this the wrapper's job. The OpenAI adapter does not
+// mint a request id at all: buildRunOptions (server/openai/run_input.go) only
+// assembles history, the tool-result rewriter and external tools. The Runner
+// then generates one itself — `ro := agent.RunOptions{RequestID: uuid.NewString()}`
+// before it applies the options, and a second uuid afterwards if an option left
+// it empty (runner/runner.go:546-552). So without this wrapper every run would
+// carry a fresh random id that nothing outside the framework has ever seen.
+//
+// The mechanism is positional: options are applied in order and the last write
+// wins, so appending the platform id after everything the caller passed
+// overwrites both the Runner's seed and any id a caller supplied. The
+// "caller's own" cases below are not something the adapter does today — they
+// are the property being relied on, asserted directly.
+func TestContextRunnerForcesThePlatformRequestID(t *testing.T) {
+	for name, options := range map[string][]trpcagent.RunOption{
+		"no options":     nil,
+		"caller's own":   {trpcagent.WithRequestID("caller-minted")},
+		"empty override": {trpcagent.WithRequestID("")},
+		"last word": {
+			trpcagent.WithRequestID("first"),
+			trpcagent.WithRequestID("last"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inner := &recordingRunner{}
+			wrapper := testContextRunner(inner)
+			ctx, err := identity.WithRunContext(context.Background(), testRunContext())
+			require.NoError(t, err)
+
+			events, err := wrapper.Run(ctx, "", "", model.NewUserMessage("hello"), options...)
+			require.NoError(t, err)
+			for range events {
+			}
+			require.Equal(t, []string{"request-1"}, inner.requestIDs())
+		})
+	}
+}
+
+// The caller's own option slice must come back unchanged. Appending to it would
+// write into an array the caller still owns whenever it had spare capacity, so
+// the next run through the same slice would carry this run's id.
+func TestTrustedRunOptionsDoesNotWriteIntoTheCallersSlice(t *testing.T) {
+	callers := make([]trpcagent.RunOption, 1, 4)
+	callers[0] = trpcagent.WithRequestID("caller-minted")
+
+	trusted := TrustedRunOptions(testRunContext(), callers)
+	require.Len(t, callers, 1)
+	require.Len(t, trusted, 2)
+	require.Equal(t, "request-1", resolvedRequestID(trusted))
+	// The caller's slice still resolves to the caller's id: nothing was written
+	// past its length.
+	require.Equal(t, "caller-minted", resolvedRequestID(callers))
+	// And the spare capacity was not used as scratch space. This has to read the
+	// backing array directly: re-slicing back to length 1 would only re-check
+	// the element already checked above, and the element that an append into the
+	// caller's array would have overwritten is the one at index 1.
+	require.Nil(t, callers[:cap(callers)][1])
+}
+
+// A trusted scope always carries a request id — identity.RunContext validates
+// it — so this is the whole of the option's contract.
+func resolvedRequestID(options []trpcagent.RunOption) string {
+	var resolved trpcagent.RunOptions
+	for _, option := range options {
+		option(&resolved)
+	}
+	return resolved.RequestID
+}
+
+// The platform request id has to reach the framework Events, not merely the
+// RunOptions. The Events are where the id becomes observable — they are what a
+// caller quoting an X-Request-ID is quoting, and the same scope is what the tool
+// audit trail reads its request id from. Nothing beyond those two consumes it
+// yet; request logging and traces are separate work.
+func TestContextRunnerRequestIDReachesTheFrameworkEvents(t *testing.T) {
+	shared := sessioninmemory.NewSessionService()
+	t.Cleanup(func() { require.NoError(t, shared.Close()) })
+	revision := publishedRevision("revision-1", "echo-v1")
+	runtime, err := NewRuntimeFromRevision(revision, shared, entitling(t, revision))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, runtime.Close()) })
+
+	scope := testRunContext()
+	scope.AppID = runtime.AgentAppID
+	scope.TenantID = runtime.TenantID
+	scope.RevisionID = runtime.RevisionID
+	ctx, err := identity.WithRunContext(context.Background(), scope)
+	require.NoError(t, err)
+
+	// Untrusted identity arguments, as a protocol adapter supplies them, plus a
+	// request id the adapter itself would never send — the strongest input,
+	// since it is the one the wrapper has to overwrite rather than merely fill.
+	events, err := runtime.protocolRunner.Run(
+		ctx,
+		"attacker",
+		"attacker-session",
+		model.NewUserMessage("hello"),
+		trpcagent.WithRequestID("caller-minted"),
+	)
+	require.NoError(t, err)
+
+	seen := 0
+	for received := range events {
+		seen++
+		require.Equal(t, scope.RequestID, received.RequestID)
+	}
+	require.NotZero(t, seen, "the run produced no events to correlate")
+}
+
 // The Runtime owns the real Runner. An adapter that closed its injected Runner
 // must not reach it.
 func TestContextRunnerCloseDoesNotCloseInnerRunner(t *testing.T) {
@@ -177,10 +289,11 @@ type recordedRun struct {
 }
 
 // recordingRunner stands in for the real Runner so a test can read back the
-// identity arguments the wrapper produced.
+// identity arguments and the run options the wrapper produced.
 type recordingRunner struct {
 	mu         sync.Mutex
 	runs       []recordedRun
+	requests   []string
 	closeCalls int
 }
 
@@ -189,7 +302,7 @@ func (r *recordingRunner) Run(
 	userID string,
 	sessionID string,
 	message model.Message,
-	_ ...trpcagent.RunOption,
+	options ...trpcagent.RunOption,
 ) (<-chan *event.Event, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -198,6 +311,9 @@ func (r *recordingRunner) Run(
 		sessionID: sessionID,
 		content:   message.Content,
 	})
+	// Resolved the way the framework resolves it — in order, last write wins —
+	// because the order is the whole of what this wrapper controls.
+	r.requests = append(r.requests, resolvedRequestID(options))
 	events := make(chan *event.Event)
 	close(events)
 	return events, nil
@@ -214,6 +330,13 @@ func (r *recordingRunner) recorded() []recordedRun {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]recordedRun(nil), r.runs...)
+}
+
+// requestIDs is the request id each run resolved to, in order.
+func (r *recordingRunner) requestIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.requests...)
 }
 
 func (r *recordingRunner) closes() int {

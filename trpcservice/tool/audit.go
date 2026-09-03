@@ -26,6 +26,11 @@ const (
 // read from the platform RunContext, never from anything the model or the
 // client supplied.
 type AuditScope struct {
+	// RequestID ties this tool call back to the single request that caused it.
+	// Without it the trail can say which session ran a tool but not which of
+	// that session's requests, and a caller holding an X-Request-ID has no way
+	// to reach the tool calls its own request made.
+	RequestID   string
 	TenantID    string
 	AppID       string
 	PrincipalID string
@@ -93,6 +98,7 @@ func (s *SlogAuditSink) Record(ctx context.Context, event AuditEvent) {
 		"tool", event.ToolName,
 		"tool_call_id", event.ToolCallID,
 		"scope_valid", event.ScopeValid,
+		"request_id", event.Scope.RequestID,
 		"tenant_id", event.Scope.TenantID,
 		"app_id", event.Scope.AppID,
 		"principal_id", event.Scope.PrincipalID,
@@ -190,6 +196,7 @@ func auditEvent(ctx context.Context, phase AuditPhase, toolName string, toolCall
 	}
 	event.ScopeValid = true
 	event.Scope = AuditScope{
+		RequestID:   runContext.RequestID,
 		TenantID:    runContext.TenantID,
 		AppID:       runContext.AppID,
 		PrincipalID: runContext.PrincipalID,

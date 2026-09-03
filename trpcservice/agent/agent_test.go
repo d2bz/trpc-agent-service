@@ -248,6 +248,7 @@ func serveChatCompletion(
 	handler, err := runtime.OpenAIHandler()
 	require.NoError(t, err)
 	ctx, err := identity.WithRunContext(context.Background(), identity.RunContext{
+		RequestID:   "request-1",
 		TenantID:    runtime.TenantID,
 		AppID:       runtime.AgentAppID,
 		PrincipalID: "principal-1",

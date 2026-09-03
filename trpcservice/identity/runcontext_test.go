@@ -10,6 +10,7 @@ import (
 
 func TestRunContextRoundTrip(t *testing.T) {
 	scope := RunContext{
+		RequestID:   "request-1",
 		TenantID:    "tenant-a",
 		AppID:       "assistant",
 		PrincipalID: testPrincipal,
@@ -50,6 +51,7 @@ func TestRunContextFromRejectsUntrustedContexts(t *testing.T) {
 
 func TestWithRunContextRejectsIncompleteScope(t *testing.T) {
 	complete := RunContext{
+		RequestID:   "request-1",
 		TenantID:    "tenant-a",
 		AppID:       "assistant",
 		PrincipalID: testPrincipal,
@@ -57,6 +59,10 @@ func TestWithRunContextRejectsIncompleteScope(t *testing.T) {
 		RevisionID:  "revision-1",
 	}
 	for name, mutate := range map[string]func(*RunContext){
+		// The request id is required like every other field: a scope that
+		// carries none is a run nothing downstream can be correlated with, and a
+		// correlation id that is only sometimes there correlates nothing.
+		"request":   func(c *RunContext) { c.RequestID = "" },
 		"tenant":    func(c *RunContext) { c.TenantID = "" },
 		"app":       func(c *RunContext) { c.AppID = "" },
 		"principal": func(c *RunContext) { c.PrincipalID = "" },

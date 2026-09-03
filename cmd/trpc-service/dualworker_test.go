@@ -24,6 +24,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	redislease "github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease/redis"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
@@ -225,9 +226,11 @@ func newWorker(
 	require.NoError(t, err)
 
 	directory := &parkingDirectory{inner: stack.directory, release: make(chan struct{})}
+	runs, err := sessionrun.NewService(resolver, directory, leases)
+	require.NoError(t, err)
 	api, err := web.NewPlatformServer(
-		stack.repository, resolver, authenticator, adminAuthenticator,
-		security.DenyCapabilities(), directory, leases,
+		stack.repository, runs, authenticator, adminAuthenticator,
+		security.DenyCapabilities(),
 	)
 	require.NoError(t, err)
 
@@ -285,6 +288,10 @@ func (w *worker) chat(
 func sessionKeyFor(t *testing.T, sessionID string) session.Key {
 	t.Helper()
 	runContext := identity.RunContext{
+		// Any well-formed id will do: this scope is built to compute a session
+		// key, not to run anything, and the request id is not part of that key.
+		// The real ones are minted per request by the HTTP entry layer.
+		RequestID:   uuid.NewString(),
 		TenantID:    platformconfig.DemoTenantID,
 		AppID:       platformconfig.DemoAgentAppID,
 		PrincipalID: platformconfig.DemoPrincipalID,

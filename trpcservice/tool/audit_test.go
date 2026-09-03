@@ -37,6 +37,7 @@ func TestAuditCallbacksRecordTrustedScope(t *testing.T) {
 	require.Len(t, events, 2)
 
 	expectedScope := servicetool.AuditScope{
+		RequestID:   "request-1",
 		TenantID:    "tenant-a",
 		AppID:       "assistant",
 		PrincipalID: "principal-1",
@@ -59,6 +60,44 @@ func TestAuditCallbacksRecordTrustedScope(t *testing.T) {
 	require.NotNil(t, after)
 	require.Nil(t, after.CustomResult)
 	require.False(t, after.SkipSummarization)
+}
+
+// Two turns of one conversation are two requests, and the trail has to tell
+// them apart. The request id is read from each run's own scope, so it varies
+// where everything else about the two runs — tenant, app, principal, session,
+// revision — is identical. Without it the trail could say which conversation ran
+// a tool but never which request did, and a caller holding an X-Request-ID would
+// have nothing to look the tool calls up by.
+func TestAuditRecordsThePerRequestID(t *testing.T) {
+	sink := &recordingSink{}
+	callbacks := servicetool.NewAuditCallbacks(sink)
+
+	for _, requestID := range []string{"request-1", "request-2"} {
+		ctx, err := identity.WithRunContext(context.Background(), identity.RunContext{
+			RequestID:   requestID,
+			TenantID:    "tenant-a",
+			AppID:       "assistant",
+			PrincipalID: "principal-1",
+			SessionID:   "conversation-1",
+			RevisionID:  "revision-1",
+		})
+		require.NoError(t, err)
+		runToolCallbacks(t, callbacks, ctx, "call-"+requestID, servicetool.RefAdd, nil)
+	}
+
+	events := sink.events()
+	require.Len(t, events, 4)
+	recorded := make([]string, 0, len(events))
+	for _, event := range events {
+		require.True(t, event.ScopeValid)
+		require.Equal(t, "conversation-1", event.Scope.SessionID)
+		require.Equal(t, "revision-1", event.Scope.RevisionID)
+		recorded = append(recorded, event.Scope.RequestID)
+	}
+	// Before and after of each call, in order: the id belongs to the run, not to
+	// the phase or to the tool.
+	require.Equal(t,
+		[]string{"request-1", "request-1", "request-2", "request-2"}, recorded)
 }
 
 // The audit trail observes a tool call; it must not become part of it.
@@ -121,7 +160,9 @@ func TestAuditEventCarriesNoPayloadFields(t *testing.T) {
 		require.Contains(t, allowed, eventType.Field(index).Name)
 	}
 
-	allowedScope := []string{"TenantID", "AppID", "PrincipalID", "SessionID", "RevisionID"}
+	allowedScope := []string{
+		"RequestID", "TenantID", "AppID", "PrincipalID", "SessionID", "RevisionID",
+	}
 	scopeType := reflect.TypeOf(servicetool.AuditScope{})
 	scopeFields := make([]string, 0, scopeType.NumField())
 	for index := range scopeType.NumField() {
@@ -144,6 +185,7 @@ func TestAuditOutputNeverContainsPayload(t *testing.T) {
 	// The trail happened, and it identifies the run.
 	require.Contains(t, output, servicetool.RefEcho)
 	require.Contains(t, output, "call-1")
+	require.Contains(t, output, "request_id=request-1")
 	require.Contains(t, output, "tenant-a")
 	require.Contains(t, output, "principal-1")
 	require.Contains(t, output, "revision-1")
@@ -348,6 +390,7 @@ func runToolCallbacks(
 func runContextFor(t *testing.T, ctx context.Context) context.Context {
 	t.Helper()
 	scoped, err := identity.WithRunContext(ctx, identity.RunContext{
+		RequestID:   "request-1",
 		TenantID:    "tenant-a",
 		AppID:       "assistant",
 		PrincipalID: "principal-1",

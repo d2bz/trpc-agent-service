@@ -17,6 +17,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -547,8 +548,7 @@ func TestPlatformStreamingHoldsRuntimeLeaseUntilHandlerReturns(t *testing.T) {
 
 func TestPlatformRejectsRuntimeWithoutOpenAIHandler(t *testing.T) {
 	repository := tenant.NewMemoryRepository()
-	server, err := NewPlatformServer(
-		repository,
+	runs, err := sessionrun.NewService(
 		resolverFunc(func(
 			context.Context,
 			tenant.TenantContext,
@@ -562,11 +562,16 @@ func TestPlatformRejectsRuntimeWithoutOpenAIHandler(t *testing.T) {
 				},
 			}, nil
 		}),
+		sessiondir.NewMemoryDirectory(),
+		newTestCoordinator(t),
+	)
+	require.NoError(t, err)
+	server, err := NewPlatformServer(
+		repository,
+		runs,
 		newTestAuthenticator(t),
 		newTestAdminAuthenticator(t),
 		security.DenyCapabilities(),
-		sessiondir.NewMemoryDirectory(),
-		newTestCoordinator(t),
 	)
 	require.NoError(t, err)
 
@@ -578,52 +583,43 @@ func TestPlatformRejectsRuntimeWithoutOpenAIHandler(t *testing.T) {
 
 func TestNewPlatformServerRequiresEveryDependency(t *testing.T) {
 	repository := tenant.NewMemoryRepository()
-	resolver := resolverFunc(func(
-		context.Context,
-		tenant.TenantContext,
-		string,
-		string,
-	) (platformagent.ResolvedRuntime, error) {
-		return platformagent.ResolvedRuntime{}, nil
-	})
+	runs, err := sessionrun.NewService(
+		resolverFunc(func(
+			context.Context,
+			tenant.TenantContext,
+			string,
+			string,
+		) (platformagent.ResolvedRuntime, error) {
+			return platformagent.ResolvedRuntime{}, nil
+		}),
+		sessiondir.NewMemoryDirectory(),
+		newTestCoordinator(t),
+	)
+	require.NoError(t, err)
 	authenticator := newTestAuthenticator(t)
 	admin := newTestAdminAuthenticator(t)
 	revisions := security.DenyCapabilities()
-	directory := sessiondir.NewMemoryDirectory()
-	leases := newTestCoordinator(t)
 
-	_, err := NewPlatformServer(
-		nil, resolver, authenticator, admin, revisions, directory, leases)
+	_, err = NewPlatformServer(nil, runs, authenticator, admin, revisions)
 	require.ErrorContains(t, err, "tenant repository is required")
-	_, err = NewPlatformServer(
-		repository, nil, authenticator, admin, revisions, directory, leases)
-	require.ErrorContains(t, err, "runtime resolver is required")
-	_, err = NewPlatformServer(
-		repository, resolver, nil, admin, revisions, directory, leases)
+	// The lease, the pin and the Runtime now live behind one service, so this is
+	// the single check that stands where three used to. The dependencies it
+	// holds are checked where they are consumed; see
+	// TestNewServiceRequiresEveryDependency in the sessionrun package.
+	_, err = NewPlatformServer(repository, nil, authenticator, admin, revisions)
+	require.ErrorContains(t, err, "run service is required")
+	_, err = NewPlatformServer(repository, runs, nil, admin, revisions)
 	require.ErrorContains(t, err, "chat authenticator is required")
 	// A control plane with no way to authenticate is a control plane whose only
 	// protection is that nobody has found the port yet.
-	_, err = NewPlatformServer(
-		repository, resolver, authenticator, nil, revisions, directory, leases)
+	_, err = NewPlatformServer(repository, runs, authenticator, nil, revisions)
 	require.ErrorContains(t, err, "admin authenticator is required")
 	// And one with no opinion on which revisions may run would let every tenant
 	// name every capability the process can reach.
-	_, err = NewPlatformServer(
-		repository, resolver, authenticator, admin, nil, directory, leases)
+	_, err = NewPlatformServer(repository, runs, authenticator, admin, nil)
 	require.ErrorContains(t, err, "revision authorizer is required")
-	_, err = NewPlatformServer(
-		repository, resolver, authenticator, admin, revisions, nil, leases)
-	require.ErrorContains(t, err, "session directory is required")
-	// No fallback to a process-wide coordinator: a platform that silently
-	// coordinated through its own memory would be exclusive against nothing but
-	// itself, which is worse than refusing to start.
-	_, err = NewPlatformServer(
-		repository, resolver, authenticator, admin, revisions, directory, nil)
-	require.ErrorContains(t, err, "session lease coordinator is required")
 
-	server, err := NewPlatformServer(
-		repository, resolver, authenticator, admin, revisions, directory, leases,
-	)
+	server, err := NewPlatformServer(repository, runs, authenticator, admin, revisions)
 	require.NoError(t, err)
 	require.NotNil(t, server.Handler())
 }
@@ -665,7 +661,160 @@ func TestPlatformHTTPMethodAndCORS(t *testing.T) {
 	// Retry-After is the only actionable part of a 409 session_busy, and a
 	// browser cannot read it unless it is exposed.
 	require.Contains(t, exposed, HeaderRetryAfter)
+	// X-Request-ID is the only part of a 500 a browser client can usefully
+	// quote back to an operator, and it is unreadable unless it is exposed.
+	require.Contains(t, exposed, HeaderRequestID)
 	require.Equal(t, http.MethodPost, preflight.Header().Get("Access-Control-Allow-Methods"))
+}
+
+// The id on the answer and the id on the run are one value, proved end to end:
+// the header comes off a real /v1/chat/completions response and the comparison
+// is against the Events the run actually left in the session service.
+//
+// Three upstream facts make this worth asserting rather than assuming. The
+// OpenAI adapter contributes no request id — buildRunOptions
+// (server/openai/run_input.go) assembles history, the tool-result rewriter and
+// external tools, nothing else. The Runner mints one of its own before applying
+// any option, and mints a second afterwards if an option left the field empty
+// (runner/runner.go:546 and :550). So a run always ends up labelled, and without
+// the platform wrapper appending last it would be labelled with a uuid that
+// never left the framework — the header would be a number nothing else in the
+// system had ever recorded, and it would look exactly as correct as this does.
+//
+// The second turn is what makes it a request id rather than a session id: same
+// session, same principal, same revision, different value, and the session ends
+// up holding events under both.
+func TestPlatformRequestIDOnTheAnswerLabelsTheRunsEvents(t *testing.T) {
+	platform := newPlatformTestServer(t)
+	seedTenantAppRevision(t, platform.handler, "tenant-a", appAssistant, "revision-1", 1, "echo-v1")
+
+	headers := chatHeaders(keyTenantA, appAssistant)
+	headers[HeaderSessionID] = "conversation-1"
+	body := `{"model":"ignored","messages":[{"role":"user","content":"hello"}]}`
+
+	published := make([]string, 0, 2)
+	for range 2 {
+		answer := requireStatus(
+			t, platform.handler, http.MethodPost, chatPath, body, headers, http.StatusOK,
+		)
+		requestID := answer.Header().Get(HeaderRequestID)
+		require.NotEmpty(t, requestID)
+		published = append(published, requestID)
+	}
+	require.NotEqual(t, published[0], published[1],
+		"two requests were given one id: it identifies the session, not the request")
+
+	stored, err := platform.sessions.GetSession(context.Background(), session.Key{
+		AppName:   "t/tenant-a/a/" + appAssistant,
+		UserID:    "u/" + principalA,
+		SessionID: "conversation-1",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.NotEmpty(t, stored.Events)
+
+	// Every event belongs to one of the two answers, and both answers are
+	// represented. An unlabelled event would mean a path that reached the session
+	// without the platform's id; a third value would mean an id was minted
+	// somewhere this platform does not control.
+	labels := make(map[string]int, len(published))
+	for _, recorded := range stored.Events {
+		require.Contains(t, published, recorded.RequestID,
+			"session event carries request id %q, which no answer published",
+			recorded.RequestID)
+		labels[recorded.RequestID]++
+	}
+	require.Len(t, labels, 2)
+	for _, requestID := range published {
+		require.Positive(t, labels[requestID],
+			"answer %q left no event behind", requestID)
+	}
+}
+
+// Every chat answer carries the id this platform gave the run, including the
+// ones that refuse before anything is started: a caller reporting a 401, a 409
+// or a 500 has something to quote, which is the whole point of a correlation
+// id. The preflight is the exception — nothing ran, so there is nothing to
+// correlate.
+func TestPlatformPublishesARequestIDOnEveryAnswer(t *testing.T) {
+	platform := newPlatformTestServer(t)
+	seedTenantAppRevision(t, platform.handler, "tenant-a", appAssistant, "revision-1", 1, "echo-v1")
+	body := `{"model":"ignored","messages":[{"role":"user","content":"hello"}]}`
+
+	pinned := chatHeaders(keyTenantA, appAssistant)
+	pinned[HeaderSessionID] = "conversation-1"
+	conflicting := cloneHeaders(pinned)
+	conflicting[HeaderAgentRevisionID] = "revision-2"
+
+	answers := []struct {
+		name           string
+		headers        map[string]string
+		expectedStatus int
+	}{
+		{name: "served", headers: pinned, expectedStatus: http.StatusOK},
+		{
+			name:           "unauthenticated",
+			headers:        map[string]string{HeaderAgentAppID: appAssistant},
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "missing route",
+			headers:        map[string]string{HeaderAuthorization: "Bearer " + keyTenantA},
+			expectedStatus: http.StatusBadRequest,
+		},
+		{name: "pin conflict", headers: conflicting, expectedStatus: http.StatusConflict},
+	}
+	seen := make(map[string]string, len(answers))
+	for _, answer := range answers {
+		t.Run(answer.name, func(t *testing.T) {
+			response := requireStatus(
+				t, platform.handler, http.MethodPost, chatPath, body, answer.headers,
+				answer.expectedStatus,
+			)
+			requestID := response.Header().Get(HeaderRequestID)
+			require.NotEmpty(t, requestID)
+			// Ids are per request, not per session or per process: two runs of
+			// one conversation that shared an id would be indistinguishable in
+			// the logs, which is the failure this header exists to prevent.
+			require.NotContains(t, seen, requestID)
+			seen[requestID] = answer.name
+		})
+	}
+
+	// A preflight carries no id. Nothing was run, and minting one would put a
+	// correlation id on a request there is nothing to correlate it with.
+	preflight := requireStatus(
+		t, platform.handler, http.MethodOptions, chatPath, "", nil, http.StatusNoContent,
+	)
+	require.Empty(t, preflight.Header().Get(HeaderRequestID))
+}
+
+// The request id is the platform's, never the caller's. A client that could
+// choose it could file its traffic under another tenant's identifier, or send
+// an empty one and file it under none.
+func TestPlatformNeverTrustsAClientSuppliedRequestID(t *testing.T) {
+	platform := newPlatformTestServer(t)
+	seedTenantAppRevision(t, platform.handler, "tenant-a", appAssistant, "revision-1", 1, "echo-v1")
+	body := `{"model":"ignored","messages":[{"role":"user","content":"hello"}]}`
+
+	for sessionID, supplied := range map[string]string{
+		"conversation-borrowed":  "another-tenants-request-id",
+		"conversation-empty":     "",
+		"conversation-malformed": "not a request id",
+	} {
+		t.Run(sessionID, func(t *testing.T) {
+			headers := chatHeaders(keyTenantA, appAssistant)
+			headers[HeaderSessionID] = sessionID
+			headers[HeaderRequestID] = supplied
+
+			response := requireStatus(
+				t, platform.handler, http.MethodPost, chatPath, body, headers, http.StatusOK,
+			)
+			minted := response.Header().Get(HeaderRequestID)
+			require.NotEmpty(t, minted)
+			require.NotEqual(t, supplied, minted)
+		})
+	}
 }
 
 // A browser reads an error body only when the actual response carries the CORS
@@ -729,6 +878,7 @@ func TestPlatformPublishesCORSHeadersOnEarlyRefusals(t *testing.T) {
 			require.Contains(t, exposed, HeaderSessionID)
 			require.Contains(t, exposed, HeaderAgentRevisionID)
 			require.Contains(t, exposed, HeaderRetryAfter)
+			require.Contains(t, exposed, HeaderRequestID)
 		})
 	}
 
@@ -870,9 +1020,11 @@ func newPlatformTestServerWith(
 	if revisions == nil {
 		revisions = security.DenyCapabilities()
 	}
+	runs, err := sessionrun.NewService(resolver, chat, coordinator)
+	require.NoError(t, err)
 	server, err := NewPlatformServer(
-		repository, resolver, newTestAuthenticator(t), newTestAdminAuthenticator(t),
-		revisions, chat, coordinator,
+		repository, runs, newTestAuthenticator(t), newTestAdminAuthenticator(t),
+		revisions,
 	)
 	require.NoError(t, err)
 	return &platformTestServer{
