@@ -2,12 +2,14 @@
 
 > 本文描述参赛实现的目标架构和组件边界。它是 8 月 27 日方案文档的详细支撑材料，原始验收要求以仓库根目录 README 为准。
 
+当前已实现网页和企微单聊文本入口：企微使用静态 Binding、专用串行 Consumer、共享 Session Run 及 PostgreSQL Inbox/Run/Outbox，并已完成[真实正常单聊](wecom-text-slice.md#真实单聊验证)。下文生产拓扑中的 Redis 唤醒、通用 Worker、Memory 和完整 OTel 不代表当前接线；IM 设计与实现映射见[收口记录](im-acceptance-closure.md)。
+
 ## 1. 设计结论
 
 本项目采用“逻辑分层、渐进拆分”的方式：
 
 - 逻辑上分为控制面和数据面，避免管理操作与高频 Agent 请求耦合。
-- 开发和最小部署阶段使用一个支持多角色启动的 Go 二进制，减少部署和调试成本。
+- 当前使用一个 Go 进程提供网页与可选企微入口；同一二进制按角色启动属于后续部署设计。
 - 生产阶段将 Gateway、Worker、Channel Adapter 和后台任务拆成独立 Deployment，分别扩缩容。
 - Agent 以不可变 Revision 发布，在 Worker 中组装为 `agent.Agent + runner.Runner` 并按需缓存；灰度期间 Session 默认固定 Revision，避免同一对话行为漂移。
 - 每次请求创建独立 Invocation；Session、Memory、配置、幂等和审计数据全部外置。
@@ -112,12 +114,12 @@ flowchart TB
 | 配置与发布服务 | 校验配置、生成不可变 Revision、切换流量、回滚 | 保存明文密钥 |
 | Channel Adapter | 平台验签、消息解析、媒体下载、回复格式与平台限流适配 | 选择 Agent、执行 Prompt |
 | Agent Gateway | 鉴权、租户解析、路由、限流、幂等入口、生成 `request_id` 和 `trace_id` | 持有会话内容、调用具体 Tool |
-| Inbox / Dispatcher | 持久化待处理消息、重试、分配 Worker、保证异步 IM 回调不丢失 | Agent 推理 |
+| Inbox / Dispatcher | 持久化待处理消息、重试、分配 Worker；未落库消息的补投取决于平台协议 | Agent 推理 |
 | Agent Worker | 取得 Session 运行权、调用 Runner、消费 Event、处理超时取消 | 保存租户配置真相 |
 | Runtime Manager | 加载 Revision，组装并缓存 Agent/Runner，管理引用计数和安全淘汰 | 保存用户 Session |
 | Policy | 用户授权、工具白名单、预算、敏感信息、危险操作审批 | 实现具体业务 Tool |
 | Storage Router | 按租户 Backend Profile 构造并缓存上游 Session/Memory/Knowledge/Artifact Service | 把所有数据强行放入同一种后端 |
-| Reply Outbox | 持久化回复、按 Channel 限流和重试、保证安全重复发送 | 重新运行 Agent |
+| Reply Outbox | 持久化回复、记录投递结果；仅在平台允许时按 Channel 限流和重试 | 重新运行 Agent |
 | Telemetry | 统一 Trace、Metric、Log、成本和审计关联字段 | 记录密钥和完整敏感正文 |
 
 ## 4. 控制面
@@ -153,7 +155,7 @@ PostgreSQL 是配置真相源。Worker 使用“通知 + 版本检查”更新�
 
 ### 5.1 统一入站消息
 
-Channel Adapter 校验平台身份并完成 Binding/Principal 解析后，把不同平台消息转换为统一 `InboundEnvelope`。以下为持久输入的核心字段；完整实验契约见 [Channel 输入契约](channel-pipeline.md#2-输入契约)，不是另一个同名 DTO：
+Channel Adapter 校验平台身份并完成 Binding/Principal 解析后，把不同平台消息转换为统一 `InboundEnvelope`。以下为持久输入的核心字段；完整契约及实验边界见 [Channel 输入契约](channel-pipeline.md#2-输入契约)，不是另一个同名 DTO：
 
 ```go
 type InboundEnvelope struct {
@@ -172,17 +174,17 @@ type InboundEnvelope struct {
 
 外部标识只用于匹配绑定和身份映射。进入核心链路后使用平台内部 ID，避免把手机号、群名等信息写入缓存键和指标标签。
 
-`InboundMessage` 是可持久化的规范输入（文本、附件引用、被回复消息引用），不是框架消息。Ingress 生成内部 `request_id`，Trace 上下文随受理与唤醒传递；外部 `msgid` 和回复关联 `req_id` 均不能替代内部请求 ID。
+`InboundMessage` 是可持久化的规范输入（文本、附件引用、被回复消息引用），不是框架消息。当前企微 Consumer 受理时生成内部 `request_id`；通用 Ingress 与跨唤醒 Trace 传播是目标架构，完整 OTel 尚未接入。外部 `msgid` 和回复关联 `req_id` 均不能替代内部请求 ID。
 
 | 转换阶段 | 明确规则 |
 | --- | --- |
 | 平台文本 -> 规范输入 | 企微 `body.text.content` 写入 `Message.Text`，`body.msgid` 写入 `ExternalEventID`；`from.userid` 经 Binding 作用域映射为 Principal；回调 `headers.req_id` 保留在受保护的回复目标中 |
-| 规范输入 -> Runner | Worker 在取得 Session/Revision 后，以 `model.NewUserMessage(Message.Text)` 构造用户消息，调用 `runner.Runner.Run(ctx, userID, sessionID, message)`；媒体未实现时明确拒绝，不丢弃附件后只处理文字 |
-| Agent Event -> 最终文本 | 只取完成且非 partial、无错误的 assistant 内容；Tool 调用、Tool 结果、runner completion、内部状态和推理内容不作为 IM 回复。当前实验的筛选与对账由 `sessionrun.TranscriptEntry` / Channel Worker 承担，真实 IM 尚未接线 |
-| 文本 -> IM 回复 | 最终文本经 Outbox 交给 Adapter；企微使用回调 `req_id`、稳定 `stream.id` 和 `finish=true`，成功回执后才确认投递。文本切片需服从平台单条回复语义，不能假定多个终态 stream 等同连续分片 |
+| 规范输入 -> Runner | 当前企微 Consumer claim Run 后调用共享 `sessionrun.Start` 取得 Session/Revision，以 `model.NewUserMessage(Message.Text)` 交给 `Handle.Run`，后者调用真实 `runner.Runner.Run`；群聊、媒体和混合消息不进入 Runner |
+| Agent Event -> 最终文本 | 当前由 [`wecom/reply.go`](../trpcservice/channels/wecom/reply.go)只取完成且非 partial、无错误、无 Tool 调用的 assistant chat completion；持续排空 Event，后续错误使 Run 失败。Tool 结果、runner completion 和推理字段不作回复。实验 `Hold` / `TranscriptEntry` 对账未纳入当前链路 |
+| 文本 -> IM 回复 | 当前把最终文本限制为 20480 UTF-8 字节，超长追加 `[truncated]`，与 Run 终态原子写入一个 Outbox；以原回调 `req_id`、稳定 `stream.id`、`finish=true` 最多发送一次，明确 `errcode=0` 回执后记为 sent，不代表用户已读 |
 | 流式和卡片扩展 | 支持时聚合 assistant 文本增量、按通道限频更新同一消息，完成后结束流；卡片只使用已定义模板及受校验字段。不支持时降级为最终纯文本，不能把任意 Event JSON 发给用户；本次企微文本演示不承诺实时增量或卡片 |
 
-异步链路使用 PostgreSQL Inbox/Run 保存幂等事实和处理状态，使用 Redis Streams Consumer Group 进行低延迟唤醒。Stream 消息只保存内部 `tenant_id`、`run_id` 和 W3C `traceparent`；Worker 仍需回查持久记录，不能把 Stream 当作唯一数据真相。
+当前异步链路由企微 Consumer 的受理循环写 PostgreSQL Inbox/Run，另一串行循环按可信 Tenant/Binding 扫描、执行和发送，本地通知只缩短轮询等待。生产目标使用 Redis Streams Consumer Group 低延迟唤醒；Stream 只携带内部 `tenant_id`、`run_id` 和 W3C `traceparent`，Worker 回查持久记录，不能以 Stream 代替数据真相。该 Redis 唤醒与原通用 Worker/Dispatcher 实验未进入当前运行链路。
 
 ### 5.2 确定性路由
 
@@ -197,7 +199,7 @@ channel_type + external_account_id
 → 健康 Worker
 ```
 
-HTTP 请求从认证凭证和 URL 中解析 Tenant 与 Agent App。IM 的外部账号标识必须包含平台要求的账号命名空间，例如企业 ID 与应用 ID；同一 `(channel_type, external_account_id)` 在平台内只能绑定一个 Tenant/App。长连接从服务端连接配置取得 Binding，再校验事件账号匹配，不允许消息正文自行指定租户。任何一步无法唯一解析都拒绝请求，不回退到公共租户或默认 Agent。此约束属于尚未实现的 Binding 配置设计，与数据模型唯一索引一致。
+HTTP 请求从认证凭证和 URL 中解析 Tenant 与 Agent App。IM 的外部账号标识必须包含平台要求的账号命名空间，例如企业 ID 与应用 ID；同一 `(channel_type, external_account_id)` 在平台内只能绑定一个 Tenant/App。当前企微已从服务端静态配置取得唯一 Binding，并校验连接上事件的 Bot 标识，不允许消息正文指定租户；App/Revision 无法解析时拒绝。动态 Binding 管理、跨进程账号唯一性注册和健康 Worker 选择仍为设计，与数据模型参考约束对应。
 
 ### 5.3 Agent 与 Runner 生命周期
 
@@ -213,7 +215,7 @@ Runtime Manager 使用以下缓存键：
 
 ### 5.4 Session 命名
 
-tRPC-Agent-Go 的 Session Key 是 `AppName + UserID + SessionID`。以下是三种模式的目标规则，真实 IM 键生成尚未实现；`group_member` 不属于首条企微单聊文本演示。
+tRPC-Agent-Go 的 Session Key 是 `AppName + UserID + SessionID`。以下三种模式中，当前企微已实现 `direct`，固定 `thread_id=""`、`epoch="0"`，派生与隔离测试见 [`wecom/wecom_test.go`](../trpcservice/channels/wecom/wecom_test.go)；`group`、`group_member` 和 epoch 换代仍为设计。
 
 ```text
 AppName = t/{tenant_id}/a/{agent_app_id}
@@ -230,13 +232,15 @@ thread_id = "" when the platform has no explicit thread
 
 `+` 表示数组连接，每个元素按字符串编码，`epoch` 为服务端保存的非负十进制字符串；数组顺序固定，不能用无边界字符串拼接替代。`principal_id` 来自当前 Tenant/Binding 下的可信用户映射，群聊必须有可信 `group_id`；缺失必要身份时拒绝，不回退成共享 Session。不同 Tenant、App、Binding、群、话题和群内成员独立模式分别进入摘要，跨群或跨租户不会沿用原会话。
 
-平台 `SessionID` 最长 67 个 ASCII 字符，只包含 `ValidateResourceID` 接受的字符；外部会话、话题和用户 ID 不直接进入 Session ID、Redis key 或日志。`AppName` 不包含 Revision，使升级和回滚后仍可读取同一 Session。需要清空上下文时递增 Session epoch，不删除历史数据。共享群模式使用合成群身份，但实际发言人仍用于 Tool 授权及 Event/Audit；默认不把个人长期 Memory 注入群聊。`group_member` 只隔离 Agent 上下文，不能使发到群里的回复变成私信，敏感结果仍须拒绝在群中输出或引导用户单聊。
+平台 `SessionID` 最长 67 个 ASCII 字符，只包含 `ValidateResourceID` 接受的字符；外部会话、话题和用户 ID 不直接进入 Session ID、Redis key 或日志。`AppName` 不包含 Revision，使升级和回滚后仍可读取同一 Session。目标设计通过递增 epoch 清空上下文并保留历史；当前企微没有换代入口。共享群设计使用合成群身份，但实际发言人仍用于 Tool 授权及 Event/Audit，默认不把个人长期 Memory 注入群聊；`group_member` 只隔离 Agent 上下文，敏感结果仍须拒绝在群中输出或引导单聊。
 
 ## 6. 节点部署
 
 ### 6.1 最小可运行部署
 
 当前可运行的参考实现使用 `./build.sh`、`./start.sh` 和 `./stop.sh`，单进程提供 Admin API、HTTP/SSE、Runtime 和 InMemory Session，默认仅监听回环地址，无需外部数据库或模型密钥。Redis/PostgreSQL 的可选集成依赖见 `deploy/docker-compose.session.yml`。
+
+企微默认关闭；启用时要求 PostgreSQL 进程 profile、静态单机器人绑定及进程默认的持久 Session/Pin。当前 Consumer 不承诺跨 Session 并行；退出先停止连接和消费者，再关闭 Runtime 与数据库，启动和验证方式见[企微文本切片](wecom-text-slice.md)。
 
 以下为后续多角色部署设计，`--role`、SQLite 和本地 Artifact 未接入当前命令入口：
 
@@ -269,6 +273,8 @@ Load Balancer
 Gateway 和 Worker 都保持无状态。运行中的 HTTP/SSE 连接只绑定当前节点；连接断开不丢失已提交的 Event，客户端可以按 `request_id` 查询结果。IM 请求先写 PostgreSQL Inbox，再投递 Redis Stream 并应答平台回调。Worker 故障后由 Consumer Group 认领未确认消息；定时扫描器也会重新投递 Inbox 中超时的非终态任务。
 
 ## 7. 并发与故障边界
+
+以下通用 Worker 的并行与重放策略描述生产目标。当前企微专用 Consumer 串行处理各 Session，只恢复尚未启动的任务；已启动但结果未知的 Run 明确失败，旧连接投递目标失败，发送失败不重跑 Agent。没有接入实验 Hold/Transcript 或跨连接补发，详见[切片恢复边界](wecom-text-slice.md#接线与恢复边界)。
 
 - 同一 Session 默认串行执行。Run Coordinator 使用 Redis 租约锁，锁值是随机 owner token，由 Worker 续约；失去租约立即取消 `context.Context`，第二个 Worker 在 Run 入口收到 `409 session_busy`。**这把租约是合作型的**：它把并发写者挡在入口，但不阻止已经在运行的写者继续写。获取租约时 `INCR` 出的单调 token 目前只是观测句柄，**不参与 Session 写入准入**——上游 `session.Service.AppendEvent` 没有 fence/CAS 参数，`WithAppendEventHook` 与后端写入之间也不是原子的，因此"装饰器在写入前拒绝落后 token"在当前上游接口下做不出来，不能称为 enforcement fencing。实现与边界见 [Session Run Lease](session-lease.md)。
 - 不同 Session 可并行执行。同一租户和 Agent 还受并发数、token 和费用配额约束。
@@ -326,7 +332,7 @@ return runCtx.Err()
 | Agent Runtime Builder | tRPC-Agent-Go `LLMAgent` + `Runner` | Graph、Chain、Parallel、业务 Agent 或其他模型供应商 |
 | Control Plane / Session Directory | InMemory、PostgreSQL | MySQL、SQLite、Redis 或外部状态服务 |
 | Session / Memory / Knowledge / Artifact | tRPC-Agent-Go 对应 Service | Redis、向量数据库、对象存储和租户级路由实现 |
-| Channel Adapter | 企业微信、飞书 | 微信客服、公众号、Telegram、Slack 等 |
+| Channel Adapter | 企业微信单聊文本 | 飞书（已有差异设计）、微信客服、公众号、Telegram、Slack 等 |
 | Tool / Policy | 平台白名单和 Guardrail 边界 | MCP Server、业务 Tool、审批和成本策略 |
 | Telemetry | OpenTelemetry | 不同 Trace、Metric、Log 后端 |
 

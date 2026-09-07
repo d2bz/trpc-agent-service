@@ -1,5 +1,7 @@
 # 数据模型设计
 
+本文同时描述逻辑设计与当前数据层。企微静态 Binding、单聊键及 PostgreSQL Inbox/Run/Outbox 已接入专用 Consumer 并通过[文本链路验收](wecom-text-slice.md)；动态 Binding 表、群聊、Memory/Summary 和完整 Audit/OTel 仍为设计，不因出现在实体图中而视为已实现。
+
 ## 1. 建模原则
 
 - `tenant_id` 是所有平台数据的强制分区键。任何查询都不能只依赖资源 ID 而省略租户条件。
@@ -103,9 +105,9 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 | `config` | 长度限制、回调模式、限速、群聊策略 |
 | `status` | `active/disabled` |
 
-`external_principals` 使用唯一键 `(tenant_id, channel_binding_id, principal_type, external_id_hash)`，把外部用户、群或会话映射为内部 `principal_id`。跨通道身份默认不自动合并。
+目标 `external_principals` 使用唯一键 `(tenant_id, channel_binding_id, principal_type, external_id_hash)` 映射内部 `principal_id`。当前企微不建此表，直接以 Tenant、Binding、用户类型和外部用户 ID 的规范数组摘要派生 Principal；跨通道身份不自动合并。
 
-外部账号需编码完整平台命名空间；同一 `(channel_type, external_account_id)` 在平台内唯一，不能跨租户重复绑定，否则入站无法唯一确定 Tenant。企微智能机器人使用 Bot ID；Webhook 地址中的 Binding ID 只用于定位候选凭据，仍须验签才可信。上述字段和约束是设计，当前没有 Binding 管理接口或真实 Adapter。
+外部账号需编码完整平台命名空间；目标唯一约束为 `(channel_type, external_account_id)`，避免跨租户重复绑定。当前企微由服务端静态配置唯一 Tenant/App/Binding/Bot，Secret 仅引用 `env:TRPC_SERVICE_WECOM_BOT_SECRET`，并核对受信任连接上事件的 Bot 标识；已有真实单聊收发。动态 Binding 管理及跨进程账号注册唯一性尚未实现。飞书 Webhook 路径只定位候选凭据，须完成[签名、Token 和应用身份校验](solution.md#55-im-接入差异)后确定绑定，仍属设计。
 
 ### 3.5 Session、Event 与 Summary
 
@@ -141,6 +143,8 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 
 `session_summaries` 使用唯一键 `(tenant_id, session_id, filter_key, source_end_sequence, summary_version)`，其中 `source_end_sequence` 表示 Summary 覆盖到哪个 Event，防止旧任务覆盖新结果。
 
+当前企微只使用 `direct`，`thread_id=""`、epoch 固定 `0`；真实 PostgreSQL Session、Pin 和配置 Repository 已通过全部 Runtime/Session 对象重建后历史与 Pin 保留的测试。群聊、epoch 换代及 Summary 表不属于当前实现。
+
 ### 3.6 Memory、Knowledge 与 Artifact
 
 - `memories`：记录 `tenant_id`、`agent_app_id`、`subject_type`、`subject_id`、正文/引用、提取来源、版本、向量引用、保留时间和状态。单聊通常以用户为 subject；群聊默认只写群共享 Memory，不读取个人私密 Memory。
@@ -156,7 +160,7 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 UNIQUE (tenant_id, channel_binding_id, external_event_id)
 ```
 
-`agent_runs` 保存 `request_id`、Session、Revision、同 Session 的 `accept_sequence`、状态、attempt/最大尝试数、`claim_token`、`next_attempt_at`、执行 deadline、恢复宽限、`last_dispatched_at`、开始/结束时间、错误类型、token、费用、Worker 和 `trace_id`。执行时长与恢复宽限以整毫秒固化，避免不同 Store 的精度语义漂移；`output_parts` 必须等于同一终态事务写入的 Outbox part 数量。状态只允许按定义的状态机前进：
+`agent_runs` 保存 `request_id`、Session、Revision、同 Session 的 `accept_sequence`、状态、attempt/最大尝试数、`claim_token`、`next_attempt_at`、执行 deadline、恢复宽限、`last_dispatched_at`、开始/结束时间、错误类型和 Worker。token、cost、`trace_id` 是目标设计字段，当前未实现完整采集；实际表结构以迁移为准。执行时长与恢复宽限以整毫秒固化；`output_parts` 必须等于同一终态事务写入的 Outbox part 数量。状态只允许按定义的状态机前进：
 
 ```text
 accepted → running → succeeded | failed
@@ -166,7 +170,11 @@ accepted → running → succeeded | failed
 
 每次 `accepted -> running` 都原子递增 attempt 并生成新的 `claim_token`；终态和 Outbox 在同一事务内以该 token 做 CAS。`failed` 的 `error_type` 可表达取消、Tool 结果未知或永久执行错误，不增加会破坏最小状态机的旁路状态。
 
+当前 PostgreSQL 实表为 `channel_inbox_messages`、`channel_agent_runs` 和 `channel_outbox_messages`，迁移见 [`channels/postgres/migrate.go`](../trpcservice/channels/postgres/migrate.go)。企微按 msgid 持久去重，以 `first_execution_started_at` 区分从未启动与已启动未知任务；后者即使重新 claim 也只落失败，不再次进入 Runner。按 Tenant/Binding 限定范围的恢复是专用 Consumer 行为，不是原通用 Worker/Transcript 实验。
+
 `outbox_messages` 使用 `UNIQUE (tenant_id, channel_binding_id, idempotency_key)`，记录可恢复的版本化投递目标、消息片段、稳定 `client_message_id`、尝试次数/最大尝试数、`send_token`、发送 deadline、下次重试时间、`duplicate_risk` 和投递结果。目标包含重发所需的真实外部引用，按敏感数据保护，不能只保存不可逆哈希。
+
+当前企微最多写入一个最终文本 Outbox，发送最多尝试一次；版本化目标含 Tenant/Binding、连接 generation、req_id 和 stream_id，持久保存不代表跨连接仍有效。旧连接目标记失败，未知回执保留 `duplicate_risk` 并停止发送；明确 `errcode=0` 才记 sent，不表示用户已读。媒体、卡片、增量流及跨连接补发未实现。
 
 `audit_logs` 是追加写记录，至少包含题目要求的全部字段：
 

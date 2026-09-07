@@ -7,6 +7,8 @@
 
 2026-09-07 校准：本文描述目标架构，完整设计覆盖原题，代码只需提供有代表性的实现。文中的生产组件和预期效果不自动成为本次必须编码的任务；当前设计验收、代码状态和证据见[验收矩阵](acceptance.md)。冻结的 8 月 27 日方案保留历史内容，旧全平台排期不再执行。
 
+当前网页聊天与企业微信单聊文本均已真实运行；企微采用单进程、单静态 Binding、PostgreSQL Inbox/Run/Outbox 和共享 Session Run。下文 Redis 调度、Memory、完整治理及生产部署仍为目标设计。IM 四项要求与实现边界统一见[IM 设计验收收口](im-acceptance-closure.md)。
+
 ## 1. 背景与目标
 
 企业通常会为客服、研发、运营等不同业务建设多个 Agent。如果每个 Agent 独立实现 IM 接入、Session、Memory、知识库、权限、密钥、监控和部署，不仅重复建设，跨节点会话、数据隔离和合规审计也很难保持一致。
@@ -35,7 +37,9 @@
 
 ## 4. 核心运行链路
 
-企业微信智能机器人 Adapter 通过 Bot ID/Secret 订阅长连接，只处理已认证连接上、机器人标识匹配的消息。Gateway 根据受信任的账号绑定确定 Tenant/App，在一个 PostgreSQL 事务内插入或命中 Inbox 并为首次事件创建 `accepted` Run，提交后再通过 Redis Streams 投递 `run_id`。Run Coordinator 获取 Session 租约并成功 claim PostgreSQL Run 后，Runtime Manager 才加载指定 Revision 的 Agent/Runner。Worker 调用 tRPC-Agent-Go Runner，读取 Session/Memory、检索 Knowledge、执行 Tool/MCP，并持续消费流式 Event。结果写入 Session、Memory、Run 和 Audit，最终通过 Outbox 发送到企业微信。长连接没有 HTTP 200 确认步骤；消息推送、Inbox 提交、回复回执是三个不同事实，边界见下文 IM 设计。
+目标架构中，企业微信智能机器人 Adapter 通过 Bot ID/Secret 订阅长连接，只处理已认证连接上、机器人标识匹配的消息。Gateway 根据受信任的账号绑定确定 Tenant/App，在一个 PostgreSQL 事务内插入或命中 Inbox 并为首次事件创建 `accepted` Run，提交后再通过 Redis Streams 投递 `run_id`。Run Coordinator 获取 Session 租约并成功 claim PostgreSQL Run 后，Runtime Manager 才加载指定 Revision 的 Agent/Runner。Worker 调用 tRPC-Agent-Go Runner，读取 Session/Memory、检索 Knowledge、执行 Tool/MCP，并持续消费流式 Event。结果写入 Session、Memory、Run 和 Audit，最终通过 Outbox 发送到企业微信。长连接没有 HTTP 200 确认步骤；消息推送、Inbox 提交、回复回执是三个不同事实，边界见下文 IM 设计。
+
+当前企微消费者直接扫描已绑定范围的 PostgreSQL 任务，claim 后调用现有 `sessionrun.Start/Run`；Session 忙时在执行预算内等待。它排空 Event，原子完成 Run 和最终文本 Outbox，再等待企微发送回执；不经过未提交的 Redis Worker/Hold/Transcript 实验。真实正常单聊及本地故障测试见[企微切片](wecom-text-slice.md)。
 
 `trace_id` 贯穿 IM callback、Gateway、Runner、Model、Tool、Session/Memory 和 IM 回复；跨 Redis Streams 时显式携带 W3C `traceparent` 并在 Worker 恢复上下文。`request_id` 贯穿幂等、取消、状态查询、成本和审计。完整时序见 [核心消息时序](sequence.md)。
 
@@ -55,7 +59,7 @@ Agent App 是稳定业务身份；Agent Revision 是模型、Prompt、Tool、Ski
 
 ### 5.4 多后端与一致性
 
-目标架构使用 PostgreSQL 保存配置、Inbox/Outbox、Run 和 Audit，并作为入站去重与任务状态的唯一事实源；Redis 保存热 Session、租约、限流和可丢失的 Worker 唤醒；PGVector 保存 Knowledge/Memory 向量；S3-compatible storage 保存 Artifact 和知识源文件。当前入口已接入配置与 Session 路由；Channel 是未接线实验，持久 Audit、Memory、向量库和对象存储仍属设计。平台基于 tRPC-Agent-Go Service 接口增加租户路由和能力矩阵，不把不同后端伪装成相同语义。
+目标架构使用 PostgreSQL 保存配置、Inbox/Outbox、Run 和 Audit，并作为入站去重与任务状态的唯一事实源；Redis 保存热 Session、租约、限流和可丢失的 Worker 唤醒；PGVector 保存 Knowledge/Memory 向量；S3-compatible storage 保存 Artifact 和知识源文件。当前入口已接入配置与 Session 路由，企微消费者已接入 PostgreSQL Inbox/Run/Outbox；通用 Channel 调度实验、持久 Audit、Memory、向量库和对象存储尚未接入运行链路。平台基于 tRPC-Agent-Go Service 接口增加租户路由和能力矩阵，不把不同后端伪装成相同语义。
 
 Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 和向量索引是带来源版本的派生数据，默认最终一致且可重建。Session 迁移采用按会话冻结、复制、校验、切换和观察；向量库迁移从源文档重建新索引版本后原子切换。详细设计见 [数据模型](data-model.md) 和 [存储与一致性](storage-and-consistency.md)。
 
@@ -71,9 +75,11 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 | 文本回复 | `aibot_respond_msg` 透传 `req_id`，以固定 `stream.id` 发送最终文本；收到成功回执再确认 Outbox | Bot 消息 API 按 message/chat ID 回复；平台流式/卡片更新能力与普通文本分开 |
 | 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 按消息类型和 API 限额拆分/退避；限流、凭据失效与永久错误分别处理 |
 | 扩展与撤回 | 图片/文件需下载解密和媒体上传，卡片、欢迎语、主动发送有独立协议；均不进入首条文本链路 | 图片/文件、富文本、交互卡片和撤回分别映射事件与出站动作，未支持时明确拒绝或记录 |
-| 当前状态 | 已选演示方向，尚无 Adapter 或真实账号联调 | 保留第二类 IM 的差异设计，实现暂缓 |
+| 当前状态 | 单静态 Binding、单聊纯文本已实现，真实正常收发已验证；增量流、群聊、媒体、卡片和撤回仍为设计 | 保留第二类 IM 的差异设计，实现暂缓 |
 
 协议依据为[企微官方 SDK README](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/README.md) 和 [WebSocket 实现](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)，2026-09-07 核对；这里只参考协议，不将 Node SDK 引入 Go 服务。自建应用 Webhook 的 `msg_signature`/AES、HTTP 200 和 access token 发送流程是另一种接入模式，不与智能机器人长连接混用。未核实的平台回复有效期、跨连接重试能力和限频数值保持待联调，不能据 SDK 的本地请求超时推定平台保证。
+
+当前企微超长文本按 UTF-8 字节截断并带 `[truncated]` 标记，只发送一次 `finish=true`，不是逐字流式。生产限频设计在外部账号作用域分配配额、保持同会话顺序，按消息/API 类型配置额度，对已确认可重试的限流采用有上限的指数退避并遵守平台有效等待值；当前没有限频调度器，也不因发送失败自动重发。媒体下载/解密、受租户保护的附件引用和出站上传由 Adapter 负责；当前不支持的消息不进入 Runner。各项降级和待核实边界见[平台限制](im-acceptance-closure.md#平台限制的明确边界)。
 
 **飞书 HTTPS 回调设计，尚无 Adapter。** 当前只用它满足第二类 IM 的差异设计；代码和真实联调留待有余力时进行。入口拟为 `POST /channels/feishu/{account_id}/events`，每个飞书应用只登记一个回调 URL。路径中的账号 ID 仅定位服务端已登记的候选 Binding 和凭据引用（Verification Token、可选 Encrypt Key、预期 App ID 及允许的飞书 tenant_key），不是租户认证结果；不依赖请求体声明的 App/Tenant 去寻找任意密钥。
 
@@ -89,7 +95,7 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 
 **撤回策略仍属设计。** 收到已验证的撤回事件时，记录对原消息和 Run 的关联，不删除已经提交的 Audit 或 Session Event；撤回也不自动抵消已执行的 Tool。通道支持撤回机器人回复时，经 Outbox 提交撤回动作，否则按租户策略忽略或发送更正说明。该策略承接[冻结稿的撤回设计](submission-2026-08-27.md#55-im-接入与幂等)，不把撤回、媒体或卡片加入当前文本演示实现范围。
 
-两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`，敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
+设计上两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`，敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；生产扩展只有确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。当前企微每条最终回复最多一次发送尝试，未知结果保留 `duplicate_risk` 且不重发，连接换代后旧目标失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
 
 单聊按 Binding 与可信用户映射 Session，群聊按 Binding、群和显式线程划分，规则见[Session 命名](architecture.md#54-session-命名)。首版设计限制同一 Bot 只有一个活动接收连接，避免连接互相替换；断线重连停止旧连接的待回执等待。Inbox 提交前的进程故障可能丢失尚未持久化的帧，当前没有证据保证平台必然重投：监测连接与持久化失败、明确提示用户重试，生产可评估平台回放能力或本地持久接收层。该残余风险不因采用长连接而自动消失。
 
@@ -149,17 +155,17 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 | 风险与触发条件 | 当前边界与残余风险 | 检测/降级与生产缓解方案 |
 | --- | --- | --- |
 | 同 Session 并发或暂停的旧 Worker 恢复写入 | 已有合作型租约与取消；上游 AppendEvent 无 fence/CAS，不能原子拒绝旧 writer；Redis failover 不在互斥保证内 | 监测续约失败、重叠 Run 与 Event 异常；协调失败拒绝新 Run。严格生产要求需支持写入准入的后端或上游接口 |
-| IM 重复、乱序或落库前进程退出 | 实验 Inbox 对已提交事件去重、按受理顺序执行；无真实 Adapter，长连接未持久化帧不保证平台补投 | 监测重复数、连接中断、持久化错误和队列年龄；提示未受理消息重试。生产评估平台回放或持久接收层 |
-| Tool 执行成功但结果未知后重放 | 现有内置 Tool 无业务副作用；Channel 实验限制重放，不替外部系统提供幂等 | 未知结果转显式失败/人工对账；生产副作用 Tool 需业务操作键和结果查询，不能只依赖模型 tool_call_id |
+| IM 重复、乱序或落库前进程退出 | 企微 Inbox 持久去重并按同 Session 受理顺序执行/回复，本地集成已验证；长连接未持久化帧仍不保证平台补投 | 监测重复数、连接中断、持久化错误和队列年龄；提示未受理消息重试。生产评估平台回放或持久接收层 |
+| Tool 执行成功但结果未知后重放 | 现有内置 Tool 无业务副作用；企微已启动但结果未知的 Run 明确失败，不自动重跑，不替外部系统提供幂等 | 未知结果转显式失败/人工对账；生产副作用 Tool 需业务操作键和结果查询，不能只依赖模型 tool_call_id |
 | 作用域缺失导致跨租户读写 | 当前配置、Session、Tool 和 Secret 边界有隔离测试；未来向量库/对象存储尚未接入，RLS 未启用 | 拒绝缺失租户与越权请求，监测拒绝事件；生产为向量过滤、对象路径、审计和缓存逐层验证作用域，可加 RLS |
-| Worker 崩溃或 Outbox 未提交 | HTTP 已持久化内容取决于所选 Session 后端，默认 InMemory 重启丢失；Channel 恢复实验未接线 | 监测 Run 超期和未投递结果；生产按持久 Event 对账、attempt CAS 与 Outbox 恢复，禁止盲目重跑未知副作用 |
+| Worker 崩溃或 Outbox 未提交 | 企微要求持久 Session/Pin；未启动任务可恢复，已启动未知任务失败，尚无最终答案重建；HTTP 默认 InMemory 重启丢失 | 监测 Run 超期和未投递结果；生产按持久 Event 对账、attempt CAS 与 Outbox 恢复，禁止盲目重跑未知副作用 |
 | Summary/Memory 旧任务晚到 | 目前为设计，未提供派生存储；不可宣称已有版本检查 | 记录输入 Event 边界与索引延迟；旧版本丢弃/保留历史，可从源 Event 重建，用户可选择等待写后可见 |
 | 迁移切换后回退到旧源库 | 当前无迁移 Job；目标已有新写入时旧源不再完整 | 冻结 Session 并校验 Event ID、数量与摘要；写入未知时停止切换，对账补齐后回切，不允许静默回退 |
-| 慢模型/Tool 占满执行资源 | 有 Context 取消、Event 排空与 Tool 循环上限；没有完整 Run deadline、租户预算或断路器 | 监测活跃 Run、耗时和取消后残留；生产增加分级超时、配额、舱壁和告警，后端故障不降级为易失存储 |
+| 慢模型/Tool 占满执行资源 | 有 Context 取消、Event 排空与 Tool 循环上限；企微有持久执行预算，当前单消费者串行，无租户预算或断路器 | 监测活跃 Run、耗时和取消后残留；生产增加分级超时、配额、舱壁和告警，后端故障不降级为易失存储 |
 | Secret 被日志、错误或上游地址带出 | 已有 SecretRef entitlement 与明确错误边界脱敏；base_url 无出站白名单，环境变量不是进程隔离，配置摘要不是签名 | 限制管理与出站网络权限，审计目标域名与授权变更；生产增加 Secret Manager、轮转及敏感日志检测 |
-| IM 限流、发送超时或旧 req_id 失效 | 实验 Dispatcher 区分失败/未知；真实发送未验证，客户端关联 ID 不保证外部 exactly-once | 监测投递年龄、回执超时和 duplicate_risk；按平台限制退避，失效目标停止自动发送并对账，发送失败不重跑 Agent |
+| IM 限流、发送超时或旧 req_id 失效 | 企微正常发送获真实 ACK；拒绝/未知/旧目标由本地测试验证，每条最终回复最多一次尝试，无完整限流器和最终送达保证 | 监测投递年龄、回执超时和 duplicate_risk；生产按平台能力决定配额、条件退避及对账，失效目标停止发送，发送失败不重跑 Agent |
 | Runtime/连接缓存持续增长 | 已有引用计数与关闭顺序；Runtime/Bundle 无完整 TTL/LRU，每租户 Profile 有上限，总租户数仍影响资源量 | 监测缓存数、活跃租约、连接和内存；生产按资源预算淘汰空闲对象，先拒绝新引用再等待活动引用退出 |
-| 排期推动过度实现或虚报能力 | 七项设计验收与代码状态分开；现有未提交 Channel 不算真实 IM，容量数值是估算 | 按交付物复核、单目标切片和证据检查收口；非阻断风险登记，超出范围冻结，保留可运行参考链路 |
+| 排期推动过度实现或虚报能力 | 七项设计验收与代码状态分开；只将已提交企微消费者及对应测试计入实现，其余 Channel 实验不纳入，容量数值是估算 | 按交付物复核、单目标切片和证据检查收口；非阻断风险登记，超出范围冻结，保留可运行参考链路 |
 
 ## 10. 交付与验收
 

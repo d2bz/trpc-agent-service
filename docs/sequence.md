@@ -2,7 +2,9 @@
 
 ## 1. 企业微信完整链路
 
-以下是目标架构的智能机器人长连接时序；当前代码未接入真实 IM、Memory 或完整 OTel。Webhook 方案需要按其协议在持久受理后返回 HTTP 确认，不能把这一步套到长连接。
+以下图示保留生产目标架构，含通用 Worker、Redis 唤醒、Memory 和完整 OTel；这些扩展不代表当前接线。当前企微专用 Consumer 已接通真实 Runner 和 PostgreSQL Inbox/Run/Outbox，并完成[真实正常单聊](wecom-text-slice.md#真实单聊验证)。Webhook 的持久受理后 HTTP 确认不能套到企微长连接。
+
+当前运行顺序是：受信任连接的单聊文本 → 静态 Binding/用户映射 → Store.Accept 持久受理 → Tenant/Binding 范围内 ClaimNextRun → 共享 Session Run 获取租约、Pin 和 Runtime → MarkRunStarted → Runner → 排空 Event 并筛选最终文本 → Close Handle → FinishRun 原子写终态与一个 Outbox → 最多一次 `finish=true` 回复 → 记录成功/失败/未知。Memory、Redis 通知及完整 OTel 仍为设计；当前没有实时增量、卡片或媒体回复。
 
 ```mermaid
 sequenceDiagram
@@ -75,20 +77,20 @@ sequenceDiagram
     end
 ```
 
-`trace_id` 从 Gateway 创建后写入 Context，并传递给 Runner、Model、Tool、Session、Memory 和出站发送 Span。`request_id` 是平台 Run 的稳定业务标识，也作为重试、取消、结果查询和成本聚合的关联键。`msgid` 是企微事件去重标识，企微 `req_id` 只用于平台协议回复关联；二者均不能替代本平台生成的 `request_id`。Outbox 持久化 `traceparent`，发送进程恢复关联 Span；这些完整 Trace 传播属于设计，当前 HTTP 已实现的是 `X-Request-ID` 及 Event 的关联。
+目标设计使 `trace_id` 从 Gateway 传入 Runner、Model、Tool、Session、Memory 和出站 Span，Outbox 持久化 `traceparent`；完整 Trace 传播尚未实现。当前企微 Consumer 生成并持久化 `request_id`，传入共享 Session Run 关联执行；HTTP 使用 `X-Request-ID`。企微 `msgid` 用于去重，`req_id` 只用于回复关联，均不替代平台请求 ID；结果查询、取消接口及成本聚合仍是目标设计。真实样例中的 `sent` 仅证明收到平台 `errcode=0` 回执，不表示用户已读。
 
 ## 2. 关键顺序规则
 
-一次 Run 内按以下顺序处理：
+生产目标的一次 Run 按以下顺序处理；当前 Consumer 与第 3、7、8 项的差异分别注明：
 
 1. 长连接认证且机器人账号匹配后才解析租户和身份；Webhook 模式先验签解密。
 2. Inbox 提交后才启动 Run。长连接不虚构入站 ACK 或断线回放保证；Webhook 仅在持久受理后返回成功确认。
-3. 获取 Session 租约后，先以 PostgreSQL 条件更新 claim Run；claim 提交成功后才确认 Redis 唤醒并加载 Runtime。
+3. 生产 Worker 获取租约并 claim 后确认 Redis 唤醒；当前 Consumer 先 claim PostgreSQL Run，再经共享 `sessionrun.Start` 获取 Session 租约、Pin 和 Runtime，在剩余预算内等待 Web 租约，成功 MarkRunStarted 后才执行，其后不得 Yield 或第二次调用 Runner。
 4. Runner 顺序持久化用户输入、模型输出、Tool 调用和 Tool 结果 Event。
 5. StateDelta 与对应 Event 由具体 Session Backend 在同一原子操作中处理；平台不拆开写入。
 6. Run 完成后，以当前 `claim_token` 做 CAS，在一个 PostgreSQL 事务内写入终态和 Outbox；迟到的旧 attempt 无权覆盖。
-7. 以已提交 Event 的边界触发 Summary 和 Memory 更新。
-8. 回复先进入 Outbox，再调用 IM API；网络错误只重试 Outbox，不重新运行 Agent。
+7. 生产目标以已提交 Event 边界触发 Summary 和 Memory 更新；当前企微没有接入这些派生服务。
+8. 回复先进入 Outbox，再调用 IM API；生产仅在平台允许时重试发送。当前企微最多一次终态发送，拒绝、未知或目标过期不自动重发，也不重新运行 Agent。
 
 Summary 是派生数据，必须记录输入 Event 边界。旧 Summary 生成任务晚到时，如果其边界小于当前版本，只保存历史版本或丢弃，不能覆盖更新的 Summary。
 
@@ -114,13 +116,13 @@ sequenceDiagram
     R->>S: 追加 B 的 Event
 ```
 
-HTTP 调用方可以选择等待或收到 `409 session_busy`；IM 场景默认按到达时间排队。队列必须有最大长度和等待超时，超过限制时返回明确的繁忙提示。
+上图是同 Session 顺序执行的目标示意，不表示租约对象直接传给下一请求。生产队列还需容量和等待上限；当前 HTTP 拿不到租约时返回 `409 session_busy`，企微以 PostgreSQL 受理序逐条执行并先结束前一条回复的发送处理，再执行下一条。
 
-> **当前实现只到"获得租约/被拒绝"这一步。** 上图里的队列尚未实现：拿不到租约的请求直接收到 `409 session_busy` + `Retry-After`，不排队、不继承租约。租约本身也只在 Run 入口互斥，不阻止已经在写的旧 Worker——见 [Session Run Lease](session-lease.md)。
+当前企微 Consumer 已验证同 Session 顺序，以及 Web 占用同一 Session 租约后在预算内等待继续；每次仍须独立获取租约，不提供通用有界队列或跨 Session 并行。租约只在 Run 入口互斥，不阻止旧 Worker 的存储写入，见 [Session Run Lease](session-lease.md)。
 
 ## 4. Worker 故障与重试
 
-Worker 可能在三个阶段故障：
+以下恢复表属于生产目标，含未纳入交付的通用 Worker/Hold/Transcript 对账与 Redis 唤醒。当前企微 Consumer 只在可信 Tenant/Binding 范围内扫描：未启动任务可继续；`FirstExecutionStartedAt` 非空的中断任务明确失败，不重放模型或 Tool；旧连接目标和未知发送终态结束，不承诺跨重启最终送达。本地恢复测试与真实正常单聊证据分别见[企微文本切片](wecom-text-slice.md#验证结果)。
 
 | 故障点 | 恢复方式 |
 | --- | --- |
@@ -131,7 +133,7 @@ Worker 可能在三个阶段故障：
 | Session 已有最终结果、Run/Outbox 未提交 | 从已持久化结果对账并生成 Outbox，不重跑 Agent；终态仍须通过当前 `claim_token` CAS 提交 |
 | 回复请求超时、结果未知 | 仅在平台支持时查询状态或使用幂等接口；企微回复引用跨连接有效性未核实，不默认重试成功。目标失效时记录失败，不能改为重跑 Agent |
 
-Redis PEL 只覆盖“Worker 尚未成功 claim PostgreSQL Run”的唤醒窗口。一旦 Run 已经进入 `running`，恢复权归 PostgreSQL deadline 扫描器；扫描器还必须按 `last_dispatched_at` 周期重投长期停留在 `accepted` 的 Run，不能只处理从未投递过的行。
+生产设计中 Redis PEL 只覆盖“Worker 尚未成功 claim PostgreSQL Run”的唤醒窗口，claim 后由 PostgreSQL deadline 扫描器接管。当前专用 Consumer 不使用 Redis PEL、Waker 或通用 Scanner；同数据库对象重建测试不等于真实平台故障验证，也没有实现“已有最终 Session 结果但 Outbox 未提交”窗口的答案重建。
 
 ## 5. HTTP 流式链路差异
 

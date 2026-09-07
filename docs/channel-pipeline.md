@@ -3,7 +3,7 @@
 > 冻结日期：2026-09-03
 > 适用范围：Channel 公共链路第一版。后续 Adapter 可以扩展消息类型，但不得绕过本文的持久化、租户、状态机和恢复边界。
 
-2026-09-07 状态：本文保留 Channel 实验的工程契约，不作为原题必须全部实现的清单。相关代码尚未提交和接线，真实 IM 未完成；本次文档检查点不包含这些运行时代码。当前长连接协议、发送未知结果与合作型租约限制以[方案](solution.md#55-im-接入差异)、[Session 租约边界](session-lease.md)和[验收记录](verification-2026-09-07.md)为准。
+2026-09-07 状态：本文保留 Channel 实验的工程契约，不作为原题必须全部实现的清单。PostgreSQL Store 已选择性提交，企业微信专用消费者已通过现有 `sessionrun.Start/Run` 接线并完成真实正常单聊验证。下文通用 Worker/Dispatcher、Redis Waker、Hold/Open、Transcript 对账和自动续跑仍为未纳入的实验，不能当作企微当前行为。当前实现、保守恢复及最多一次最终发送以[企微文本切片](wecom-text-slice.md)为准；原题四项设计对应[IM 收口](im-acceptance-closure.md)。
 
 ## 1. 目标与所有权
 
