@@ -1,6 +1,28 @@
 # 验收矩阵
 
-> 状态说明：`planned` 表示设计已覆盖但代码未完成，`partial` 表示已有部分实现或验证，`done` 表示代码、测试、文档和演示证据全部齐备。
+## 原题设计验收
+
+2026-09-07 按[原题](../README.md#验收标准)重新确定交付口径：设计须覆盖完整要求，并提供与设计对应的 GitHub 实现代码；原题明确不要求完整系统，也没有逐功能全部编码的清单。下面七项按设计内容验收，不能由功能实现状态代替。
+
+| 原题项 | 必须说明的内容 | 设计证据入口 | 复核状态 |
+| --- | --- | --- | --- |
+| 1 | 多租户、节点化部署、同步、多后端、IM、治理监控、故障恢复 | [方案](solution.md)、[架构](architecture.md) | 2026-09-07 内容复核通过 |
+| 2 | tenant、agent、binding、session、event、memory、summary、audit 关系 | [数据模型](data-model.md) | 2026-09-07 内容复核通过，已统一账号绑定唯一性 |
+| 3 | 至少两类 IM 的接入差异，包含微信或企微 | [企微与飞书差异](solution.md#55-im-接入差异) | 2026-09-07 内容复核通过，企微已对齐智能机器人长连接 |
+| 4 | 至少三类后端的存储和同步策略 | [存储与一致性](storage-and-consistency.md) | 2026-09-07 内容复核通过，已限定迁移回退条件 |
+| 5 | 完整消息时序及 trace_id 或 request_id 的贯穿方式 | [核心时序](sequence.md) | 2026-09-07 内容复核通过，主图已渲染检查 |
+| 6 | 至少八项生产风险和缓解措施 | [当前十二项风险](solution.md#9-主要风险)、本页已知限制 | 2026-09-07 内容复核通过，含当前边界、检测/降级和缓解方案 |
+| 7 | tRPC-Agent-Go 复用能力与平台新增职责 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) | 2026-09-07 内容复核通过 |
+
+这是项目内部的设计内容复核，不是赛事最终批准，也不表示功能全部实现。[本轮验收记录](verification-2026-09-07.md)列出八类交付物、当前工作树验证和仍未完成的交付事项。
+
+风险清单应说明触发条件、影响、当前边界、检测或降级、生产缓解方案及残余限制，不要求本版实现全部缓解措施。实际提供的能力仍须兑现明确承诺，并解决其发布阻断问题。
+
+## 设计与实现追踪
+
+以下 A01-A28、D01-D08、F01 及 I01-I15 保留为细化追踪，不是原题要求全部实现的清单。状态按代码/证据完成度记录：`planned` 表示尚无已验收实现，`partial` 表示已有部分实现或验证，`done` 表示该条明确范围所需证据齐备；它们不代表上表设计验收是否通过，也不自动形成开发排期。
+
+截至 2026-09-07，Channel 未提交实验已修复跨租户碰撞测试的 Run ID 夹具。本轮当前工作树全仓默认 `go test -race -count=1 -timeout 900s ./...`、`go vet ./...`、构建和 8 项 HTTP/SSE 演示检查通过；真实 PostgreSQL/Redis 门控集成未在本轮运行，真实 IM Adapter 与启动接线尚未完成。工作树绿测不等于这些未提交代码已经在 GitHub 交付，详见本轮验收记录。
 
 | ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -16,12 +38,12 @@
 | A10 | Memory 跨节点可见性 | [Memory 顺序](storage-and-consistency.md#53-memory) | 待实现双 Worker 可见性测试 | planned |
 | A11 | Redis 到 SQL 迁移 | [Session 迁移](storage-and-consistency.md#71-sessionredis-到-sql) | 待实现迁移 Job 与校验测试 | planned |
 | A12 | 本地到远端向量库迁移 | [向量迁移](storage-and-consistency.md#72-向量库迁移) | 待实现索引重建与切换测试 | planned |
-| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | 待实现三次投递单 Run 测试 | planned |
-| A14 | 至少两类 IM，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 待实现企业微信和飞书 Adapter/E2E | planned |
-| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | 待实现 InboundEnvelope/Outbox 测试 | planned |
+| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | 未提交 Channel 实验已有 Ingress 重复投递测试，真实 IM 重复事件链路尚未验收 | partial |
+| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 已选演示方向为网页聊天和企微智能机器人长连接，尚未完成；飞书保留差异设计，不要求双真实 IM 收发，网页不替代第二类外部 IM 差异设计 | planned |
+| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | 未提交 Channel 实验已有 Ingress、Worker、Dispatcher 及相关测试；真实 Adapter 转换和启动接线尚未完成 | partial |
 | A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 待实现验签向量与身份测试 | planned |
 | A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 待实现键生成与隔离测试 | planned |
-| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 待实现分片、429、媒体和重试测试 | planned |
+| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 未提交 Channel 实验已有 Sender/Dispatcher 及测试；具体企微平台限制尚未验收，媒体不在已选文本演示范围 | partial |
 | A19 | Plugin/Guardrail/Callback 租户治理 | [Tool 与 Policy Runtime](tool-policy.md)、[治理](solution.md#56-治理与安全) | 已实现静态 Tool Registry、Revision ToolRefs、Policy 白名单交集、未知/重复/越权 fail closed、Tool callback 审计和工具循环上限；租户级 PolicyRef entitlement 已实现，在创建、发布和 Runtime 构建三处由同一个 authorizer 判定（见 I14）；预算、审批、Guardrail 和动态扩展待实现 | partial |
 | A20 | 指标与租户成本 | [可观测性](solution.md#57-可观测性)、[容量估算](solution.md#6-容量估算方法) | 待实现 OTel Metric 与成本聚合测试 | planned |
 | A21 | 全链路 Trace | [完整时序](sequence.md#1-企业微信完整链路) | 待实现 trace 传播集成测试 | planned |
@@ -32,15 +54,15 @@
 | A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及 Session Revision Pin：发布和回滚都不会改变已开始的会话；`postgres` profile 下 Pin 与控制面同库，重启和多进程都能读到同一个 Pin（见 I10），权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
-| D01 | 2000-4000 字架构方案 | [正式提交方案](submission-2026-08-27.md) | 1.0 中文正文 3288 字，已完成提交前检查 | partial |
+| D01 | 架构方案，原题建议 2000-4000 字 | [正式提交方案](submission-2026-08-27.md) | 1.0 中文正文 3288 字，历史提交前检查已完成；当前交付待复核 | partial |
 | D02 | 系统架构图 | [正式架构图](submission-2026-08-27.md#3-总体架构) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
 | D03 | 核心时序图 | [正式时序图](submission-2026-08-27.md#4-核心消息链路) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
-| D04 | 数据模型 | [数据模型](data-model.md) | ER 图由 Mermaid CLI 11.12.0 渲染通过；迁移文件待实现 | partial |
-| D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | Session Run Lease、Revision Pin、Storage Router 的并发与关闭测试已实现；Inbox/Outbox、Memory/Summary 和迁移一致性测试待实现 | partial |
+| D04 | 数据模型 | [数据模型](data-model.md) | ER 图由 Mermaid CLI 11.12.0 渲染通过；原题允许表结构或 JSON Schema，不要求全部数据库迁移 | partial |
+| D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | Session Run Lease、Revision Pin、Storage Router 的并发与关闭测试已实现；Inbox/Outbox 实验尚未整体验收，Memory/Summary 和迁移一致性测试待实现 | partial |
 | D06 | 多后端适配方案 | [后端路由与取舍](storage-and-consistency.md#1-统一后端路由) | Session 三种 Adapter、不可变租户 BackendProfile、生产 Router 和动态 InMemory/PostgreSQL/Redis Factory 已实现；Memory/Knowledge/Artifact 后端与完整能力矩阵仍待实现 | partial |
 | D07 | 至少 8 个风险与缓解 | [风险清单](submission-2026-08-27.md#8-主要风险与应对) | 12 项已记录并完成复核 | partial |
-| D08 | GitHub 实现代码 | 当前仓库 | 已有最小可运行链路，完整平台功能待实现 | partial |
-| F01 | 明确上游复用与平台新增 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) | 已固定上游依赖并验证 LLMAgent、Runner、Session、OpenAI Server，以及 `model/openai` 的 OpenAI-compatible 模型构造；平台模块待继续实现 | partial |
+| D08 | GitHub 实现代码 | 当前仓库 | 已有最小可运行链路；当前提交版本、仓库入口和复现证据待确认，原题不要求完整平台功能 | partial |
+| F01 | 明确上游复用与平台新增 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) | 已固定上游依赖并验证 LLMAgent、Runner、Session、OpenAI Server，以及 `model/openai` 的 OpenAI-compatible 模型构造；其余平台职责以设计和明确实现范围分别验收 | partial |
 
 ## 阶段性实现证据
 
@@ -84,4 +106,4 @@
 
 ## 验收使用方式
 
-每完成一个功能，必须同时补充代码路径、测试命令和演示步骤，再把状态改为 `done`。只有设计文档的条目保持 `planned` 或 `partial`，不能因为“已设计”而宣称功能完成。
+先复核七项原题设计验收和八类交付物，再验证选入交付的参考实现。只有设计材料也可以满足对应的设计要求，但不能因此宣称功能已实现。功能条目变为 `done` 前须补充其明确范围内的代码路径、测试命令及适用的演示证据；未选中的扩展能力保留现状和风险说明，不以清空 `planned/partial` 为目标。

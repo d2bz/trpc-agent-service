@@ -68,7 +68,7 @@ type BackendCapabilities struct {
 | Knowledge 元数据和源文档 | PostgreSQL + Object Storage | 元数据强一致 | 源文档是重建索引的事实来源 |
 | Knowledge Chunk/Embedding | PGVector/Qdrant/Milvus 等 | 最终一致 | 可按索引版本重建和切换 |
 | Artifact | S3-compatible Storage | 写入后可读 | 适合大对象、生命周期和独立扩容 |
-| 限流、幂等快路径、Session 租约 | Redis | 短期强原子 | Lua/SET NX、低延迟、天然 TTL |
+| 限流、Session 租约、Worker 唤醒 | Redis | 短期强原子/可丢失通知 | Lua/Streams、低延迟、天然 TTL；持久正确性由 PostgreSQL 保证 |
 
 本地模式允许 InMemory/SQLite/本地文件，但能力矩阵必须标记 `SharedAcrossNodes=false`，启动生产角色时拒绝不安全组合。
 
@@ -77,7 +77,7 @@ type BackendCapabilities struct {
 | 后端 | 优点 | 限制 | 推荐用途 |
 | --- | --- | --- | --- |
 | InMemory | 零依赖、延迟低 | 重启丢失、不可跨节点 | 单元测试和本地演示 |
-| Redis | 低延迟、TTL、原子命令 | 内存成本高，复杂查询弱 | 热 Session、锁、幂等、限流 |
+| Redis | 低延迟、TTL、原子命令 | 内存成本高，复杂查询弱，通知可丢失 | 热 Session、租约、限流、Worker 唤醒 |
 | PostgreSQL/MySQL | 事务、唯一约束、查询和审计能力强 | 写延迟高于 Redis，需维护索引 | 配置、持久 Session、Run、Audit |
 | SQLite | 部署简单 | 多节点和高并发写受限 | 本地单节点 |
 | PGVector | 与 SQL 共用运维体系、事务边界清楚 | 超大规模向量性能有限 | 参赛生产参考实现 |
@@ -116,13 +116,13 @@ Run Coordinator 使用 Redis Lua 脚本完成：
 
 ### 4.2 Tool 副作用
 
-Session 串行不能防止 Worker 在 Tool 成功后崩溃。每个具有副作用的 Tool 必须接收：
+Session 串行不能防止 Worker 在 Tool 成功后崩溃。每个允许自动重放且具有副作用的 Tool 必须接收跨 attempt 稳定的业务幂等键，例如：
 
 ```text
-idempotency_key = request_id + tool_call_id
+idempotency_key = request_id + stable_operation_id
 ```
 
-Tool Adapter 在业务系统侧保存该键与结果。相同键再次调用时返回原结果。无法支持幂等的危险 Tool 不自动重放，Run 进入 `manual_review`。
+`stable_operation_id` 必须由平台或业务 Tool 根据已持久化的业务操作确定，不能直接使用上游 `tool_call_id`：模型再次调用时可能生成新的 Tool Call ID，它只能标识单次模型 attempt 内的调用。Tool Adapter 在业务系统侧保存幂等键与结果，相同键再次调用时返回原结果。没有显式可重放声明或无法提供业务幂等的 Tool，在执行结果未知时不自动重跑，Run 以明确错误失败并进入人工处理。
 
 ## 5. Event、State、Summary 和 Memory 顺序
 
@@ -158,14 +158,11 @@ Memory 从已完成 Session/Run 的稳定 Event 中异步提取。Memory 写入 
 inbound:{channel_binding_id}:{external_event_id}
 ```
 
-处理分两层：
-
-1. Redis `SET NX` 是低延迟快路径，短 TTL 状态为 `processing`，完成后延长保留期。
-2. PostgreSQL `UNIQUE (tenant_id, channel_binding_id, external_event_id)` 是持久正确性保证。
+PostgreSQL `UNIQUE (tenant_id, channel_binding_id, external_event_id)` 是唯一的持久去重事实源。受信任的 Adapter 消息在一个事务内插入或命中 Inbox，并为首次事件创建 `accepted` Run；重复请求读取原 `request_id`，不创建第二个 Run。Webhook 只有事务提交后才返回成功确认；长连接的推送与回执边界见[IM 设计](solution.md#55-im-接入差异)。Redis 不在数据库提交前做 `SET NX` 去重，否则会出现“Redis 写成功、SQL 事务失败、平台重投又被 Redis 拦截”的丢消息窗口。
 
 重复请求返回原 `request_id` 和已受理状态，不创建新 Run。没有稳定事件 ID 的平台，使用平台建议字段组成规范字符串后计算摘要，并记录碰撞与误判风险。
 
-首次 Inbox 提交后，将 `inbox_id + traceparent` 投递到 Redis Streams。Consumer Group 提供 Worker 分发和故障认领；定时扫描 PostgreSQL 非终态 Inbox 负责修复“数据库已提交但 Stream 未投递”的窗口。
+首次 Inbox/Run 事务提交后，将 `run_id + traceparent` 投递到 Redis Streams。Consumer Group 的 PEL 只恢复 Worker 尚未成功 claim PostgreSQL Run 的唤醒；claim 成功后即 XACK。PostgreSQL 扫描器负责把 deadline 已过的 `running` attempt 重置为 `accepted`，并按 `last_dispatched_at` 重新投递长期 `accepted` 的 Run，包括曾成功 XADD 但通知丢失或被裁剪的情况。所有终态更新都以本 attempt 的 `claim_token` 做 CAS，旧 Worker 的迟到结果不得覆盖新 attempt。
 
 ### 6.2 出站
 
@@ -194,9 +191,9 @@ planned → snapshotting → syncing → verifying → cutover → draining → 
 4. 从源后端读取 State、Event 和 Summary 快照，按稳定 Event ID 幂等写入目标。
 5. 比较 Event 数量、摘要和抽样内容校验和。
 6. 原子更新 Session 目录中的 `backend_profile_id`。
-7. 进入观察期，读取失败可回退源后端；确认后再按保留策略清理源数据。
+7. 进入观察期。只有目标尚无新增写入、所有在途写入已停止且源目标校验一致时才允许切回源后端。一旦目标已接受新 Event 或写入结果未知，先冻结该 Session，对账补齐并重新校验后才能回切；不能静默读取旧源库。确认后再按保留策略清理源数据。
 
-迁移以 Session 为单位，不全局停机。实现在线双写前，短暂冻结一个 Session 比跨后端分布式事务更可靠，也更符合参赛工期。
+迁移以 Session 为单位，不全局停机。迁移前必须等待活动 Run 和在途写入排空；合作型租约本身不能证明旧 writer 已停止，不满足静默期条件时停止切换。以上为迁移设计，当前没有迁移 Job、目录切换 API 或跨后端双写实现，不以此宣称在线迁移已可用。
 
 ### 7.2 向量库迁移
 

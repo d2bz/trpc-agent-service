@@ -2,6 +2,8 @@
 
 ## 1. 企业微信完整链路
 
+以下是目标架构的智能机器人长连接时序；当前代码未接入真实 IM、Memory 或完整 OTel。Webhook 方案需要按其协议在持久受理后返回 HTTP 确认，不能把这一步套到长连接。
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -19,25 +21,30 @@ sequenceDiagram
     participant OB as Reply Outbox
     participant OT as OpenTelemetry
 
+    CA->>WC: WSS 连接，aibot_subscribe(bot_id, secret)
+    WC-->>CA: 认证成功回执
     User->>WC: 发送消息
-    WC->>CA: Webhook 回调
-    CA->>CA: 验签、解密、解析消息
+    WC->>CA: aibot_msg_callback(msgid, req_id)
+    CA->>CA: 校验连接绑定与 aibotid，解析用户文本
     CA->>GW: InboundEnvelope
     GW->>OT: 建立 trace，生成 request_id/traceparent
     GW->>DB: 查询 Channel Binding 与发布路由
-    GW->>DB: INSERT Inbox(external_event_id)
+    GW->>DB: 事务：INSERT Inbox + INSERT Run(accepted)
 
     alt 重复投递
-        DB-->>GW: 唯一键冲突，返回已有 request_id
+        DB-->>GW: 唯一键命中，返回已有 request_id
         GW-->>CA: 已受理
-        CA-->>WC: 200 OK
+        Note over CA,WC: 不创建第二个 Run，无 HTTP 确认步骤
     else 首次投递
-        DB-->>GW: tenant_id + app_id + revision_id
+        DB-->>GW: 提交 Inbox/Run，返回 run_id + request_id
         GW-->>CA: 已受理
-        CA-->>WC: 200 OK
-        GW->>RC: Redis Stream(inbox_id, traceparent)
+        Note over CA,WC: Inbox 提交仅代表平台内部持久受理
+        GW->>RC: 提交后 Redis Stream(run_id, traceparent)
         RC->>OT: Extract traceparent，恢复/关联 trace
         RC->>RC: 获取 Session 租约
+        RC->>DB: 条件 claim accepted Run，attempt++，生成 claim_token
+        DB-->>RC: claim 提交成功
+        RC->>RC: XACK 唤醒消息
         RC->>RM: 获取指定 Revision Runtime
         alt Runtime 缓存未命中
             RM->>DB: 读取不可变 Revision 和 secret_ref
@@ -56,30 +63,32 @@ sequenceDiagram
         R->>S: 顺序追加 Event 和 StateDelta
         R-->>RC: 流式 Event Channel
         RC->>RC: 持续消费直到关闭
-        RC->>M: 异步写入 Memory
-        RC->>DB: 更新 Run 状态与成本
-        RC->>OB: 写入回复，幂等键=request_id+part
+        RC->>DB: 事务：按 claim_token 完成 Run + 写 Outbox
+        RC->>M: 按已提交 Event 边界派生 Memory
+        RC->>OB: 唤醒发送，幂等键=request_id+part
         RC->>RC: 释放 Session 租约
         OB->>CA: 发送任务
-        CA->>WC: 按长度拆分/媒体上传/限流发送
+        CA->>WC: aibot_respond_msg(req_id, stream.id, finish=true)
+        WC-->>CA: 同 req_id 的发送回执（检查 errcode）
         WC->>User: Agent 回复
-        CA->>DB: 记录投递结果
+        CA->>DB: 按 send_token 记录成功/失败/结果未知
     end
 ```
 
-`trace_id` 从 Gateway 创建后写入 Context，并传递给 Runner、Model、Tool、Session、Memory 和出站发送 Span。`request_id` 是平台 Run 的稳定业务标识，也作为重试、取消、结果查询和成本聚合的关联键。
+`trace_id` 从 Gateway 创建后写入 Context，并传递给 Runner、Model、Tool、Session、Memory 和出站发送 Span。`request_id` 是平台 Run 的稳定业务标识，也作为重试、取消、结果查询和成本聚合的关联键。`msgid` 是企微事件去重标识，企微 `req_id` 只用于平台协议回复关联；二者均不能替代本平台生成的 `request_id`。Outbox 持久化 `traceparent`，发送进程恢复关联 Span；这些完整 Trace 传播属于设计，当前 HTTP 已实现的是 `X-Request-ID` 及 Event 的关联。
 
 ## 2. 关键顺序规则
 
 一次 Run 内按以下顺序处理：
 
-1. 验签成功后才解析租户和身份。
-2. Inbox 首次写入成功后才向 IM 平台确认已受理。
-3. 获取 Session 租约后才加载 Session 和调用 Runner。
+1. 长连接认证且机器人账号匹配后才解析租户和身份；Webhook 模式先验签解密。
+2. Inbox 提交后才启动 Run。长连接不虚构入站 ACK 或断线回放保证；Webhook 仅在持久受理后返回成功确认。
+3. 获取 Session 租约后，先以 PostgreSQL 条件更新 claim Run；claim 提交成功后才确认 Redis 唤醒并加载 Runtime。
 4. Runner 顺序持久化用户输入、模型输出、Tool 调用和 Tool 结果 Event。
 5. StateDelta 与对应 Event 由具体 Session Backend 在同一原子操作中处理；平台不拆开写入。
-6. Run 完成后，以已提交 Event 的边界触发 Summary 和 Memory 更新。
-7. 回复先进入 Outbox，再调用 IM API；网络错误只重试 Outbox，不重新运行 Agent。
+6. Run 完成后，以当前 `claim_token` 做 CAS，在一个 PostgreSQL 事务内写入终态和 Outbox；迟到的旧 attempt 无权覆盖。
+7. 以已提交 Event 的边界触发 Summary 和 Memory 更新。
+8. 回复先进入 Outbox，再调用 IM API；网络错误只重试 Outbox，不重新运行 Agent。
 
 Summary 是派生数据，必须记录输入 Event 边界。旧 Summary 生成任务晚到时，如果其边界小于当前版本，只保存历史版本或丢弃，不能覆盖更新的 Summary。
 
@@ -115,11 +124,14 @@ Worker 可能在三个阶段故障：
 
 | 故障点 | 恢复方式 |
 | --- | --- |
-| Runner 调用前 | 任务仍在 Inbox，其他 Worker 重新领取 |
-| Runner 运行中、尚无外部副作用 | 租约过期后重跑，同一 Inbox 记录保持相同 `request_id` |
-| Tool 已产生副作用 | Tool 使用 `request_id + tool_call_id` 幂等；无法幂等的 Tool 标记为 `manual_review`，不自动重放 |
-| Session 已写入、回复未发送 | 不重跑 Agent，只从已持久化结果重新生成或重试 Outbox |
-| 回复请求超时、结果未知 | 先按平台能力查询投递状态；无法查询时以稳定客户端消息 ID 重试并记录可能重复风险 |
+| PostgreSQL claim 前 | Redis PEL 认领未确认唤醒；扫描器也会重新投递长期 `accepted` 的 Run |
+| claim 后、Runner 调用前 | Run deadline 扫描器把过期 `running` attempt 重置为 `accepted`；旧 `claim_token` 随即失效 |
+| Runner 已开始但结果未知 | 先对账 Session Event；仅当 Revision 无 Tool，或全部 Tool 明确声明可重放且具备跨 attempt 的业务幂等时，才允许自动续跑 |
+| Tool 结果未知且不满足重放条件 | Run 以 `tool_outcome_unknown` 失败并进入人工/显式错误处理；不能仅凭 Session 中还只有用户 Event 判断可重跑 |
+| Session 已有最终结果、Run/Outbox 未提交 | 从已持久化结果对账并生成 Outbox，不重跑 Agent；终态仍须通过当前 `claim_token` CAS 提交 |
+| 回复请求超时、结果未知 | 仅在平台支持时查询状态或使用幂等接口；企微回复引用跨连接有效性未核实，不默认重试成功。目标失效时记录失败，不能改为重跑 Agent |
+
+Redis PEL 只覆盖“Worker 尚未成功 claim PostgreSQL Run”的唤醒窗口。一旦 Run 已经进入 `running`，恢复权归 PostgreSQL deadline 扫描器；扫描器还必须按 `last_dispatched_at` 周期重投长期停留在 `accepted` 的 Run，不能只处理从未投递过的行。
 
 ## 5. HTTP 流式链路差异
 

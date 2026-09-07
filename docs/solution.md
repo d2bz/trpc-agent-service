@@ -5,6 +5,8 @@
 > 方案提交：2026-08-27
 > 项目验收：2026-09-11
 
+2026-09-07 校准：本文描述目标架构，完整设计覆盖原题，代码只需提供有代表性的实现。文中的生产组件和预期效果不自动成为本次必须编码的任务；当前设计验收、代码状态和证据见[验收矩阵](acceptance.md)。冻结的 8 月 27 日方案保留历史内容，旧全平台排期不再执行。
+
 ## 1. 背景与目标
 
 企业通常会为客服、研发、运营等不同业务建设多个 Agent。如果每个 Agent 独立实现 IM 接入、Session、Memory、知识库、权限、密钥、监控和部署，不仅重复建设，跨节点会话、数据隔离和合规审计也很难保持一致。
@@ -27,13 +29,13 @@
 - 控制面包括 Admin API、配置与发布、灰度回滚，管理 Tenant、Agent App、不可变 Agent Revision、Channel Binding、Backend Profile 和 Policy。
 - 数据面包括 Channel Adapter、Gateway、Inbox、Worker、Runtime Manager、Policy、Storage Router 和 Reply Outbox，负责一条消息的完整运行。
 
-开发阶段使用一个 Go 二进制按 `--role=all|gateway|worker|channel|job` 启动，避免过早微服务化。生产部署把 Gateway、Worker、Channel 和后台任务拆为独立 Kubernetes Deployment，并共享 PostgreSQL、Redis、PGVector、对象存储和 OpenTelemetry Collector。
+目标部署方案使用一个 Go 二进制按 `--role=all|gateway|worker|channel|job` 启动，生产部署可把 Gateway、Worker、Channel 和后台任务拆为独立 Kubernetes Deployment，并共享 PostgreSQL、Redis、PGVector、对象存储和 OpenTelemetry Collector。多角色参数与生产部署当前未实现，属于架构说明。
 
 详细架构图和职责见 [总体架构设计](architecture.md)。
 
 ## 4. 核心运行链路
 
-企业微信消息到达后，Channel Adapter 先验签、解密并转换为统一消息；Gateway 根据外部账号确定 Channel Binding、Tenant 和 Agent App，并持久化 Inbox 幂等记录，再通过 Redis Streams 投递 `inbox_id`。Run Coordinator 获取 Session 租约，Runtime Manager 加载指定 Revision 的 Agent/Runner，Worker 调用 tRPC-Agent-Go Runner，读取 Session/Memory、检索 Knowledge、执行 Tool/MCP，并持续消费流式 Event。结果写入 Session、Memory、Run 和 Audit，最终通过 Outbox 重试发送到企业微信。
+企业微信智能机器人 Adapter 通过 Bot ID/Secret 订阅长连接，只处理已认证连接上、机器人标识匹配的消息。Gateway 根据受信任的账号绑定确定 Tenant/App，在一个 PostgreSQL 事务内插入或命中 Inbox 并为首次事件创建 `accepted` Run，提交后再通过 Redis Streams 投递 `run_id`。Run Coordinator 获取 Session 租约并成功 claim PostgreSQL Run 后，Runtime Manager 才加载指定 Revision 的 Agent/Runner。Worker 调用 tRPC-Agent-Go Runner，读取 Session/Memory、检索 Knowledge、执行 Tool/MCP，并持续消费流式 Event。结果写入 Session、Memory、Run 和 Audit，最终通过 Outbox 发送到企业微信。长连接没有 HTTP 200 确认步骤；消息推送、Inbox 提交、回复回执是三个不同事实，边界见下文 IM 设计。
 
 `trace_id` 贯穿 IM callback、Gateway、Runner、Model、Tool、Session/Memory 和 IM 回复；跨 Redis Streams 时显式携带 W3C `traceparent` 并在 Worker 恢复上下文。`request_id` 贯穿幂等、取消、状态查询、成本和审计。完整时序见 [核心消息时序](sequence.md)。
 
@@ -53,27 +55,33 @@ Agent App 是稳定业务身份；Agent Revision 是模型、Prompt、Tool、Ski
 
 ### 5.4 多后端与一致性
 
-参考实现使用 PostgreSQL 保存配置、Inbox/Outbox、Run 和 Audit；Redis 保存热 Session、租约、幂等和限流；PGVector 保存 Knowledge/Memory 向量；S3-compatible storage 保存 Artifact 和知识源文件。平台基于 tRPC-Agent-Go Service 接口增加租户路由和能力矩阵，不把不同后端伪装成相同语义。
+目标架构使用 PostgreSQL 保存配置、Inbox/Outbox、Run 和 Audit，并作为入站去重与任务状态的唯一事实源；Redis 保存热 Session、租约、限流和可丢失的 Worker 唤醒；PGVector 保存 Knowledge/Memory 向量；S3-compatible storage 保存 Artifact 和知识源文件。当前入口已接入配置与 Session 路由；Channel 是未接线实验，持久 Audit、Memory、向量库和对象存储仍属设计。平台基于 tRPC-Agent-Go Service 接口增加租户路由和能力矩阵，不把不同后端伪装成相同语义。
 
 Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 和向量索引是带来源版本的派生数据，默认最终一致且可重建。Session 迁移采用按会话冻结、复制、校验、切换和观察；向量库迁移从源文档重建新索引版本后原子切换。详细设计见 [数据模型](data-model.md) 和 [存储与一致性](storage-and-consistency.md)。
 
 ### 5.5 IM 接入差异
 
-| 能力 | 企业微信 | 飞书 |
+| 能力 | 企业微信智能机器人长连接 | 飞书事件订阅 |
 | --- | --- | --- |
-| 入站方式 | HTTPS Webhook 回调 | 事件订阅 Webhook 或 WebSocket 长连接 |
-| 安全 | `msg_signature` 验签、AES 解密 | Verification Token、Encrypt Key、请求签名 |
-| 回调时限 | 需快速确认，长任务主动回复 | 事件快速确认，长任务调用 Bot 消息 API |
-| 会话 | 企业成员、外部联系人、群聊 | Chat、User、Thread |
-| 富消息 | 文本、图片、文件、模板/应用消息 | 文本、富文本、图片、文件、交互卡片 |
-| 限流处理 | 按企业/应用接口限制退避 | 按应用与群维度限频并退避重试 |
-| 参考用途 | 满足微信体系验收并验证企业身份 | 低成本真实联调和第二通道差异 |
+| 入站方式 | 主动连接 `wss://openws.work.weixin.qq.com`，发送 `aibot_subscribe`；接收 `aibot_msg_callback` | HTTPS 事件订阅；也可使用官方 SDK 长连接 |
+| 安全 | Bot ID/Secret 认证；校验事件 `aibotid` 与受信任连接绑定一致，不用自建应用 access token | Webhook 校验 Verification Token、启用加密时按 Encrypt Key 验签解密；长连接使用应用凭据认证 |
+| 入站确认 | 推送帧没有 HTTP 响应；只有 Inbox 事务提交后才在平台内部标记受理，不假定断连后必然补投 | Webhook 快速确认前提交 Inbox；长连接确认由 SDK/协议处理，需核对处理器和确认顺序 |
+| 幂等与回复关联 | `body.msgid` 作入站事件键；`headers.req_id` 用于回复关联，不等同于平台 `request_id` | 事件 ID 作入站去重键；message/chat/thread 标识用于回复定位 |
+| 身份与会话 | `from.userid`、`chattype`、群聊 `chatid`，机器人账号先绑定 Tenant/App | App、Chat、User、Thread 共同决定绑定和会话作用域 |
+| 文本回复 | `aibot_respond_msg` 透传 `req_id`，以固定 `stream.id` 发送最终文本；收到成功回执再确认 Outbox | Bot 消息 API 按 message/chat ID 回复；平台流式/卡片更新能力与普通文本分开 |
+| 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 按消息类型和 API 限额拆分/退避；限流、凭据失效与永久错误分别处理 |
+| 扩展与撤回 | 图片/文件需下载解密和媒体上传，卡片、欢迎语、主动发送有独立协议；均不进入首条文本链路 | 图片/文件、富文本、交互卡片和撤回分别映射事件与出站动作，未支持时明确拒绝或记录 |
+| 当前状态 | 已选演示方向，尚无 Adapter 或真实账号联调 | 保留第二类 IM 的差异设计，实现暂缓 |
 
-两个 Adapter 共享统一 InboundEnvelope 和 Outbox，平台差异只留在验签、身份提取、消息转换、限流与发送实现中。重复投递由 Redis 快路径和 PostgreSQL 唯一约束共同去重。
+协议依据为[企微官方 SDK README](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/README.md) 和 [WebSocket 实现](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)，2026-09-07 核对；这里只参考协议，不将 Node SDK 引入 Go 服务。自建应用 Webhook 的 `msg_signature`/AES、HTTP 200 和 access token 发送流程是另一种接入模式，不与智能机器人长连接混用。未核实的平台回复有效期、跨连接重试能力和限频数值保持待联调，不能据 SDK 的本地请求超时推定平台保证。
+
+两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`，敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
+
+单聊按 Binding 与可信用户映射 Session，群聊按 Binding、群和显式线程划分，规则见[Session 命名](architecture.md#54-session-命名)。首版设计限制同一 Bot 只有一个活动接收连接，避免连接互相替换；断线重连停止旧连接的待回执等待。Inbox 提交前的进程故障可能丢失尚未持久化的帧，当前没有证据保证平台必然重投：监测连接与持久化失败、明确提示用户重试，生产可评估平台回放能力或本地持久接收层。该残余风险不因采用长连接而自动消失。
 
 ### 5.6 治理与安全
 
-Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检查 IM 用户权限、Tool 白名单、预算和敏感输入；危险 Tool 进入人工审批；执行后进行输出脱敏和审计。密钥配置只保存 `secret_ref`，日志、Trace、错误和审计不记录明文密钥。具有副作用的 Tool 使用 `request_id + tool_call_id` 作为业务幂等键。
+Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检查 IM 用户权限、Tool 白名单、预算和敏感输入；危险 Tool 进入人工审批；执行后进行输出脱敏和审计。密钥配置只保存 `secret_ref`，日志、Trace、错误和审计不记录明文密钥。Tool 必须显式声明是否可重放；具有副作用且允许自动重放的 Tool 使用跨模型 attempt 稳定的业务操作键，不能把可能重生的上游 `tool_call_id` 当成跨 attempt 保证。
 
 ### 5.7 可观测性
 
@@ -81,7 +89,7 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 
 ### 5.8 故障恢复
 
-- Worker 故障：Redis Streams Consumer Group 认领未确认消息，PostgreSQL Inbox 扫描补偿；Tool 依靠业务幂等键安全重试。
+- Worker 故障：Redis PEL 只认领尚未成功 claim PostgreSQL Run 的唤醒；claim 后由 PostgreSQL deadline 扫描器重置过期 `running` attempt，并重投长期 `accepted` 的 Run。只有显式可重放且具备业务幂等的 Tool 才能自动重试。
 - IM 重试：相同外部事件返回原 `request_id`，不创建第二个 Run。
 - 模型超时：取消 Context，排空 Runner Event Channel，保存终止状态并给出可重试回复。
 - 数据库故障：有界重试；不能把生产 Session 静默切到 InMemory。
@@ -96,53 +104,48 @@ OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Mem
 - 峰值 20 RPS 时，Worker 数量至少为 `ceil(20 / 4) = 5`，再增加 1 个故障冗余，共 6 个。
 - 每轮平均写入 6 个 Event，则 Session Backend 峰值写 QPS 约 `20 × 6 = 120`，按两倍突发准备 240 QPS。
 - 每轮输入输出合计 4,000 token，20 RPS 时模型消耗约 `80,000 token/s`，必须按租户和模型供应商设置预算与限速。
-- IM 回调按日均峰值系数 10 估算，Inbox 和 Gateway 保留至少两倍突发余量；实际结果由压测报告替换。
+- IM 回调按日均峰值系数 10 估算，Inbox 和 Gateway 保留至少两倍突发余量；若提供压测，报告应区分实测结果与这些假设，原题未要求达到示例容量。
 
 ## 7. 预期效果
+
+以下是目标架构的生产效果，未实现部分以设计和限制说明交付，不据此宣称代码已具备对应能力。当前已选演示方向为网页聊天与企微智能机器人长连接，飞书保留差异设计。
 
 1. 两个以上租户可以创建、发布和隔离运行各自 Agent。
 2. 企业微信与飞书完成从入站到回复的全链路演示。
 3. 两个 Worker 无需 sticky session 即可继续同一持久化会话。
 4. Redis、PostgreSQL、PGVector 和对象存储职责清楚，并演示 Session/索引迁移。
-5. 重复 IM 消息只产生一个 Run 和一次 Tool 副作用。
+5. 重复 IM 消息只产生一个 Run；纯函数 Tool 或具备跨 attempt 业务幂等的 Tool 可保证一次业务副作用，其他 Tool 的未知结果转显式失败处理而不自动重放。
 6. 单次请求可以通过 `trace_id` 查询模型、Tool、存储和回复耗时，通过 `request_id` 查询状态、成本和审计。
 7. Worker 重启、模型超时和后端短暂故障有明确、可测试的恢复行为。
 
-## 8. 时间规划
+## 8. 当前收口安排
+
+以下安排替代此前“截至 9 月 8 日全部平台功能落地”的计划，按原题交付而非功能清单数量验收。
 
 | 日期 | 工作与交付物 |
 | --- | --- |
-| 8/21 | 冻结项目背景、总体架构、核心时序、数据模型、存储与一致性方案 |
-| 8/22-8/23 | 完成治理、可观测性、运维、风险、验收矩阵；验证最小 Runner 链路 |
-| 8/24-8/25 | 完成方案总稿、架构图、容量与演示计划；完成 Tenant/Revision、Admin API、动态路由和 Runtime 缓存的内存参考实现 |
-| 8/26 | 方案评审、图表渲染、交叉检查、提交演练并冻结 `1.0-rc1` |
-| 8/27 | 提交方案文档；演示多租户 Admin → Runtime → Runner → Session 链路 |
-| 8/28-8/31 | PostgreSQL 控制面、Gateway、共享 Redis/PostgreSQL Session、Runtime 淘汰和双 Worker 验证 |
-| 9/1-9/3 | Session Run Lease、双 Worker、StorageBundle、租户 BackendProfile 与动态 PostgreSQL/Redis |
-| 9/4 | Inbox/Outbox、Channel 公共链路、幂等与重试骨架 |
-| 9/5-9/6 | 周末，不安排开发任务 |
-| 9/7 | 企业微信、飞书、身份映射、群聊规则、媒体/限流与端到端测试 |
-| 9/8 | Memory/Summary、迁移验证、Guardrail/预算/审计、OpenTelemetry、故障恢复与部署收口 |
-| 9/9-9/10 | 冻结功能开发；全量联调、容量测试、演示脚本和缺陷修复 |
-| 9/11 | 正式验收 |
-| 9/12-9/14 | 验收后修复、材料整理和最终提交 |
+| 9/7-9/8 | 复核七项设计验收与八类交付物，收口选定参考实现及网页/企微演示范围；仅解决对应发布阻断 |
+| 9/9-9/10 | 对选定版本回归、联调并采集可复现证据；明确未实现能力与残余风险 |
+| 9/11 | 交付完整设计、GitHub 实现及其验证证据，按原题验收 |
 
 ## 9. 主要风险
 
-| 风险 | 缓解措施 |
-| --- | --- |
-| 同一 Session 被多个 Worker 同时执行 | Redis owner-token 租约（已实现，合作型入口互斥 + TTL 接管）、有界队列（未实现）、后端 CAS/版本兜底（上游 `AppendEvent` 无 fence/CAS 入口，做不到；残余风险按 [§5.3](#53-无状态多节点) 接受） |
-| IM 重复或乱序 | Inbox 唯一约束、平台事件 ID、会话队列、过期消息策略 |
-| Tool 重试造成重复业务操作 | `request_id + tool_call_id` 幂等；不支持幂等的危险 Tool 转人工 |
-| 租户数据串读 | 强制 TenantContext、复合查询、键前缀、向量过滤、对象路径分区和隔离测试 |
-| Worker 崩溃丢失进行中请求 | Inbox 状态机、租约过期重领、Event/Outbox 持久化 |
-| Summary/Memory 旧任务覆盖新数据 | 来源 Event 边界、版本检查、幂等写入和可重建机制 |
-| 后端迁移数据遗漏 | 分批游标、事件 ID、数量与校验和验证、观察期和指针回滚 |
-| 模型或 Tool 延迟拖垮节点 | 分级超时、Context 取消、并发舱壁、断路器和租户配额 |
-| 密钥或敏感内容泄漏 | Secret Reference、结构化脱敏、日志字段白名单和访问审计 |
-| IM 平台限流或发送结果未知 | Outbox、指数退避、`retry_after`、稳定消息 ID和重复风险记录 |
-| Agent 对象长期空占资源 | 热门预热、低频懒加载、空闲 TTL、LRU、租户配额和引用计数淘汰 |
-| 三周工期导致过度设计 | 模块化单体、参考后端收敛、逐条验收矩阵、优先完成纵向链路 |
+此表列目标架构的风险与缓解方向，不是功能实施清单。当前参考版本采用的措施、未实施措施及残余限制需分别标明；未来后端、极端故障和平台不提供的强保证不因进入本表而自动增加实现范围。
+
+| 风险与触发条件 | 当前边界与残余风险 | 检测/降级与生产缓解方案 |
+| --- | --- | --- |
+| 同 Session 并发或暂停的旧 Worker 恢复写入 | 已有合作型租约与取消；上游 AppendEvent 无 fence/CAS，不能原子拒绝旧 writer；Redis failover 不在互斥保证内 | 监测续约失败、重叠 Run 与 Event 异常；协调失败拒绝新 Run。严格生产要求需支持写入准入的后端或上游接口 |
+| IM 重复、乱序或落库前进程退出 | 实验 Inbox 对已提交事件去重、按受理顺序执行；无真实 Adapter，长连接未持久化帧不保证平台补投 | 监测重复数、连接中断、持久化错误和队列年龄；提示未受理消息重试。生产评估平台回放或持久接收层 |
+| Tool 执行成功但结果未知后重放 | 现有内置 Tool 无业务副作用；Channel 实验限制重放，不替外部系统提供幂等 | 未知结果转显式失败/人工对账；生产副作用 Tool 需业务操作键和结果查询，不能只依赖模型 tool_call_id |
+| 作用域缺失导致跨租户读写 | 当前配置、Session、Tool 和 Secret 边界有隔离测试；未来向量库/对象存储尚未接入，RLS 未启用 | 拒绝缺失租户与越权请求，监测拒绝事件；生产为向量过滤、对象路径、审计和缓存逐层验证作用域，可加 RLS |
+| Worker 崩溃或 Outbox 未提交 | HTTP 已持久化内容取决于所选 Session 后端，默认 InMemory 重启丢失；Channel 恢复实验未接线 | 监测 Run 超期和未投递结果；生产按持久 Event 对账、attempt CAS 与 Outbox 恢复，禁止盲目重跑未知副作用 |
+| Summary/Memory 旧任务晚到 | 目前为设计，未提供派生存储；不可宣称已有版本检查 | 记录输入 Event 边界与索引延迟；旧版本丢弃/保留历史，可从源 Event 重建，用户可选择等待写后可见 |
+| 迁移切换后回退到旧源库 | 当前无迁移 Job；目标已有新写入时旧源不再完整 | 冻结 Session 并校验 Event ID、数量与摘要；写入未知时停止切换，对账补齐后回切，不允许静默回退 |
+| 慢模型/Tool 占满执行资源 | 有 Context 取消、Event 排空与 Tool 循环上限；没有完整 Run deadline、租户预算或断路器 | 监测活跃 Run、耗时和取消后残留；生产增加分级超时、配额、舱壁和告警，后端故障不降级为易失存储 |
+| Secret 被日志、错误或上游地址带出 | 已有 SecretRef entitlement 与明确错误边界脱敏；base_url 无出站白名单，环境变量不是进程隔离，配置摘要不是签名 | 限制管理与出站网络权限，审计目标域名与授权变更；生产增加 Secret Manager、轮转及敏感日志检测 |
+| IM 限流、发送超时或旧 req_id 失效 | 实验 Dispatcher 区分失败/未知；真实发送未验证，客户端关联 ID 不保证外部 exactly-once | 监测投递年龄、回执超时和 duplicate_risk；按平台限制退避，失效目标停止自动发送并对账，发送失败不重跑 Agent |
+| Runtime/连接缓存持续增长 | 已有引用计数与关闭顺序；Runtime/Bundle 无完整 TTL/LRU，每租户 Profile 有上限，总租户数仍影响资源量 | 监测缓存数、活跃租约、连接和内存；生产按资源预算淘汰空闲对象，先拒绝新引用再等待活动引用退出 |
+| 排期推动过度实现或虚报能力 | 七项设计验收与代码状态分开；现有未提交 Channel 不算真实 IM，容量数值是估算 | 按交付物复核、单目标切片和证据检查收口；非阻断风险登记，超出范围冻结，保留可运行参考链路 |
 
 ## 10. 交付与验收
 

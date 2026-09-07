@@ -96,12 +96,16 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 | --- | --- |
 | `id/tenant_id/agent_app_id` | 所属租户和目标 App |
 | `channel_type` | `wecom/feishu/http/...` |
+| `transport` | `wecom_bot_ws/feishu_webhook/feishu_ws/...`，明确协议模式 |
 | `external_account_id` | 企业应用、公众号或 Bot 标识的哈希/非敏感 ID |
+| `credential_secret_ref` | 长连接 Bot Secret 或应用凭据的服务端引用，不保存明文 |
 | `verify_secret_ref/crypto_secret_ref` | 验签和解密密钥引用 |
 | `config` | 长度限制、回调模式、限速、群聊策略 |
 | `status` | `active/disabled` |
 
 `external_principals` 使用唯一键 `(tenant_id, channel_binding_id, principal_type, external_id_hash)`，把外部用户、群或会话映射为内部 `principal_id`。跨通道身份默认不自动合并。
+
+外部账号需编码完整平台命名空间；同一 `(channel_type, external_account_id)` 在平台内唯一，不能跨租户重复绑定，否则入站无法唯一确定 Tenant。企微智能机器人使用 Bot ID；Webhook 地址中的 Binding ID 只用于定位候选凭据，仍须验签才可信。上述字段和约束是设计，当前没有 Binding 管理接口或真实 Adapter。
 
 ### 3.5 Session、Event 与 Summary
 
@@ -152,14 +156,17 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 UNIQUE (tenant_id, channel_binding_id, external_event_id)
 ```
 
-`agent_runs` 保存 `request_id`、Session、Revision、状态、开始/结束时间、错误类型、token、费用、Worker 和 `trace_id`。状态只允许按定义的状态机前进：
+`agent_runs` 保存 `request_id`、Session、Revision、同 Session 的 `accept_sequence`、状态、attempt/最大尝试数、`claim_token`、`next_attempt_at`、执行 deadline、恢复宽限、`last_dispatched_at`、开始/结束时间、错误类型、token、费用、Worker 和 `trace_id`。执行时长与恢复宽限以整毫秒固化，避免不同 Store 的精度语义漂移；`output_parts` 必须等于同一终态事务写入的 Outbox part 数量。状态只允许按定义的状态机前进：
 
 ```text
-accepted → queued → running → succeeded
-                            ↘ failed / canceled / manual_review
+accepted → running → succeeded | failed
+        ↑      |
+        +------+  未启动时 Yield，或恢复扫描器在 recover_after 后重置
 ```
 
-`outbox_messages` 使用 `UNIQUE (tenant_id, channel_binding_id, idempotency_key)`，记录目标、消息片段、尝试次数、下次重试时间和投递结果。
+每次 `accepted -> running` 都原子递增 attempt 并生成新的 `claim_token`；终态和 Outbox 在同一事务内以该 token 做 CAS。`failed` 的 `error_type` 可表达取消、Tool 结果未知或永久执行错误，不增加会破坏最小状态机的旁路状态。
+
+`outbox_messages` 使用 `UNIQUE (tenant_id, channel_binding_id, idempotency_key)`，记录可恢复的版本化投递目标、消息片段、稳定 `client_message_id`、尝试次数/最大尝试数、`send_token`、发送 deadline、下次重试时间、`duplicate_risk` 和投递结果。目标包含重发所需的真实外部引用，按敏感数据保护，不能只保存不可逆哈希。
 
 `audit_logs` 是追加写记录，至少包含题目要求的全部字段：
 
@@ -191,7 +198,7 @@ ALTER TABLE backend_profiles
     ADD CONSTRAINT backend_profiles_pkey PRIMARY KEY (tenant_id, id);
 
 CREATE UNIQUE INDEX uq_channel_external_account
-    ON channel_bindings (tenant_id, channel_type, external_account_id);
+    ON channel_bindings (channel_type, external_account_id);
 
 CREATE UNIQUE INDEX uq_inbox_external_event
     ON inbox_messages (tenant_id, channel_binding_id, external_event_id);
@@ -211,7 +218,7 @@ CREATE INDEX ix_audit_tenant_time
     ON audit_logs (tenant_id, created_at DESC);
 ```
 
-所有平台 Repository 方法都接收显式 `TenantContext`。PostgreSQL 参考实现额外启用 Row-Level Security 作为纵深防御，但应用层仍必须带租户条件，不能把 RLS 当作唯一隔离措施。
+平台数据访问显式携带租户作用域。生产部署建议额外启用 PostgreSQL Row-Level Security 作为纵深防御；当前参考实现未启用 RLS，实际隔离由 Repository 租户条件、键空间和测试保证，不能把 RLS 当作当前已实现能力。
 
 ## 5. 群聊策略
 

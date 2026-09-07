@@ -39,6 +39,7 @@ flowchart TB
         Runtime[Agent Runtime Manager]
         Policy[Plugin / Guardrail / Policy]
         Outbox[Reply Outbox]
+        Router[Storage Router / Adapter]
     end
 
     subgraph Framework[tRPC-Agent-Go v1.11.2]
@@ -82,10 +83,11 @@ flowchart TB
     Runtime --> PG
     Runtime --> Redis
     Runtime --> Secrets
-    StateAPI --> Redis
-    StateAPI --> PG
-    StateAPI --> Vector
-    StateAPI --> Object
+    StateAPI --> Router
+    Router --> Redis
+    Router --> PG
+    Router --> Vector
+    Router --> Object
 
     Worker --> Outbox
     Outbox --> Channel
@@ -171,7 +173,7 @@ type InboundEnvelope struct {
 
 外部标识只用于匹配绑定和身份映射。进入核心链路后使用平台内部 ID，避免把手机号、群名等信息写入缓存键和指标标签。
 
-异步链路使用 PostgreSQL Inbox 保存幂等事实和处理状态，使用 Redis Streams Consumer Group 进行低延迟投递与故障认领。Stream 消息只保存 `inbox_id`、路由提示和 W3C `traceparent`；Worker 仍需回查 Inbox，不能把 Stream 当作唯一数据真相。
+异步链路使用 PostgreSQL Inbox/Run 保存幂等事实和处理状态，使用 Redis Streams Consumer Group 进行低延迟唤醒。Stream 消息只保存内部 `tenant_id`、`run_id` 和 W3C `traceparent`；Worker 仍需回查持久记录，不能把 Stream 当作唯一数据真相。
 
 ### 5.2 确定性路由
 
@@ -186,7 +188,7 @@ channel_type + external_account_id
 → 健康 Worker
 ```
 
-HTTP 请求从认证凭证和 URL 中解析 Tenant 与 Agent App。任何一步无法唯一解析都拒绝请求，不回退到公共租户或默认 Agent。
+HTTP 请求从认证凭证和 URL 中解析 Tenant 与 Agent App。IM 的外部账号标识必须包含平台要求的账号命名空间，例如企业 ID 与应用 ID；同一 `(channel_type, external_account_id)` 在平台内只能绑定一个 Tenant/App。长连接从服务端连接配置取得 Binding，再校验事件账号匹配，不允许消息正文自行指定租户。任何一步无法唯一解析都拒绝请求，不回退到公共租户或默认 Agent。此约束属于尚未实现的 Binding 配置设计，与数据模型唯一索引一致。
 
 ### 5.3 Agent 与 Runner 生命周期
 
@@ -208,14 +210,18 @@ tRPC-Agent-Go 的 Session Key 是 `AppName + UserID + SessionID`，平台按以�
 AppName   = t/{tenant_id}/a/{agent_app_id}
 UserID    = u/{principal_id}                         # 单聊
 UserID    = g/{channel_binding_id}/{group_hash}      # 群聊
-SessionID = c/{channel_binding_id}/{conversation_hash}[/t/{thread_hash}]
+SessionID = c-{binding_digest}-{conversation_digest}[-t-{thread_digest}]
 ```
 
-`AppName` 不包含 Revision，使升级和回滚后仍可读取同一 Session。需要清空上下文时创建新的 Session epoch，不删除历史数据。群聊使用合成的群身份作为框架 `UserID`，实际发言人记录在 Event 元数据和审计字段中；默认不把个人长期 Memory 注入群聊，避免隐私泄漏。
+平台 `SessionID` 使用固定长度摘要和 `-` 分隔，只包含 `ValidateResourceID` 接受的字符；外部会话、话题和用户 ID 不直接进入 Session ID、Redis key 或日志。`AppName` 不包含 Revision，使升级和回滚后仍可读取同一 Session。需要清空上下文时创建新的 Session epoch，不删除历史数据。群聊使用合成的群身份作为框架 `UserID`，实际发言人记录在 Event 元数据和审计字段中；默认不把个人长期 Memory 注入群聊，避免隐私泄漏。
 
 ## 6. 节点部署
 
 ### 6.1 最小可运行部署
+
+当前可运行的参考实现使用 `./build.sh`、`./start.sh` 和 `./stop.sh`，单进程提供 Admin API、HTTP/SSE、Runtime 和 InMemory Session，默认仅监听回环地址，无需外部数据库或模型密钥。Redis/PostgreSQL 的可选集成依赖见 `deploy/docker-compose.session.yml`。
+
+以下为后续多角色部署设计，`--role`、SQLite 和本地 Artifact 未接入当前命令入口：
 
 ```text
 trpc-service --role=all
@@ -250,7 +256,7 @@ Gateway 和 Worker 都保持无状态。运行中的 HTTP/SSE 连接只绑定当
 - 同一 Session 默认串行执行。Run Coordinator 使用 Redis 租约锁，锁值是随机 owner token，由 Worker 续约；失去租约立即取消 `context.Context`，第二个 Worker 在 Run 入口收到 `409 session_busy`。**这把租约是合作型的**：它把并发写者挡在入口，但不阻止已经在运行的写者继续写。获取租约时 `INCR` 出的单调 token 目前只是观测句柄，**不参与 Session 写入准入**——上游 `session.Service.AppendEvent` 没有 fence/CAS 参数，`WithAppendEventHook` 与后端写入之间也不是原子的，因此"装饰器在写入前拒绝落后 token"在当前上游接口下做不出来，不能称为 enforcement fencing。实现与边界见 [Session Run Lease](session-lease.md)。
 - 不同 Session 可并行执行。同一租户和 Agent 还受并发数、token 和费用配额约束。
 - Runner 返回的 Event Channel 必须由唯一消费者持续读取，直到关闭或完成取消后的排空，防止 goroutine 泄漏。
-- 入站消息、Run 和出站回复都有稳定幂等键。模型推理可以重试，具有副作用的 Tool 必须接收业务幂等键。
+- 入站消息、Run 和出站回复都有稳定幂等键。模型推理是否可重试取决于 Tool 能力声明；具有副作用的 Tool 只有在接收跨 attempt 稳定的业务幂等键后才可自动重放。
 - PostgreSQL/Redis 短暂不可用时停止接收新的有状态 Run；不把生产请求静默降级到 InMemory。
 - Worker 退出时先停止领取新任务，取消或等待活动 Run，在宽限期内排空 Event 和写入最终状态。
 
