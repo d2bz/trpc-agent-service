@@ -117,6 +117,10 @@ func NewPlatformServer(
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/v1/chat/completions", server.handleChatCompletions)
+	// The chat page and its assets. It is registered last and at "/" because it
+	// is also the catch-all: handleUI answers the two page URLs and the embedded
+	// asset names, and every other path with a 404. See handleUI.
+	mux.HandleFunc("/", handleUI)
 	// The admin subtree is deliberately not registered on the mux: it is taken
 	// before the mux runs at all. See adminFirst.
 	server.handler = adminFirst(mux, server.handleAdmin)

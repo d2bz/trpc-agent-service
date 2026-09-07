@@ -149,6 +149,10 @@ cd trpc-agent-service
 
 当前实现会启动内存控制面，预置 `demo` Tenant、`echo` Agent App 和已发布的 `echo-v1` Revision，再通过 Runtime Resolver 懒加载真实的 tRPC-Agent-Go `LLMAgent + Runner + InMemory Session`。服务监听 `127.0.0.1:8080`，确定性回显模型不需要外部 API Key。
 
+打开 [网页聊天](http://127.0.0.1:8080/) 即可发送消息、查看流式回复、停止生成、新建对话和继续已有对话。页面由同一 Go 二进制内嵌提供，无需前端构建或外部 CDN；默认使用 `echo` 和公开的开发 chat key。要访问其他已配置应用或凭据，在页面设置中填写 App ID 和**对话凭据**，不要填 Admin Key、模型 API Key 或企业微信 Secret。
+
+网页的会话列表和凭据仅保留在当前页面内存中，刷新后不恢复；更换 App 或凭据会清空本地对话。续聊复用服务端返回的 Session ID，每次只发送最新一条用户消息。停止会中断当前 HTTP 请求，但不承诺撤销已发生的服务端写入或 Tool 操作；失败不会自动重发。企业微信真实收发仍是后续独立切片，飞书当前保留差异设计。
+
 对话面和 Admin 面都要求 Bearer 凭据，且使用两套互不相通的凭据体系。Admin Key 没有公开默认值：环境里没有 `TRPC_SERVICE_ADMIN_API_KEY` 时，`start.sh` 会生成一个并存到 `data/admin-api-key`（`0600`，已被 `.gitignore` 排除），重启复用同一个文件。脚本只打印路径，不打印 key：
 
 ```text
