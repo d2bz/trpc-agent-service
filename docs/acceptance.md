@@ -24,7 +24,7 @@
 
 2026-09-07 历史完整实验工作树已修复跨租户碰撞测试的 Run ID 夹具，并通过全仓默认 race、vet、构建和 8 项 HTTP/SSE 检查；当时未运行真实 PostgreSQL/Redis 门控集成，证据见[本轮验收记录](verification-2026-09-07.md)。随后提交的网页和企微协议包是前置检查点；企微当前本地执行链路的最终证据单列于 I17。
 
-已选择性纳入的 Store 检查点另有历史证据：在基线 `6e549b1` 的干净快照上只加入 11 个既有文件（净增 6610 行），于 `/tmp/trpc-channel-selection.VKE9k1` 通过全仓默认 race、vet、build 和本地真实 PostgreSQL Store race。该候选不包含原实验的 Worker、Dispatcher、Waker、Scanner 或未提交的 `sessionrun` 修改，范围及命令见[Channel 选择记录](channel-selection.md)。当前基于 `deeb137` 的[企微文本切片](wecom-text-slice.md)已完成实际 Runner、PostgreSQL 消费链路和启动接线的本地验收，具体结果见 I17；真实 Bot 凭据尚未配置，线上联调未完成。
+已选择性纳入的 Store 检查点另有历史证据：在基线 `6e549b1` 的干净快照上只加入 11 个既有文件（净增 6610 行），于 `/tmp/trpc-channel-selection.VKE9k1` 通过全仓默认 race、vet、build 和本地真实 PostgreSQL Store race。该候选不包含原实验的 Worker、Dispatcher、Waker、Scanner 或未提交的 `sessionrun` 修改，范围及命令见[Channel 选择记录](channel-selection.md)。基于 `deeb137` 的[企微文本切片](wecom-text-slice.md)已完成实际 Runner、PostgreSQL 消费链路和启动接线的本地验收；2026-09-07 又完成真实 Bot 正常单聊收发验证，具体证据与范围见 I17。
 
 | ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -40,12 +40,12 @@
 | A10 | Memory 跨节点可见性 | [Memory 顺序](storage-and-consistency.md#53-memory) | 待实现双 Worker 可见性测试 | planned |
 | A11 | Redis 到 SQL 迁移 | [Session 迁移](storage-and-consistency.md#71-sessionredis-到-sql) | 待实现迁移 Job 与校验测试 | planned |
 | A12 | 本地到远端向量库迁移 | [向量迁移](storage-and-consistency.md#72-向量库迁移) | 待实现索引重建与切换测试 | planned |
-| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | I17 的本地 mock WebSocket + 实际 Runner + PostgreSQL 集成已验证重复 msgid 只受理/执行/发送一次；重建全部 Runtime/Session 对象后再次投递不新增用户轮次。真实 Bot 链路未联调 | partial |
-| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 企微协议包及 I17 本地单进程、单绑定文本链路已验证，真实 Bot 凭据未配置。第二类外部 IM 由飞书差异设计覆盖，飞书不在本轮实现范围；网页 I16 不替代该设计要求 | partial |
-| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | [消费者](../trpcservice/channels/wecom/consumer.go)经共享 `sessionrun.Start/Run` 执行、排空 Event、持久化最终文本并回复本地协议帧，I17 集成通过；[启动接线](../cmd/trpc-service/wecom.go)默认禁用、启用要求 PostgreSQL。这是本地链路证据，不是线上机器人验收 | partial |
-| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 企微订阅鉴权、静态 Binding 和身份派生已有协议测试；本地真实 PostgreSQL 已验证持久去重及 Tenant/Binding 扫描、认领、恢复隔离，含外部行排序靠前且 LIMIT=1。企微入口不使用 Webhook 验签，飞书回调安全仍为设计 | partial |
+| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | I17 的本地 mock WebSocket + 实际 Runner + PostgreSQL 集成已验证重复 msgid 只受理/执行/发送一次；重建全部 Runtime/Session 对象后再次投递不新增用户轮次。真实 Bot 已验证正常单聊，重复投递仍以本地测试为证据 | partial |
+| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 企微协议包、I17 本地单进程单绑定链路及真实 Bot 正常单聊已验证。第二类外部 IM 由飞书差异设计覆盖，飞书不在本轮实现范围；网页 I16 不替代该设计要求 | partial |
+| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | [消费者](../trpcservice/channels/wecom/consumer.go)经共享 `sessionrun.Start/Run` 执行、排空 Event、持久化最终文本并发送回复，本地集成和 I17 真实 Bot 正常单聊均通过；[启动接线](../cmd/trpc-service/wecom.go)默认禁用、启用要求 PostgreSQL。发送成功指平台回执，不代表用户已读 | partial |
+| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 真实 Go 客户端已收到 subscribe 的 `errcode=0` ACK；静态 Binding 和身份派生已有协议测试，本地真实 PostgreSQL 已验证持久去重及 Tenant/Binding 扫描、认领、恢复隔离，含外部行排序靠前且 LIMIT=1。企微入口不使用 Webhook 验签，飞书回调安全仍为设计 | partial |
 | A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 单聊 Session 派生的确定性和租户/App/Binding/用户隔离已测试；I17 使用真实 PostgreSQL Session、Pin 和配置 Repository，重建全部 Runtime/Session 对象后历史及 Pin 保留，同 Session 顺序通过。群聊仍为设计，协议包拒绝群聊输入 | partial |
-| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 本地验证 20480 UTF-8 字节上限及截断、重连、每条终态回复最多一次发送尝试；明确拒绝不重跑 Agent，未知发送保留 duplicate_risk 且不再次发送。真实平台限频和 Bot 未联调，群聊、媒体、卡片不在当前范围 | partial |
+| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 本地验证 20480 UTF-8 字节上限及截断、重连、每条终态回复最多一次发送尝试；明确拒绝不重跑 Agent，未知发送保留 duplicate_risk 且不再次发送。真实 Bot 仅验证正常单聊，平台限频及故障行为未实测，群聊、媒体、卡片不在当前范围 | partial |
 | A19 | Plugin/Guardrail/Callback 租户治理 | [Tool 与 Policy Runtime](tool-policy.md)、[治理](solution.md#56-治理与安全) | 已实现静态 Tool Registry、Revision ToolRefs、Policy 白名单交集、未知/重复/越权 fail closed、Tool callback 审计和工具循环上限；租户级 PolicyRef entitlement 已实现，在创建、发布和 Runtime 构建三处由同一个 authorizer 判定（见 I14）；预算、审批、Guardrail 和动态扩展待实现 | partial |
 | A20 | 指标与租户成本 | [可观测性](solution.md#57-可观测性)、[容量估算](solution.md#6-容量估算方法) | 待实现 OTel Metric 与成本聚合测试 | planned |
 | A21 | 全链路 Trace | [完整时序](sequence.md#1-企业微信完整链路) | 待实现 trace 传播集成测试 | planned |
@@ -116,7 +116,7 @@ TRPC_PLAYWRIGHT_MODULE=/tmp/trpc-browser-qa/node_modules/playwright \
 
 ## 企微文本切片状态（2026-09-07）
 
-**I17：企微单聊文本执行，done，仅限本地单进程、单绑定链路。** 范围与验收条件见[切片说明](wecom-text-slice.md)。Consumer 和 `cmd` 接线共享网页使用的 Session Run 服务；集成使用本地 mock WebSocket、实际 Runner 及真实 PostgreSQL Store、Session、Pin 和配置 Repository。飞书仅提供第二类 IM 差异设计，不在本轮编码或联调范围。
+**I17：企微单聊文本执行，done，限于单进程、单绑定链路；真实 Bot 正常单聊已验证。** 范围与验收条件见[切片说明](wecom-text-slice.md)。Consumer 和 `cmd` 接线共享网页使用的 Session Run 服务；本地集成使用 mock WebSocket、实际 Runner 及真实 PostgreSQL Store、Session、Pin 和配置 Repository。真实平台验证仅覆盖下表正常路径，本地去重、拒绝、未知结果与恢复测试不升级为真实平台故障证据。飞书仅保留第二类 IM 差异设计。
 
 | 最终验证证据 | 结果 |
 | --- | --- |
@@ -124,7 +124,8 @@ TRPC_PLAYWRIGHT_MODULE=/tmp/trpc-browser-qa/node_modules/playwright \
 | Leader：`TRPC_SERVICE_SESSION_INTEGRATION=1 go test -race -count=1 -timeout 180s ./trpcservice/channels/postgres ./trpcservice/channels/wecom` | 真实 PostgreSQL 通过，分别 3.906s / 9.993s；DSN 使用已提交 Compose 的本地开发值 |
 | 本地文本收发、重复投递、Session 顺序、Tenant/Binding 隔离、全部 Runtime/Session 对象重建后的历史与 Pin | 通过；重投不新增用户轮次，见 `wecom/e2e_integration_test.go` 和 `postgres/scope_integration_test.go` |
 | 发送拒绝/未知不重跑、有限恢复、Web 租约等待、UTF-8 截断、取消排空、密钥边界与通道失败触发进程退出 | 通过；未启动任务继续、已启动过期任务不进入 Runner、旧目标失败，均限定为切片约定行为 |
-| 真实 Bot 线上收发 | 凭据未配置，尚未联调；本地协议帧不等同线上验收 |
+| 真实 Bot 正常单聊 | 2026-09-07 18:29:00 北京时间，用户手工发送 `17 乘 23`；已验收提交 `0378175` / `4121770` 对应二进制运行于 `localhost:18081`，使用真实 PostgreSQL 和 AIHubMix `gpt-4o-mini`，回复文本含 `391` |
+| 本次真实收发的持久记录与回执 | 对测试绑定过滤后 Inbox 为 1；Run `succeeded`、Attempt 1、ExecutionMillis 2526；Outbox `sent`、Attempt 1、DuplicateRisk false。`sent` 表示平台返回 `errcode=0` ACK，不宣称用户已读；不记录外部账号、用户、请求或消息标识 |
 
 本切片不承诺跨连接重发、跨重启最终送达、已启动任务重放或模型已完成但 Outbox 未提交时的答案重建；读取后落库前仍有已登记窗口。以上恢复边界以切片说明为准，不扩展为完整生产恢复承诺。
 
