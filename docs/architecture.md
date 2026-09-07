@@ -153,25 +153,34 @@ PostgreSQL 是配置真相源。Worker 使用“通知 + 版本检查”更新�
 
 ### 5.1 统一入站消息
 
-Channel Adapter 把不同平台消息转换为统一 `InboundEnvelope`：
+Channel Adapter 校验平台身份并完成 Binding/Principal 解析后，把不同平台消息转换为统一 `InboundEnvelope`。以下为持久输入的核心字段；完整实验契约见 [Channel 输入契约](channel-pipeline.md#2-输入契约)，不是另一个同名 DTO：
 
 ```go
 type InboundEnvelope struct {
-    RequestID       string
-    TraceID         string
-    TraceParent     string
-    ChannelType     string
-    ChannelBinding string
-    ExternalEvent  string
-    SenderID        string
-    ConversationID string
-    ThreadID        string
-    Message         model.Message
-    ReceivedAt      time.Time
+    TenantID         string
+    Channel          ChannelType
+    ChannelBindingID string
+    AgentAppID       string
+    PrincipalID      string
+    SessionID        string
+    ExternalEventID  string
+    Message          InboundMessage
+    DeliveryTarget   DeliveryTarget
+    ReceivedAt       time.Time
 }
 ```
 
 外部标识只用于匹配绑定和身份映射。进入核心链路后使用平台内部 ID，避免把手机号、群名等信息写入缓存键和指标标签。
+
+`InboundMessage` 是可持久化的规范输入（文本、附件引用、被回复消息引用），不是框架消息。Ingress 生成内部 `request_id`，Trace 上下文随受理与唤醒传递；外部 `msgid` 和回复关联 `req_id` 均不能替代内部请求 ID。
+
+| 转换阶段 | 明确规则 |
+| --- | --- |
+| 平台文本 -> 规范输入 | 企微 `body.text.content` 写入 `Message.Text`，`body.msgid` 写入 `ExternalEventID`；`from.userid` 经 Binding 作用域映射为 Principal；回调 `headers.req_id` 保留在受保护的回复目标中 |
+| 规范输入 -> Runner | Worker 在取得 Session/Revision 后，以 `model.NewUserMessage(Message.Text)` 构造用户消息，调用 `runner.Runner.Run(ctx, userID, sessionID, message)`；媒体未实现时明确拒绝，不丢弃附件后只处理文字 |
+| Agent Event -> 最终文本 | 只取完成且非 partial、无错误的 assistant 内容；Tool 调用、Tool 结果、runner completion、内部状态和推理内容不作为 IM 回复。当前实验的筛选与对账由 `sessionrun.TranscriptEntry` / Channel Worker 承担，真实 IM 尚未接线 |
+| 文本 -> IM 回复 | 最终文本经 Outbox 交给 Adapter；企微使用回调 `req_id`、稳定 `stream.id` 和 `finish=true`，成功回执后才确认投递。文本切片需服从平台单条回复语义，不能假定多个终态 stream 等同连续分片 |
+| 流式和卡片扩展 | 支持时聚合 assistant 文本增量、按通道限频更新同一消息，完成后结束流；卡片只使用已定义模板及受校验字段。不支持时降级为最终纯文本，不能把任意 Event JSON 发给用户；本次企微文本演示不承诺实时增量或卡片 |
 
 异步链路使用 PostgreSQL Inbox/Run 保存幂等事实和处理状态，使用 Redis Streams Consumer Group 进行低延迟唤醒。Stream 消息只保存内部 `tenant_id`、`run_id` 和 W3C `traceparent`；Worker 仍需回查持久记录，不能把 Stream 当作唯一数据真相。
 
@@ -204,16 +213,24 @@ Runtime Manager 使用以下缓存键：
 
 ### 5.4 Session 命名
 
-tRPC-Agent-Go 的 Session Key 是 `AppName + UserID + SessionID`，平台按以下方式编码租户边界：
+tRPC-Agent-Go 的 Session Key 是 `AppName + UserID + SessionID`。以下是三种模式的目标规则，真实 IM 键生成尚未实现；`group_member` 不属于首条企微单聊文本演示。
 
 ```text
-AppName   = t/{tenant_id}/a/{agent_app_id}
-UserID    = u/{principal_id}                         # 单聊
-UserID    = g/{channel_binding_id}/{group_hash}      # 群聊
-SessionID = c-{binding_digest}-{conversation_digest}[-t-{thread_digest}]
+AppName = t/{tenant_id}/a/{agent_app_id}
+H(fields) = hex(SHA-256(JSON-string-array(fields)))
+base = ["im-session-v1", tenant_id, agent_app_id, channel_binding_id]
+thread_id = "" when the platform has no explicit thread
 ```
 
-平台 `SessionID` 使用固定长度摘要和 `-` 分隔，只包含 `ValidateResourceID` 接受的字符；外部会话、话题和用户 ID 不直接进入 Session ID、Redis key 或日志。`AppName` 不包含 Revision，使升级和回滚后仍可读取同一 Session。需要清空上下文时创建新的 Session epoch，不删除历史数据。群聊使用合成的群身份作为框架 `UserID`，实际发言人记录在 Event 元数据和审计字段中；默认不把个人长期 Memory 注入群聊，避免隐私泄漏。
+| 模式 | 框架 UserID | SessionID |
+| --- | --- | --- |
+| `direct` | `u/{principal_id}` | `d-` + `H(base + ["direct", principal_id, thread_id, epoch])` |
+| `group` | `g/` + `H(base + ["group", group_id])` | `g-` + `H(base + ["group", group_id, thread_id, epoch])` |
+| `group_member` | `u/{principal_id}` | `gm-` + `H(base + ["group_member", group_id, principal_id, thread_id, epoch])` |
+
+`+` 表示数组连接，每个元素按字符串编码，`epoch` 为服务端保存的非负十进制字符串；数组顺序固定，不能用无边界字符串拼接替代。`principal_id` 来自当前 Tenant/Binding 下的可信用户映射，群聊必须有可信 `group_id`；缺失必要身份时拒绝，不回退成共享 Session。不同 Tenant、App、Binding、群、话题和群内成员独立模式分别进入摘要，跨群或跨租户不会沿用原会话。
+
+平台 `SessionID` 最长 67 个 ASCII 字符，只包含 `ValidateResourceID` 接受的字符；外部会话、话题和用户 ID 不直接进入 Session ID、Redis key 或日志。`AppName` 不包含 Revision，使升级和回滚后仍可读取同一 Session。需要清空上下文时递增 Session epoch，不删除历史数据。共享群模式使用合成群身份，但实际发言人仍用于 Tool 授权及 Event/Audit；默认不把个人长期 Memory 注入群聊。`group_member` 只隔离 Agent 上下文，不能使发到群里的回复变成私信，敏感结果仍须拒绝在群中输出或引导用户单聊。
 
 ## 6. 节点部署
 

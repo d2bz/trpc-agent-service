@@ -116,8 +116,8 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 | `sessions.id/tenant_id/agent_app_id` | 平台 Session 身份 |
 | `sessions.scope_type` | `direct/group/group_member` |
 | `sessions.framework_app_name` | `t/{tenant_id}/a/{agent_app_id}` |
-| `sessions.framework_user_id` | 单聊用户或合成群身份 |
-| `sessions.framework_session_id` | Channel Binding + 会话/话题哈希 |
+| `sessions.framework_user_id` | 单聊/群内成员模式使用用户身份；共享群模式使用合成群身份 |
+| `sessions.framework_session_id` | Tenant/App/Binding + 模式、用户或群/成员、话题、epoch 的摘要，见 [Session 命名](architecture.md#54-session-命名) |
 | `sessions.backend_profile_id` | 当前 Session 后端 |
 | `sessions.pinned_revision_id` | 灰度期间固定的 Agent Revision；紧急回滚可失效 |
 | `sessions.epoch` | `/new` 或空闲切分后的会话世代 |
@@ -227,9 +227,11 @@ Channel Binding 明确配置以下一种模式：
 | 模式 | Session 范围 | 适用场景 |
 | --- | --- | --- |
 | `group` | 整个群/话题共享 Session | 群助手，需要理解群内连续讨论 |
-| `group_member` | 群内每个成员独立 Session | 涉及个人数据、权限和私密 Memory 的助手 |
+| `group_member` | 群内每个成员独立 Session | 需要分别保留成员上下文的助手；回复仍发到群中，不能据此开放私密数据 |
 
 无论哪种模式，Tool 授权都使用实际 `sender_principal_id`，不能因为 Session 使用合成群身份而跳过个人权限校验。不同 Tenant、Channel Binding、Group 和 Topic 始终生成不同键。
+
+三种模式的键公式及编码见 [Session 命名](architecture.md#54-session-命名)。共享群不把成员 ID 放入 Session 摘要；`group_member` 必须同时包含群 ID 和成员 Principal，避免同一成员跨群串会话。两种群聊模式均为设计，首条企微文本演示只接单聊。
 
 ## 6. 数据生命周期
 

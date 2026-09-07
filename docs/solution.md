@@ -64,9 +64,9 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 | 能力 | 企业微信智能机器人长连接 | 飞书事件订阅 |
 | --- | --- | --- |
 | 入站方式 | 主动连接 `wss://openws.work.weixin.qq.com`，发送 `aibot_subscribe`；接收 `aibot_msg_callback` | HTTPS 事件订阅；也可使用官方 SDK 长连接 |
-| 安全 | Bot ID/Secret 认证；校验事件 `aibotid` 与受信任连接绑定一致，不用自建应用 access token | Webhook 校验 Verification Token、启用加密时按 Encrypt Key 验签解密；长连接使用应用凭据认证 |
+| 安全 | Bot ID/Secret 认证；校验事件 `aibotid` 与受信任连接绑定一致，不用自建应用 access token | Webhook 按已配置凭据验证签名、Token 与应用身份；解密不等于认证，URL challenge 单独处理，顺序见下文；长连接使用应用凭据认证 |
 | 入站确认 | 推送帧没有 HTTP 响应；只有 Inbox 事务提交后才在平台内部标记受理，不假定断连后必然补投 | Webhook 快速确认前提交 Inbox；长连接确认由 SDK/协议处理，需核对处理器和确认顺序 |
-| 幂等与回复关联 | `body.msgid` 作入站事件键；`headers.req_id` 用于回复关联，不等同于平台 `request_id` | 事件 ID 作入站去重键；message/chat/thread 标识用于回复定位 |
+| 幂等与回复关联 | `body.msgid` 作入站事件键；`headers.req_id` 用于回复关联，不等同于平台 `request_id` | `im.message.receive_v1` 按 `message_id` 在 Binding 内去重，不能只依赖 `event_id`；message/chat/thread 标识用于回复定位 |
 | 身份与会话 | `from.userid`、`chattype`、群聊 `chatid`，机器人账号先绑定 Tenant/App | App、Chat、User、Thread 共同决定绑定和会话作用域 |
 | 文本回复 | `aibot_respond_msg` 透传 `req_id`，以固定 `stream.id` 发送最终文本；收到成功回执再确认 Outbox | Bot 消息 API 按 message/chat ID 回复；平台流式/卡片更新能力与普通文本分开 |
 | 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 按消息类型和 API 限额拆分/退避；限流、凭据失效与永久错误分别处理 |
@@ -74,6 +74,20 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 | 当前状态 | 已选演示方向，尚无 Adapter 或真实账号联调 | 保留第二类 IM 的差异设计，实现暂缓 |
 
 协议依据为[企微官方 SDK README](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/README.md) 和 [WebSocket 实现](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)，2026-09-07 核对；这里只参考协议，不将 Node SDK 引入 Go 服务。自建应用 Webhook 的 `msg_signature`/AES、HTTP 200 和 access token 发送流程是另一种接入模式，不与智能机器人长连接混用。未核实的平台回复有效期、跨连接重试能力和限频数值保持待联调，不能据 SDK 的本地请求超时推定平台保证。
+
+**飞书 HTTPS 回调设计，尚无 Adapter。** 当前只用它满足第二类 IM 的差异设计；代码和真实联调留待有余力时进行。入口拟为 `POST /channels/feishu/{account_id}/events`，每个飞书应用只登记一个回调 URL。路径中的账号 ID 仅定位服务端已登记的候选 Binding 和凭据引用（Verification Token、可选 Encrypt Key、预期 App ID 及允许的飞书 tenant_key），不是租户认证结果；不依赖请求体声明的 App/Tenant 去寻找任意密钥。
+
+处理顺序如下，所有鉴权前解析和解密都不触发 Inbox、Runner 或业务路由：
+
+1. 按入口定位候选凭据，限制请求体大小并保留原始 body 字节。根据服务端配置解析明文或解密 `encrypt` 包装，识别事件类型；配置了 Encrypt Key 却收到普通明文事件时拒绝降级。解析出的身份此时仍不可信。
+2. `url_verification` 是独立分支：必要解密后校验顶层 `token` 与该账号的 Verification Token 一致，再在官方要求的 1 秒内返回 `{"challenge":"原值"}`；不创建 Run。官方 challenge 示例没有 App ID/tenant_key，不要求这些字段，也不把普通事件的签名要求套到 challenge 上。
+3. 普通事件配置了 Encrypt Key 时，必须用 `X-Lark-Request-Timestamp`、`X-Lark-Request-Nonce`、Key 和**原始 body** 按顺序计算 SHA-256，并核对 `X-Lark-Signature`；缺失或不匹配即拒绝。不能对重新序列化或解密后的 JSON 验签。签名计算本身不依赖解密，可在签名头齐备时提前执行；仅解密成功不能跳过验签。
+4. 普通事件未配置 Encrypt Key 时，仍须校验 Verification Token，不允许因 SDK 跳过签名就放行。对本设计采用的 v2.0 消息事件，无论是否加密都显式核对 `header.token`、`header.app_id` 和已登记的 `header.tenant_key`；App/租户不符或无法唯一定位有效 Binding 即拒绝。通过后才按受信任的 Binding 及 Chat/User/Thread 映射平台 Tenant、App、Session，并校验允许的事件类型。
+5. 消息内容通过验证后，以 Binding 内的 `message_id` 持久去重，Inbox 提交成功或命中已提交记录后再确认受理；不等待 Agent 执行完成。签名校验不替代持久去重，Token 和原始消息体也不写入日志。
+
+以上依据为 2026-09-07 核对的飞书官方[Webhook 配置与 challenge](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/choose-a-subscription-mode/send-notifications-to-developers-server)、[事件安全校验与解密](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/encrypt-key-encryption-configuration-case)和[接收消息事件](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/events/receive)。官方 Go SDK 固定版本 [`b059ee1` 的 Dispatcher](https://github.com/larksuite/oapi-sdk-go/blob/b059ee1824d45444306559b5c33c3f268c0de10d/event/dispatcher/dispatcher.go)会先解析/解密、对 challenge 跳过签名、无 Encrypt Key 时直接跳过签名，并仅在 challenge 分支校验 Token；普通事件的 Token/App/租户绑定校验仍由平台负责，不能只构造 SDK Dispatcher 就宣称完成认证。
+
+**撤回策略仍属设计。** 收到已验证的撤回事件时，记录对原消息和 Run 的关联，不删除已经提交的 Audit 或 Session Event；撤回也不自动抵消已执行的 Tool。通道支持撤回机器人回复时，经 Outbox 提交撤回动作，否则按租户策略忽略或发送更正说明。该策略承接[冻结稿的撤回设计](submission-2026-08-27.md#55-im-接入与幂等)，不把撤回、媒体或卡片加入当前文本演示实现范围。
 
 两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`，敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
 
