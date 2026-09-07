@@ -20,11 +20,11 @@
 
 ## 设计与实现追踪
 
-以下 A01-A28、D01-D08、F01 及 I01-I16 保留为细化追踪，不是原题要求全部实现的清单。状态按代码/证据完成度记录：`planned` 表示尚无已验收实现，`partial` 表示已有部分实现或验证，`done` 表示该条明确范围所需证据齐备；它们不代表上表设计验收是否通过，也不自动形成开发排期。
+以下 A01-A28、D01-D08、F01 及 I01-I17 保留为细化追踪，不是原题要求全部实现的清单。状态按代码/证据完成度记录：`planned` 表示尚无已验收实现，`partial` 表示已有部分实现或验证，`done` 表示该条明确范围所需证据齐备；它们不代表上表设计验收是否通过，也不自动形成开发排期。
 
-2026-09-07 历史完整实验工作树已修复跨租户碰撞测试的 Run ID 夹具，并通过全仓默认 race、vet、构建和 8 项 HTTP/SSE 检查；当时未运行真实 PostgreSQL/Redis 门控集成，证据见[本轮验收记录](verification-2026-09-07.md)。此后网页聊天和企微协议包已分别提交，企微仍只有本地协议验证。
+2026-09-07 历史完整实验工作树已修复跨租户碰撞测试的 Run ID 夹具，并通过全仓默认 race、vet、构建和 8 项 HTTP/SSE 检查；当时未运行真实 PostgreSQL/Redis 门控集成，证据见[本轮验收记录](verification-2026-09-07.md)。随后提交的网页和企微协议包是前置检查点；企微当前本地执行链路的最终证据单列于 I17。
 
-本次选择性纳入的 Store 检查点另有独立证据：在基线 `6e549b1` 的干净快照上只加入 11 个既有文件（净增 6610 行），于 `/tmp/trpc-channel-selection.VKE9k1` 通过全仓默认 race、vet、build 和本地真实 PostgreSQL Store race。该候选不包含 Worker、Dispatcher、Waker、Scanner 或未提交的 `sessionrun` 修改，不能沿用完整实验测试宣称执行层已交付；范围及命令见[Channel 选择记录](channel-selection.md)。数据层测试不证明重启自动恢复或发送失败不重跑 Agent；Runner 接线和真实 Bot 端到端验收仍未完成。
+已选择性纳入的 Store 检查点另有历史证据：在基线 `6e549b1` 的干净快照上只加入 11 个既有文件（净增 6610 行），于 `/tmp/trpc-channel-selection.VKE9k1` 通过全仓默认 race、vet、build 和本地真实 PostgreSQL Store race。该候选不包含原实验的 Worker、Dispatcher、Waker、Scanner 或未提交的 `sessionrun` 修改，范围及命令见[Channel 选择记录](channel-selection.md)。当前基于 `deeb137` 的[企微文本切片](wecom-text-slice.md)已完成实际 Runner、PostgreSQL 消费链路和启动接线的本地验收，具体结果见 I17；真实 Bot 凭据尚未配置，线上联调未完成。
 
 | ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -40,19 +40,19 @@
 | A10 | Memory 跨节点可见性 | [Memory 顺序](storage-and-consistency.md#53-memory) | 待实现双 Worker 可见性测试 | planned |
 | A11 | Redis 到 SQL 迁移 | [Session 迁移](storage-and-consistency.md#71-sessionredis-到-sql) | 待实现迁移 Job 与校验测试 | planned |
 | A12 | 本地到远端向量库迁移 | [向量迁移](storage-and-consistency.md#72-向量库迁移) | 待实现索引重建与切换测试 | planned |
-| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | 本次选取的 PostgreSQL Store 持久去重已有本地真实数据库 race 证据，见[选择记录](channel-selection.md)；协议包、Store 和 Runner 尚未接通，真实 IM 重复事件链路未验收 | partial |
-| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 网页聊天已完成 I16；已提交 `channels/wecom` 智能机器人长连接协议包并完成本地 mock WebSocket 验证，尚无 Runner 接线和真实 Bot 验收；飞书仅保留差异设计，网页不替代第二类外部 IM 差异设计 | partial |
-| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | 已提交[企微协议包](../trpcservice/channels/wecom/README.md)，本地验证单聊文本解析、可信 Binding 身份派生、最终文本发送及回执判定；不调用 Runner，本次 Store 检查点也不包含执行与收发编排，端到端转换和启动接线未完成 | partial |
-| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 企微长连接已本地验证订阅鉴权、静态 Binding 校验与身份派生；持久 Store 去重另有测试，两者尚未接线。该入口不使用 Webhook 回调验签，飞书回调安全流程保留设计 | partial |
-| A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 企微单聊 Session 派生已测试确定性、字段边界及租户/App/Binding/用户隔离，见 `wecom/wecom_test.go`；群聊和跨群隔离仍为设计，协议包拒绝群聊输入 | partial |
-| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 已提交企微协议包本地验证文本边界、连接重连和回复成功/拒绝/结果未知分类；回复失败不在协议包内自动重试，持久发送编排未接线。真实平台限制与 Bot 尚未联调，群聊、媒体和卡片不在当前文本范围 | partial |
+| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | I17 的本地 mock WebSocket + 实际 Runner + PostgreSQL 集成已验证重复 msgid 只受理/执行/发送一次；重建全部 Runtime/Session 对象后再次投递不新增用户轮次。真实 Bot 链路未联调 | partial |
+| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 企微协议包及 I17 本地单进程、单绑定文本链路已验证，真实 Bot 凭据未配置。第二类外部 IM 由飞书差异设计覆盖，飞书不在本轮实现范围；网页 I16 不替代该设计要求 | partial |
+| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | [消费者](../trpcservice/channels/wecom/consumer.go)经共享 `sessionrun.Start/Run` 执行、排空 Event、持久化最终文本并回复本地协议帧，I17 集成通过；[启动接线](../cmd/trpc-service/wecom.go)默认禁用、启用要求 PostgreSQL。这是本地链路证据，不是线上机器人验收 | partial |
+| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 企微订阅鉴权、静态 Binding 和身份派生已有协议测试；本地真实 PostgreSQL 已验证持久去重及 Tenant/Binding 扫描、认领、恢复隔离，含外部行排序靠前且 LIMIT=1。企微入口不使用 Webhook 验签，飞书回调安全仍为设计 | partial |
+| A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 单聊 Session 派生的确定性和租户/App/Binding/用户隔离已测试；I17 使用真实 PostgreSQL Session、Pin 和配置 Repository，重建全部 Runtime/Session 对象后历史及 Pin 保留，同 Session 顺序通过。群聊仍为设计，协议包拒绝群聊输入 | partial |
+| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 本地验证 20480 UTF-8 字节上限及截断、重连、每条终态回复最多一次发送尝试；明确拒绝不重跑 Agent，未知发送保留 duplicate_risk 且不再次发送。真实平台限频和 Bot 未联调，群聊、媒体、卡片不在当前范围 | partial |
 | A19 | Plugin/Guardrail/Callback 租户治理 | [Tool 与 Policy Runtime](tool-policy.md)、[治理](solution.md#56-治理与安全) | 已实现静态 Tool Registry、Revision ToolRefs、Policy 白名单交集、未知/重复/越权 fail closed、Tool callback 审计和工具循环上限；租户级 PolicyRef entitlement 已实现，在创建、发布和 Runtime 构建三处由同一个 authorizer 判定（见 I14）；预算、审批、Guardrail 和动态扩展待实现 | partial |
 | A20 | 指标与租户成本 | [可观测性](solution.md#57-可观测性)、[容量估算](solution.md#6-容量估算方法) | 待实现 OTel Metric 与成本聚合测试 | planned |
 | A21 | 全链路 Trace | [完整时序](sequence.md#1-企业微信完整链路) | 待实现 trace 传播集成测试 | planned |
 | A22 | 审计字段完整 | [Audit 模型](data-model.md#37-inboxrunoutbox-与-audit)、[Tool 审计](tool-policy.md#3-执行与审计) | 已实现 Tool before/after 结构化事件，可信 RunContext 作用域、call ID、成功状态和耗时有字段与泄漏测试；Revision 与 BackendProfile 的 `created_by` 都只来自认证后的 Admin Principal，请求体不能声明该字段。持久化 Audit Store、查询、保留期、管理操作流水与全链路审计待实现 | partial |
 | A23 | 密钥管理和脱敏 | [控制面配置](architecture.md#42-配置传播)、[治理](solution.md#56-治理与安全) | 已实现模型和 BackendProfile `SecretRef` 的 `env:VAR_NAME` 授权后解析、缺失拒绝和错误不泄漏测试；动态存储 Factory 先整体替换解析后的 DSN/URL，再用 `sessionbackend.Scrub` 处理驱动改写的密码片段，替换后不保留原错误链。调用模型上游前还会删除进程环境派生的 `Authorization`、`OpenAI-Organization` 和 `OpenAI-Project` 三个请求头。这些是明确边界上的防护，**不是**进程级 Secret 隔离或全链路脱敏；`base_url` 仍不受 entitlement 约束，生产 Secret Manager、轮转、撤销和审计仍未实现 | partial |
-| A24 | 节点/IM/数据库/模型/Tool 故障恢复 | [故障恢复](solution.md#58-故障恢复)、[故障降级](storage-and-consistency.md#8-故障与降级) | 待实现故障注入测试 | planned |
-| A25 | Context、goroutine、Event Channel 排空 | [并发与故障边界](architecture.md#7-并发与故障边界) | 待实现 goleak/取消/排空测试 | planned |
+| A24 | 节点/IM/数据库/模型/Tool 故障恢复 | [故障恢复](solution.md#58-故障恢复)、[故障降级](storage-and-consistency.md#8-故障与降级) | `TestIntegrationRecoveryExecutesOnlyNeverStartedWork` 已在真实 PostgreSQL 验证未启动任务继续、已启动过期任务失败且不进入 Runner、旧连接目标终态失败；不承诺跨连接/跨重启最终送达或完整生产恢复 | partial |
+| A25 | Context、goroutine、Event Channel 排空 | [并发与故障边界](architecture.md#7-并发与故障边界) | 企微消费者取消、Event 排空及关闭次序相关测试通过；`TestWeComFailureStopsTheProcess` 验证通道终止失败触发 HTTP drain 和服务退出。全仓 race 通过，证据范围为本地参考实现 | partial |
 | A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及 Session Revision Pin：发布和回滚都不会改变已开始的会话；`postgres` profile 下 Pin 与控制面同库，重启和多进程都能读到同一个 Pin（见 I10），权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
@@ -60,7 +60,7 @@
 | D02 | 系统架构图 | [正式架构图](submission-2026-08-27.md#3-总体架构) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
 | D03 | 核心时序图 | [正式时序图](submission-2026-08-27.md#4-核心消息链路) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
 | D04 | 数据模型 | [数据模型](data-model.md) | ER 图由 Mermaid CLI 11.12.0 渲染通过；原题允许表结构或 JSON Schema，不要求全部数据库迁移 | partial |
-| D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | Session Run Lease、Revision Pin、Storage Router 的并发与关闭测试已实现；Inbox/Outbox 实验尚未整体验收，Memory/Summary 和迁移一致性测试待实现 | partial |
+| D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | Session Run Lease、Revision Pin、Storage Router 的并发与关闭测试已实现；I17 选定的 Inbox/Outbox 本地文本链路已验收，其余原实验未纳入，Memory/Summary 和迁移一致性仍为设计 | partial |
 | D06 | 多后端适配方案 | [后端路由与取舍](storage-and-consistency.md#1-统一后端路由) | Session 三种 Adapter、不可变租户 BackendProfile、生产 Router 和动态 InMemory/PostgreSQL/Redis Factory 已实现；Memory/Knowledge/Artifact 后端与完整能力矩阵仍待实现 | partial |
 | D07 | 至少 8 个风险与缓解 | [风险清单](submission-2026-08-27.md#8-主要风险与应对) | 12 项已记录并完成复核 | partial |
 | D08 | GitHub 实现代码 | 当前仓库 | 已有最小可运行链路；当前提交版本、仓库入口和复现证据待确认，原题不要求完整平台功能 | partial |
@@ -113,6 +113,20 @@ TRPC_PLAYWRIGHT_MODULE=/tmp/trpc-browser-qa/node_modules/playwright \
 `TRPC_CHROME_EXECUTABLE` 可指定已有 Chrome，`TRPC_WEB_SCREENSHOT_DIR` 可指定截图目录，默认输出到系统临时目录的 `trpc-web-screens`。脚本使用公开 demo chat key 和 QA 假凭据，不读取 `.env.local`、Admin Key 或模型密钥；异常响应由本地假上游提供。
 
 风险登记：页面历史和凭据仅在当前页内存中，刷新不恢复；没有历史查询、Markdown、媒体或跨端同步。Stop 仅中断 HTTP，不承诺回滚已发生的服务端操作。浏览器回归脚本为显式运行，尚未接入 CI。企业微信真实收发、真实 PostgreSQL/Redis 门控及外部模型不属于这次网页验收；飞书仍为差异设计。可选优化不进入当前切片。
+
+## 企微文本切片状态（2026-09-07）
+
+**I17：企微单聊文本执行，done，仅限本地单进程、单绑定链路。** 范围与验收条件见[切片说明](wecom-text-slice.md)。Consumer 和 `cmd` 接线共享网页使用的 Session Run 服务；集成使用本地 mock WebSocket、实际 Runner 及真实 PostgreSQL Store、Session、Pin 和配置 Repository。飞书仅提供第二类 IM 差异设计，不在本轮编码或联调范围。
+
+| 最终验证证据 | 结果 |
+| --- | --- |
+| Leader：`TRPC_SERVICE_MODEL_INTEGRATION=0 TRPC_SERVICE_SESSION_INTEGRATION=0 go test -race -count=1 -timeout 900s ./...`；Opus：`go build ./...`、`go vet ./...` | 最终代码全部通过，基于 `deeb137` 的独立切片工作树 |
+| Leader：`TRPC_SERVICE_SESSION_INTEGRATION=1 go test -race -count=1 -timeout 180s ./trpcservice/channels/postgres ./trpcservice/channels/wecom` | 真实 PostgreSQL 通过，分别 3.906s / 9.993s；DSN 使用已提交 Compose 的本地开发值 |
+| 本地文本收发、重复投递、Session 顺序、Tenant/Binding 隔离、全部 Runtime/Session 对象重建后的历史与 Pin | 通过；重投不新增用户轮次，见 `wecom/e2e_integration_test.go` 和 `postgres/scope_integration_test.go` |
+| 发送拒绝/未知不重跑、有限恢复、Web 租约等待、UTF-8 截断、取消排空、密钥边界与通道失败触发进程退出 | 通过；未启动任务继续、已启动过期任务不进入 Runner、旧目标失败，均限定为切片约定行为 |
+| 真实 Bot 线上收发 | 凭据未配置，尚未联调；本地协议帧不等同线上验收 |
+
+本切片不承诺跨连接重发、跨重启最终送达、已启动任务重放或模型已完成但 Outbox 未提交时的答案重建；读取后落库前仍有已登记窗口。以上恢复边界以切片说明为准，不扩展为完整生产恢复承诺。
 
 ## 已知限制
 

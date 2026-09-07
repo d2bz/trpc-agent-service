@@ -379,6 +379,14 @@ type storageStack struct {
 	sessions    session.Service
 	coordinator sessionlease.Coordinator
 
+	// pool is the shared control-plane pool under the postgres profile, and nil
+	// under every other one. It is exposed so a component built after the stack
+	// can read and write through the same connections the repository and the
+	// directory use, rather than opening a second pool over the same database.
+	// Borrowing it comes with the rule the other borrowers follow: whoever takes
+	// it closes nothing, because the stack owns it.
+	pool *pgxpool.Pool
+
 	// connString and redisURL are kept so close errors can be scrubbed too. A
 	// pool reports a failure by echoing the string it was built from, and a
 	// close on the shutdown path is logged like any other error.
@@ -568,6 +576,7 @@ func openPostgresStorage(ctx context.Context, cfg storageConfig, deps storageDep
 		return fail(err)
 	}
 	stack.push("postgres pool", closePool)
+	stack.pool = pool
 
 	if err := deps.ping(ctx, pool); err != nil {
 		return fail(err)

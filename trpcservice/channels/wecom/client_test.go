@@ -12,6 +12,22 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 )
 
+func TestClientDoesNotExposeDialErrorsAfterReconnectExhaustion(t *testing.T) {
+	server := newMockServer(t)
+	cfg := testConfig(t, server, testBinding())
+	cfg.MaxReconnectAttempts = 1
+	transportError := errors.New(secretMarker)
+	cfg.dial = func(context.Context) (wsConn, error) { return nil, transportError }
+	client, err := New(cfg)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	err = client.Run(ctx)
+	require.ErrorIs(t, err, ErrReconnectExhausted)
+	requireRedacted(t, err)
+	require.False(t, errors.Is(err, transportError), "raw transport errors must not be unwrapped")
+}
+
 // The whole accepted path, over a real WebSocket connection to a local server:
 // subscribe, receipt, inbound single-chat text, final reply, matching success
 // receipt. Every frame is asserted as the protocol defines it, because this is

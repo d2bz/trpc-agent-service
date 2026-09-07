@@ -68,13 +68,14 @@ func main() {
 //     than a half-built process.
 //   - Cleanup is registered by deferring, which makes the shutdown order the
 //     reverse of the startup order for free: HTTP drain inside waitForStop,
-//     then the RuntimeResolver, then the storage Router, then the session store
-//     and the shared pool. Each step waits for the one above it to let go. The
-//     resolver waits for in-flight runtimes; the Router waits for the storage
-//     leases those runtimes hold, including the borrowed lease on the process
-//     default; and only then is the session store closed. A runtime still
-//     writing to a session store that had already been closed would lose the
-//     last turn of the conversation it was serving.
+//     then the IM channel, then the RuntimeResolver, then the storage Router,
+//     then the session store and the shared pool. Each step waits for the one
+//     above it to let go. The channel waits for the message it is executing or
+//     answering; the resolver waits for in-flight runtimes; the Router waits for
+//     the storage leases those runtimes hold, including the borrowed lease on
+//     the process default; and only then is the session store closed. A runtime
+//     still writing to a session store that had already been closed would lose
+//     the last turn of the conversation it was serving.
 func run(addr string) error {
 	return runWith(addr, os.Getenv, defaultStorageDeps())
 }
@@ -143,6 +144,15 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 		return err
 	}
 
+	// Started here and registered after the Runtime defer, so that it stops
+	// before the Runtimes it executes through and the pool it writes through are
+	// released. It is off unless configured; see startWeComChannel.
+	channel, err := startWeComChannel(startupCtx, storageCfg, stack, runs, getenv)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, channel.stop()) }()
+
 	api, err := web.NewPlatformServer(
 		stack.repository,
 		// The same repository the Router resolves through, so a profile this
@@ -180,7 +190,7 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 	)
 	defer stop()
 
-	return waitForStop(signalCtx, errCh, httpServer, shutdownTimeout)
+	return waitForStop(signalCtx, errCh, channel.failed(), httpServer, shutdownTimeout)
 }
 
 // loopbackHostname is the only non-literal host accepted as loopback. Resolving
@@ -226,9 +236,15 @@ type httpServerLifecycle interface {
 // waitForStop blocks until the process is signalled or the server stops serving.
 // Both paths must leave no connection open: an active SSE response still holds a
 // runtime lease, and RuntimeResolver.Close waits for every lease to be released.
+//
+// A channel that has failed terminally is a third way to stop. It is not a
+// serve error — HTTP is still healthy and still holding requests — so it takes
+// the graceful path, and its own error is kept: it is the reason the process
+// exited, and the deferred stop above only reports what is left in the channel.
 func waitForStop(
 	signalCtx context.Context,
 	serveErrCh <-chan error,
+	channelErrCh <-chan error,
 	server httpServerLifecycle,
 	timeout time.Duration,
 ) error {
@@ -242,6 +258,10 @@ func waitForStop(
 			return nil
 		}
 		return errors.Join(err, server.Close())
+	case err := <-channelErrCh:
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return errors.Join(err, shutdownHTTPServer(shutdownCtx, server))
 	}
 }
 

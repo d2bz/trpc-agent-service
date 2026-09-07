@@ -407,15 +407,61 @@ type RunRecovery struct {
 	Outcome RequeueOutcome
 }
 
+// ScanScope optionally narrows a scan to one binding of one tenant.
+//
+// The zero value is the platform scan every existing caller makes. It crosses
+// tenants deliberately: recovery and dispatch are duties of the process, not of
+// a tenant, and the refs these scans return carry no conversation content.
+//
+// A scope with both fields set is what a single-binding adapter needs. Such an
+// adapter may only act on its own rows, and filtering a returned page in Go
+// cannot give it that: the LIMIT has already chosen the page by then, so one
+// busy neighbour would starve it while it discarded rows it was never allowed
+// to see. The narrowing therefore belongs in the query.
+//
+// Half a scope is refused rather than guessed at. A tenant on its own would
+// quietly widen to every binding that tenant has, and a binding on its own
+// would quietly cross the isolation boundary; neither is a scan any caller
+// means to ask for, and both would fail as a silent over-read rather than as an
+// error.
+type ScanScope struct {
+	TenantID  string
+	BindingID string
+}
+
+// Scoped reports whether this scope narrows the scan.
+func (s ScanScope) Scoped() bool {
+	return s != ScanScope{}
+}
+
+// Validate rejects a scope that is neither absent nor complete.
+func (s ScanScope) Validate() error {
+	if !s.Scoped() {
+		return nil
+	}
+	if s.TenantID == "" || s.BindingID == "" {
+		return errInvalidf("scan scope needs both tenant id and channel binding id")
+	}
+	if err := tenant.ValidateResourceID("tenant id", s.TenantID); err != nil {
+		return err
+	}
+	return tenant.ValidateResourceID("channel binding id", s.BindingID)
+}
+
 // RecoverRequest drives a scanner over expired in-flight rows.
 type RecoverRequest struct {
-	Now   time.Time
+	Now time.Time
+	// Scope is optional; see ScanScope.
+	Scope ScanScope
 	Limit int
 }
 
 // Validate rejects a scan the Store must not run.
 func (r RecoverRequest) Validate() error {
 	if err := requireTime("now", r.Now); err != nil {
+		return err
+	}
+	if err := r.Scope.Validate(); err != nil {
 		return err
 	}
 	return requireLimit(r.Limit)
@@ -433,7 +479,9 @@ type DispatchScanRequest struct {
 	// is worth publishing. It stops every scan from re-publishing everything
 	// that is merely still queued.
 	StaleAfter time.Duration
-	Limit      int
+	// Scope is optional; see ScanScope.
+	Scope ScanScope
+	Limit int
 }
 
 // Validate rejects a scan the Store must not run.
@@ -443,6 +491,9 @@ func (r DispatchScanRequest) Validate() error {
 	}
 	if r.StaleAfter <= 0 {
 		return errInvalidf("stale after must be positive")
+	}
+	if err := r.Scope.Validate(); err != nil {
+		return err
 	}
 	return requireLimit(r.Limit)
 }
@@ -845,12 +896,13 @@ type RunStore interface {
 	) ([]OutboxPart, error)
 
 	// RecoverRuns requeues or terminates Runs whose recovery deadline passed.
-	// It crosses tenants and returns only references.
+	// It crosses tenants unless the request carries a ScanScope, and returns
+	// only references.
 	RecoverRuns(ctx context.Context, request RecoverRequest) ([]RunRecovery, error)
 
 	// ListDispatchableRuns returns due Runs whose wakeup looks lost, each with
-	// the generation it was found on. It crosses tenants and returns only
-	// references.
+	// the generation it was found on. It crosses tenants unless the request
+	// carries a ScanScope, and returns only references.
 	ListDispatchableRuns(ctx context.Context, request DispatchScanRequest) ([]RunDispatch, error)
 
 	// MarkRunsDispatched records that a wakeup was published, after it was.
@@ -920,13 +972,15 @@ type OutboxStore interface {
 	// RecoverOutbox requeues or terminates parts whose send deadline passed.
 	// A requeued part is marked duplicate_risk, because a send that ran out of
 	// time may still have been delivered. A part it terminates closes the Run's
-	// later unsent parts, exactly as CompleteOutbox does.
+	// later unsent parts, exactly as CompleteOutbox does. It crosses tenants
+	// unless the request carries a ScanScope.
 	RecoverOutbox(ctx context.Context, request RecoverRequest) ([]OutboxRecovery, error)
 
 	// ListDispatchableOutbox returns due parts whose wakeup looks lost, each with
 	// the generation it was found on. It applies the same eligibility rule as
 	// ClaimOutbox, so it lists at most the currently sendable head of each Run
-	// and never announces a part nothing could claim.
+	// and never announces a part nothing could claim. It crosses tenants unless
+	// the request carries a ScanScope.
 	ListDispatchableOutbox(ctx context.Context, request DispatchScanRequest) ([]OutboxDispatch, error)
 
 	// MarkOutboxDispatched records that a wakeup was published, after it was.

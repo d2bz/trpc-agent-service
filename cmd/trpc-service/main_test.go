@@ -87,7 +87,7 @@ func TestWaitForStopShutsDownOnSignal(t *testing.T) {
 	signalCtx, stop := context.WithCancel(context.Background())
 	stop()
 
-	require.NoError(t, waitForStop(signalCtx, make(chan error), server, time.Second))
+	require.NoError(t, waitForStop(signalCtx, make(chan error), nil, server, time.Second))
 	require.Equal(t, 1, server.shutdownCalls)
 	require.Zero(t, server.closeCalls)
 }
@@ -97,7 +97,7 @@ func TestWaitForStopForcesCloseWhenGracefulShutdownExpires(t *testing.T) {
 	signalCtx, stop := context.WithCancel(context.Background())
 	stop()
 
-	err := waitForStop(signalCtx, make(chan error), server, time.Second)
+	err := waitForStop(signalCtx, make(chan error), nil, server, time.Second)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Equal(t, 1, server.shutdownCalls)
 	require.Equal(t, 1, server.closeCalls)
@@ -109,7 +109,7 @@ func TestWaitForStopForcesCloseAfterServeFailure(t *testing.T) {
 	serveErrCh := make(chan error, 1)
 	serveErrCh <- serveErr
 
-	err := waitForStop(context.Background(), serveErrCh, server, time.Second)
+	err := waitForStop(context.Background(), serveErrCh, nil, server, time.Second)
 	require.ErrorIs(t, err, serveErr)
 	require.Zero(t, server.shutdownCalls)
 	require.Equal(t, 1, server.closeCalls)
@@ -120,7 +120,7 @@ func TestWaitForStopIgnoresServerClosed(t *testing.T) {
 	serveErrCh := make(chan error, 1)
 	serveErrCh <- http.ErrServerClosed
 
-	require.NoError(t, waitForStop(context.Background(), serveErrCh, server, time.Second))
+	require.NoError(t, waitForStop(context.Background(), serveErrCh, nil, server, time.Second))
 	require.Zero(t, server.shutdownCalls)
 	require.Zero(t, server.closeCalls)
 }

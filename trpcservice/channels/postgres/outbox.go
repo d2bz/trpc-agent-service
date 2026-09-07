@@ -120,19 +120,23 @@ const (
 		    updated_at = $4, send_token = '', sent_by = '', send_deadline_at = NULL
 		WHERE tenant_id = $1 AND outbox_id = $2 AND status = 'sending' AND send_token = $5`
 
+	// scopeFilterSQL binds $1 and $2 and needs no alias here; see scope.go.
 	selectExpiredOutboxSQL = `SELECT ` + outboxColumns + ` FROM channel_outbox_messages
-		WHERE status = 'sending' AND send_deadline_at <= $1
+		WHERE status = 'sending' AND send_deadline_at <= $3` + scopeFilterSQL + `
 		ORDER BY tenant_id COLLATE "C", outbox_id COLLATE "C"
-		LIMIT $2
+		LIMIT $4
 		FOR UPDATE SKIP LOCKED`
 
+	// The scope filter is the aliased spelling: an unqualified column here would
+	// still resolve to o, but the predecessor subquery beside it makes the
+	// difference between an outer and an inner reference worth stating.
 	selectDispatchableOutboxSQL = `SELECT o.tenant_id, o.outbox_id, o.channel, o.attempt
 		FROM channel_outbox_messages AS o
-		WHERE o.status = 'pending' AND o.next_attempt_at <= $1
-		  AND (o.last_dispatched_at IS NULL OR o.last_dispatched_at <= $2)
-		  AND NOT ` + unsentPredecessorSQL + `
+		WHERE o.status = 'pending' AND o.next_attempt_at <= $3
+		  AND (o.last_dispatched_at IS NULL OR o.last_dispatched_at <= $4)
+		  AND NOT ` + unsentPredecessorSQL + aliasedScopeFilterSQL + `
 		ORDER BY o.tenant_id COLLATE "C", o.outbox_id COLLATE "C"
-		LIMIT $3`
+		LIMIT $5`
 
 	// Fenced, due-guarded and monotonic exactly like markRunsDispatchedSQL,
 	// which carries the reasoning for each predicate.
@@ -510,7 +514,10 @@ func (s *Store) RecoverOutbox(
 
 	var recovered []channels.OutboxRecovery
 	err := s.withTx(ctx, "recover outbox parts", func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, selectExpiredOutboxSQL, now, int32(request.Limit))
+		tenantArg, bindingArg := scopeArgs(request.Scope)
+		rows, err := tx.Query(
+			ctx, selectExpiredOutboxSQL,
+			tenantArg, bindingArg, now, int32(request.Limit))
 		if err != nil {
 			return storageError(ctx, "recover outbox parts", err)
 		}
@@ -565,9 +572,10 @@ func (s *Store) ListDispatchableOutbox(
 		return nil, err
 	}
 	now := channels.NormalizeTime(request.Now)
+	tenantArg, bindingArg := scopeArgs(request.Scope)
 	rows, err := s.pool.Query(
 		ctx, selectDispatchableOutboxSQL,
-		now, now.Add(-request.StaleAfter), int32(request.Limit))
+		tenantArg, bindingArg, now, now.Add(-request.StaleAfter), int32(request.Limit))
 	if err != nil {
 		return nil, storageError(ctx, "list dispatchable outbox parts", err)
 	}

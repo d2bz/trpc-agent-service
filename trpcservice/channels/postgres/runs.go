@@ -129,19 +129,24 @@ const (
 	// comparison, which is what the in-memory Store sorts by; a database whose
 	// default collation ordered text differently would otherwise return a
 	// different page.
+	//
+	// scopeFilterSQL binds $1 and $2; see scope.go. It sits before LIMIT and
+	// before FOR UPDATE, so a scoped scanner neither reads nor locks a row
+	// outside its binding, and rows it may not touch cannot crowd its own work
+	// out of the page.
 	selectExpiredRunsSQL = `SELECT ` + runColumns + ` FROM channel_agent_runs
-		WHERE status = 'running' AND recover_after <= $1
+		WHERE status = 'running' AND recover_after <= $3` + scopeFilterSQL + `
 		ORDER BY tenant_id COLLATE "C", run_id COLLATE "C"
-		LIMIT $2
+		LIMIT $4
 		FOR UPDATE SKIP LOCKED`
 
 	// The attempt comes back with the reference and is what the mark below is
 	// fenced on; see channels.RunDispatch.
 	selectDispatchableRunsSQL = `SELECT tenant_id, run_id, attempt FROM channel_agent_runs
-		WHERE status = 'accepted' AND next_attempt_at <= $1
-		  AND (last_dispatched_at IS NULL OR last_dispatched_at <= $2)
+		WHERE status = 'accepted' AND next_attempt_at <= $3
+		  AND (last_dispatched_at IS NULL OR last_dispatched_at <= $4)` + scopeFilterSQL + `
 		ORDER BY tenant_id COLLATE "C", run_id COLLATE "C"
-		LIMIT $3`
+		LIMIT $5`
 
 	// Three predicates beyond the reference, each covering a way the row can
 	// stop being the one that was announced:
@@ -529,7 +534,10 @@ func (s *Store) RecoverRuns(
 
 	var recovered []channels.RunRecovery
 	err := s.withTx(ctx, "recover runs", func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, selectExpiredRunsSQL, now, int32(request.Limit))
+		tenantArg, bindingArg := scopeArgs(request.Scope)
+		rows, err := tx.Query(
+			ctx, selectExpiredRunsSQL,
+			tenantArg, bindingArg, now, int32(request.Limit))
 		if err != nil {
 			return storageError(ctx, "recover runs", err)
 		}
@@ -581,9 +589,10 @@ func (s *Store) ListDispatchableRuns(
 		return nil, err
 	}
 	now := channels.NormalizeTime(request.Now)
+	tenantArg, bindingArg := scopeArgs(request.Scope)
 	rows, err := s.pool.Query(
 		ctx, selectDispatchableRunsSQL,
-		now, now.Add(-request.StaleAfter), int32(request.Limit))
+		tenantArg, bindingArg, now, now.Add(-request.StaleAfter), int32(request.Limit))
 	if err != nil {
 		return nil, storageError(ctx, "list dispatchable runs", err)
 	}

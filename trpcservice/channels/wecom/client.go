@@ -233,7 +233,9 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 		attempts++
 		if c.cfg.MaxReconnectAttempts != ReconnectForever && attempts > c.cfg.MaxReconnectAttempts {
-			return fmt.Errorf("%w: %w", ErrReconnectExhausted, err)
+			// Transport errors may carry credentials or peer-supplied text.
+			// Keep them out of both the public message and the unwrap chain.
+			return ErrReconnectExhausted
 		}
 		if err := sleepContext(ctx, c.backoff(attempts)); err != nil {
 			return err
