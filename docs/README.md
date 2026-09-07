@@ -24,6 +24,9 @@
 - [身份、权限与密钥治理](security-and-governance.md)：对话面/控制面两条互不相交的凭据链路、`platform_admin`/`tenant_admin` 角色模型、Admin 请求处理顺序、Security Manifest 的严格解析、租户 SecretRef/PolicyRef entitlement、Runtime 构建顺序和发布态摘要校验，以及明确未实现的部分。
 - [cc-connect IM 接入参考笔记（仅作参考）](im-reference-cc-connect.md)：飞书与企业微信协议实现的可借鉴经验、与本项目架构的边界、明确不采用的做法，以及后续实现和测试清单；不作为架构、实现、依赖或验收依据。
 - [Channel 持久化流水线契约](channel-pipeline.md)：Inbox/Run/Outbox 状态机、attempt token CAS、同 Session 顺序、Redis/PostgreSQL 恢复边界、Tool 重放条件和关闭顺序。
+- [IM 设计验收收口](im-acceptance-closure.md)：四项 IM 要求、真实单聊证据和设计边界。
+- [最小企微可观测性](observability-slice.md)：三阶段 Span、指标、脱敏和本地验收记录。
+- [可复现本地部署](local-deployment.md)：网页、私密配置、可选 PostgreSQL/企微与 Collector 的运行步骤。
 
 ## 待建立
 

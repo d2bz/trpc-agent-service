@@ -57,7 +57,7 @@ IM 四项说明要求已单独[收口](im-acceptance-closure.md)：消息转换�
 | A25 | Context、goroutine、Event Channel 排空 | [并发与故障边界](architecture.md#7-并发与故障边界) | 企微消费者取消、Event 排空及关闭次序相关测试通过；`TestWeComFailureStopsTheProcess` 验证通道终止失败触发 HTTP drain 和服务退出。全仓 race 通过，证据范围为本地参考实现 | partial |
 | A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及 Session Revision Pin：发布和回滚都不会改变已开始的会话；`postgres` profile 下 Pin 与控制面同库，重启和多进程都能读到同一个 Pin（见 I10），权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
-| A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署) | 待实现 Compose/Kubernetes 验证 | planned |
+| A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署)、[本地运行](local-deployment.md) | 已验证单进程网页启动/HTTP/SSE/停止、私密环境文件启动及临时 schema 下的 PostgreSQL 启动；已有数据库 Compose 配置和本地 Collector 配置通过校验。多角色、Kubernetes、生产部署与真实 Bot 遥测组合仍为设计或待联调 | partial |
 | D01 | 架构方案，原题建议 2000-4000 字 | [正式提交方案](submission-2026-08-27.md) | 1.0 中文正文 3288 字，历史提交前检查已完成；当前交付待复核 | partial |
 | D02 | 系统架构图 | [正式架构图](submission-2026-08-27.md#3-总体架构) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
 | D03 | 核心时序图 | [正式时序图](submission-2026-08-27.md#4-核心消息链路) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |

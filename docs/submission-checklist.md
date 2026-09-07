@@ -29,7 +29,10 @@
 ## 3. 提交前验证
 
 - [x] 2026-09-07 已按[七项原题设计验收](acceptance.md#原题设计验收)完成内容复核及八类交付物映射，见[本轮记录](verification-2026-09-07.md)。
-- [x] 当前参考链路、未实现能力和十二项风险边界已区分；网页/企微仍为后续独立演示切片。
+- [x] 当前参考链路、未实现能力和十二项风险边界已区分；后续已完成[网页切片验收](acceptance.md#网页切片验收2026-09-07)及[企微文本链路验收](wecom-text-slice.md#验证结果)。
+- [x] 企业微信真实正常单聊已有[独立证据](wecom-text-slice.md#真实单聊验证)；重复投递、发送失败与恢复仍以本地协议集成为证据。
+- [x] `f5ed53c` 的可选企微三阶段 OTel 已完成[本地验收](observability-slice.md#验证结果)，以 `request_id` 关联，未验证真实 Bot 遥测，不宣称完整连续 Trace。
+- [x] 本轮[可复现本地部署](local-deployment.md#本轮验证)的构建、网页 8 项 HTTP/SSE、环境文件、临时 PostgreSQL schema 启动与 Collector 配置校验通过；没有新增真实 Bot 遥测证据。
 - [ ] 在选定交付提交上执行以下适用检查并保存结果；本清单列出命令不代表已经执行通过。
 
 ```bash
@@ -78,14 +81,16 @@ docker compose -f deploy/docker-compose.session.yml down -v
 - [x] 本地分支名为 `feature/d2bz`。
 - [x] 个人 Fork 存在 `origin/feature/d2bz`。
 - [x] 8 月 27 日提交 commit 已推送，且本地与远端 SHA 一致。
-- [ ] 当前交付的分支、commit 和 GitHub 入口已核对，所需代码已推送。
-- [ ] 当前工作区和待提交差异已检查，无运行日志、PID、二进制、覆盖率文件或密钥进入 Git。2026-09-07 存在未提交 Channel 实验及文档修改，不能宣称工作区干净。
+- [ ] 当前交付的分支、commit 和 GitHub 入口已核对，所需代码已推送。参赛入口为 `d2bz/trpc-agent-service` 的 `feature/d2bz`；本地已验收 `f5ed53c` 及后续部署切片尚待确认推送，不能将本地提交视为远端可用。
+- [ ] 当前工作区和待提交差异已检查，无运行日志、PID、二进制、覆盖率文件或密钥进入 Git。原工作区的未提交 Channel 实验继续保留；当前部署切片在独立工作树中进行，不将原实验自动纳入交付。
 - [ ] 提交平台所需的仓库、分支、文档入口和演示说明已经填写。
 
 ## 5. 当前实现边界
 
 截至 2026-09-03 的历史记录：已实现真实 LLMAgent/Runner、Tenant/App/不可变 Revision、发布与回滚、对话面和 Admin 面独立凭据、租户 SecretRef/PolicyRef entitlement、服务端 Session Revision Pin、Runtime 缓存与生命周期、PostgreSQL 控制面、InMemory/PostgreSQL/Redis Session、Redis Session Run Lease、双 Worker 共享链路、StorageBundle Router，以及租户 BackendProfile 的 InMemory/PostgreSQL 控制面和动态 Session Factory。默认本地配置仍为 InMemory，`postgres` profile 已接入共享 Repository/Directory，Revision 可按租户 BackendProfile 动态构建 PostgreSQL/Redis Session；相关门控集成测试有历史通过记录。
 
-2026-09-07 当前增量：Inbox/Run/Outbox 等 Channel 实验代码尚未提交，跨租户碰撞测试的 Run ID 夹具已修复。本轮全仓默认 race、vet、构建和 8 项本地 HTTP/SSE 演示通过；真实 PostgreSQL/Redis 集成、外部模型和 IM 均未在本轮联调，真实 IM Adapter 与启动接线尚未完成。测试对应含未提交代码的工作树，不代替最终交付 commit 的验收。
+2026-09-07 早期工作树历史记录：Inbox/Run/Outbox 等 Channel 实验代码当时尚未提交，跨租户碰撞测试的 Run ID 夹具已修复。该轮全仓默认 race、vet、构建和 8 项本地 HTTP/SSE 演示通过；真实 PostgreSQL/Redis 集成、外部模型和 IM 当时均未联调，真实 IM Adapter 与启动接线尚未完成。此记录对应当时含未提交代码的工作树，不代替后续提交的验收。
 
-当前按原题收口设计与参考实现，旧全平台开发冻结排期不再作为必须实现的清单。网页聊天和企微智能机器人长连接是已选演示方向，飞书保留差异设计；Memory/Summary、持久 Audit、Telemetry、生产部署及完整治理等未完成能力如实列入设计和风险边界，不自动进入实施。已知限制见[验收矩阵](acceptance.md#已知限制)，所有实现状态以可运行代码和对应版本的证据为准。
+后续已提交网页聊天、选定 PostgreSQL Store 和企微持久消费者；`0378175` 已验证真实 Bot、真实模型与 PostgreSQL 的正常单聊，`b35215d` 收口 IM 设计，`f5ed53c` 增加默认关闭的三阶段 Span、次数和耗时。企微为单进程、单静态 Binding、单聊文本；未知发送结果不自动重发，已启动未知 Run 不重跑，旧连接目标失败。网页、企微与观测证据分别见本页第 3 节链接。
+
+当前按原题收口设计与参考实现，旧全平台开发冻结排期不再作为必须实现的清单。飞书保留差异设计；Memory/Summary、持久 Audit、完整 Model/Tool/存储 Trace、生产部署及完整治理等未完成能力如实列入设计和风险边界，不自动进入实施。本轮只补可复现本地运行配置与说明。已知限制见[验收矩阵](acceptance.md#已知限制)，所有实现状态以可运行代码和对应版本的证据为准。
