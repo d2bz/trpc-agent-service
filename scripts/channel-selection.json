@@ -45,7 +45,7 @@
     },
     {
       "path": "trpcservice/channels/postgres/postgres.go",
-      "sha256": "214c8aec993f3cc65633958e1dbf5037ce40fcbc9a891f8a55ee0984043ddda1",
+      "sha256": "6368b18ae11606a28a3f9fc3fbb9372de1f392428185780a39ee301700c38b0a",
       "lines": 354
     },
     {

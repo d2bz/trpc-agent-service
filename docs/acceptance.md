@@ -22,7 +22,9 @@
 
 以下 A01-A28、D01-D08、F01 及 I01-I16 保留为细化追踪，不是原题要求全部实现的清单。状态按代码/证据完成度记录：`planned` 表示尚无已验收实现，`partial` 表示已有部分实现或验证，`done` 表示该条明确范围所需证据齐备；它们不代表上表设计验收是否通过，也不自动形成开发排期。
 
-截至 2026-09-07，Channel 未提交实验已修复跨租户碰撞测试的 Run ID 夹具。本轮当前工作树全仓默认 `go test -race -count=1 -timeout 900s ./...`、`go vet ./...`、构建和 8 项 HTTP/SSE 演示检查通过；真实 PostgreSQL/Redis 门控集成未在本轮运行，真实 IM Adapter 与启动接线尚未完成。工作树绿测不等于这些未提交代码已经在 GitHub 交付，详见本轮验收记录。
+2026-09-07 历史完整实验工作树已修复跨租户碰撞测试的 Run ID 夹具，并通过全仓默认 race、vet、构建和 8 项 HTTP/SSE 检查；当时未运行真实 PostgreSQL/Redis 门控集成，证据见[本轮验收记录](verification-2026-09-07.md)。此后网页聊天和企微协议包已分别提交，企微仍只有本地协议验证。
+
+本次选择性纳入的 Store 检查点另有独立证据：在基线 `6e549b1` 的干净快照上只加入 11 个既有文件（净增 6610 行），于 `/tmp/trpc-channel-selection.VKE9k1` 通过全仓默认 race、vet、build 和本地真实 PostgreSQL Store race。该候选不包含 Worker、Dispatcher、Waker、Scanner 或未提交的 `sessionrun` 修改，不能沿用完整实验测试宣称执行层已交付；范围及命令见[Channel 选择记录](channel-selection.md)。数据层测试不证明重启自动恢复或发送失败不重跑 Agent；Runner 接线和真实 Bot 端到端验收仍未完成。
 
 | ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -38,12 +40,12 @@
 | A10 | Memory 跨节点可见性 | [Memory 顺序](storage-and-consistency.md#53-memory) | 待实现双 Worker 可见性测试 | planned |
 | A11 | Redis 到 SQL 迁移 | [Session 迁移](storage-and-consistency.md#71-sessionredis-到-sql) | 待实现迁移 Job 与校验测试 | planned |
 | A12 | 本地到远端向量库迁移 | [向量迁移](storage-and-consistency.md#72-向量库迁移) | 待实现索引重建与切换测试 | planned |
-| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | 未提交 Channel 实验已有 Ingress 重复投递测试，真实 IM 重复事件链路尚未验收 | partial |
-| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 网页聊天已完成 I16；企微智能机器人长连接尚未实现，飞书保留差异设计。不要求双真实 IM 收发，网页不替代第二类外部 IM 差异设计 | planned |
-| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | 未提交 Channel 实验已有 Ingress、Worker、Dispatcher 及相关测试；真实 Adapter 转换和启动接线尚未完成 | partial |
-| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 待实现验签向量与身份测试 | planned |
-| A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 待实现键生成与隔离测试 | planned |
-| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 未提交 Channel 实验已有 Sender/Dispatcher 及测试；具体企微平台限制尚未验收，媒体不在已选文本演示范围 | partial |
+| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | 本次选取的 PostgreSQL Store 持久去重已有本地真实数据库 race 证据，见[选择记录](channel-selection.md)；协议包、Store 和 Runner 尚未接通，真实 IM 重复事件链路未验收 | partial |
+| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 网页聊天已完成 I16；已提交 `channels/wecom` 智能机器人长连接协议包并完成本地 mock WebSocket 验证，尚无 Runner 接线和真实 Bot 验收；飞书仅保留差异设计，网页不替代第二类外部 IM 差异设计 | partial |
+| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | 已提交[企微协议包](../trpcservice/channels/wecom/README.md)，本地验证单聊文本解析、可信 Binding 身份派生、最终文本发送及回执判定；不调用 Runner，本次 Store 检查点也不包含执行与收发编排，端到端转换和启动接线未完成 | partial |
+| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 企微长连接已本地验证订阅鉴权、静态 Binding 校验与身份派生；持久 Store 去重另有测试，两者尚未接线。该入口不使用 Webhook 回调验签，飞书回调安全流程保留设计 | partial |
+| A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 企微单聊 Session 派生已测试确定性、字段边界及租户/App/Binding/用户隔离，见 `wecom/wecom_test.go`；群聊和跨群隔离仍为设计，协议包拒绝群聊输入 | partial |
+| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 已提交企微协议包本地验证文本边界、连接重连和回复成功/拒绝/结果未知分类；回复失败不在协议包内自动重试，持久发送编排未接线。真实平台限制与 Bot 尚未联调，群聊、媒体和卡片不在当前文本范围 | partial |
 | A19 | Plugin/Guardrail/Callback 租户治理 | [Tool 与 Policy Runtime](tool-policy.md)、[治理](solution.md#56-治理与安全) | 已实现静态 Tool Registry、Revision ToolRefs、Policy 白名单交集、未知/重复/越权 fail closed、Tool callback 审计和工具循环上限；租户级 PolicyRef entitlement 已实现，在创建、发布和 Runtime 构建三处由同一个 authorizer 判定（见 I14）；预算、审批、Guardrail 和动态扩展待实现 | partial |
 | A20 | 指标与租户成本 | [可观测性](solution.md#57-可观测性)、[容量估算](solution.md#6-容量估算方法) | 待实现 OTel Metric 与成本聚合测试 | planned |
 | A21 | 全链路 Trace | [完整时序](sequence.md#1-企业微信完整链路) | 待实现 trace 传播集成测试 | planned |
