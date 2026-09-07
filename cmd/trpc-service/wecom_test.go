@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -60,16 +64,61 @@ func TestWeComIsDisabledUntilItIsAskedFor(t *testing.T) {
 // there, and refusing costs no connection and no Secret.
 func TestWeComRequiresDurableStorage(t *testing.T) {
 	channel, err := startWeComChannel(context.Background(),
-		storageConfig{profile: profileInMemory}, &storageStack{}, nil, env(enabledEnv()))
+		storageConfig{profile: profileInMemory}, telemetry.Config{},
+		&storageStack{}, nil, env(enabledEnv()))
 	require.ErrorIs(t, err, errWeComConfig)
 	require.Nil(t, channel)
 
 	// Disabled under the same profile is not an error: it is the default.
 	channel, err = startWeComChannel(context.Background(),
-		storageConfig{profile: profileInMemory}, &storageStack{}, nil, env(nil))
+		storageConfig{profile: profileInMemory}, telemetry.Config{},
+		&storageStack{}, nil, env(nil))
 	require.NoError(t, err)
 	require.Nil(t, channel)
 	require.NoError(t, channel.stop())
+}
+
+// The flush happens after both halves have returned, and it is the channel that
+// owns it: a record made by the last message this process handled must not be
+// dropped because the exporter was closed first.
+func TestWeComChannelFlushesWhatItsLoopsRecorded(t *testing.T) {
+	exports := make(chan string, 4)
+	collector := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case exports <- r.URL.Path:
+			default:
+			}
+		}))
+	defer collector.Close()
+
+	observer, err := telemetry.Open(context.Background(),
+		telemetry.Config{Enabled: true, Endpoint: collector.URL})
+	require.NoError(t, err)
+	stages, err := observer.ChannelRecorder(telemetry.Binding{
+		TenantID:  "tenant-a",
+		AppID:     "app-a",
+		BindingID: "binding-a",
+		Channel:   channels.ChannelWeCom,
+	})
+	require.NoError(t, err)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	channel := &wecomChannel{
+		cancel:   cancel,
+		failures: make(chan error, 2),
+		observer: observer,
+	}
+	channel.start(runCtx, "consumer", func(ctx context.Context) error {
+		<-ctx.Done()
+		_, span := stages.Start(ctx, telemetry.StageDeliver)
+		span.End(telemetry.Result{Outcome: telemetry.OutcomeSucceeded, RequestID: "req-1"})
+		return ctx.Err()
+	})
+
+	require.NoError(t, channel.stop())
+	require.NotEmpty(t, exports, "stop must export what the loop recorded on its way out")
 }
 
 // The bot Secret is granted to one tenant and one reference, in code. Nothing

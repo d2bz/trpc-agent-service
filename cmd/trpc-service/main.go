@@ -18,6 +18,7 @@ import (
 	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
@@ -111,6 +112,17 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 	// Safe to log: describe reports presence, never contents.
 	log.Printf("storage %s", storageCfg.describe())
 
+	// Read here, with the other configuration, so that a misconfigured collector
+	// is a refusal before anything is opened. Nothing is built yet; see
+	// startWeComChannel.
+	telemetryCfg, err := telemetry.Load(getenv)
+	if err != nil {
+		return err
+	}
+	// Safe to log: Describe renders the checked origin, which cannot carry a
+	// credential.
+	log.Printf("telemetry %s", telemetryCfg.Describe())
+
 	// One deadline over every connection, migration and constructor between
 	// here and a serving process.
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
@@ -147,7 +159,7 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 	// Started here and registered after the Runtime defer, so that it stops
 	// before the Runtimes it executes through and the pool it writes through are
 	// released. It is off unless configured; see startWeComChannel.
-	channel, err := startWeComChannel(startupCtx, storageCfg, stack, runs, getenv)
+	channel, err := startWeComChannel(startupCtx, storageCfg, telemetryCfg, stack, runs, getenv)
 	if err != nil {
 		return err
 	}

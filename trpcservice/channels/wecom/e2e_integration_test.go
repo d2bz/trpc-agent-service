@@ -24,6 +24,7 @@ import (
 	sessiondirpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	tenantpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tenant/postgres"
 )
@@ -137,6 +138,8 @@ type e2e struct {
 	sessions    session.Service
 	directory   sessiondir.Directory
 	closeRuns   func()
+	// observer is nil unless a test turns telemetry on for the consumer below.
+	observer *telemetry.Telemetry
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -200,6 +203,7 @@ func (e *e2e) start(t *testing.T) *mockConn {
 		Store:     e.store,
 		Runs:      e.runs,
 		Revisions: func(context.Context, string, string, string) error { return nil },
+		Telemetry: e.observer,
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())

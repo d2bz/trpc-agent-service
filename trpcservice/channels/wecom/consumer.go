@@ -15,6 +15,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -118,6 +119,12 @@ type ConsumerConfig struct {
 	// Revisions is re-asked before every execution; see RevisionCheck.
 	Revisions RevisionCheck
 
+	// Telemetry is optional and off by default. When it is nil the consumer
+	// records nothing, which is the behaviour every existing caller has: the
+	// stage records below are an operator's view of this loop and never a part
+	// of it, so a process without a collector runs exactly as before.
+	Telemetry *telemetry.Telemetry
+
 	// Now and NewID are seams for tests. They default to the wall clock and to
 	// UUIDs.
 	Now   func() time.Time
@@ -149,6 +156,9 @@ type Consumer struct {
 	scan   channels.ScanScope
 	policy channels.RunPolicy
 	worker string
+	// stages records what the loops below did, for an operator. It is nil unless
+	// telemetry was configured.
+	stages *telemetry.ChannelRecorder
 
 	// nudge shortens the wait after an accept. It is an optimisation and never
 	// a guarantee: every durable item is found by the poll below whether or not
@@ -193,6 +203,17 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
+	// Built from this consumer's own binding rather than passed in, so a record
+	// cannot be attributed to a tenant this consumer does not serve.
+	stages, err := cfg.Telemetry.ChannelRecorder(telemetry.Binding{
+		TenantID:  cfg.Binding.TenantID,
+		AppID:     cfg.Binding.AgentAppID,
+		BindingID: cfg.Binding.BindingID,
+		Channel:   channels.ChannelWeCom,
+	})
+	if err != nil {
+		return nil, err
+	}
 	return &Consumer{
 		binding:   cfg.Binding,
 		client:    cfg.Client,
@@ -208,6 +229,7 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 		},
 		policy: policy,
 		worker: "wecom-" + cfg.Binding.BindingID,
+		stages: stages,
 		nudge:  make(chan struct{}, 1),
 	}, nil
 }
@@ -255,16 +277,33 @@ func (c *Consumer) acceptLoop(ctx context.Context) error {
 	}
 }
 
-// accept writes one message to the Store, retrying with the same identifiers.
+// accept records one message and reports the stage once, however many times the
+// write below had to be retried.
+func (c *Consumer) accept(ctx context.Context, message DirectText) error {
+	ctx, span := c.stages.Start(ctx, telemetry.StageAccept)
+	stage, err := c.record(ctx, message)
+	span.End(stage)
+	return err
+}
+
+// record writes one message to the Store, retrying with the same identifiers.
 //
 // The ids are minted before the first call and reused, which is what makes a
 // retry recognisable: the Store returns the row the first call created rather
 // than creating a second Run. A redelivery of the same platform message id is
 // recognised the same way, by the Store, on the external event id.
-func (c *Consumer) accept(ctx context.Context, message DirectText) error {
+func (c *Consumer) record(
+	ctx context.Context,
+	message DirectText,
+) (telemetry.Result, error) {
+	failed := telemetry.Result{
+		Outcome:   telemetry.OutcomeFailed,
+		ErrorType: channels.ErrorInternal,
+	}
 	envelope, err := c.envelope(message)
 	if err != nil {
-		return ErrAcceptFailed
+		failed.ErrorType = channels.ErrorPermanent
+		return failed, ErrAcceptFailed
 	}
 	request := channels.AcceptRequest{
 		IDs: channels.AcceptIDs{
@@ -277,14 +316,28 @@ func (c *Consumer) accept(ctx context.Context, message DirectText) error {
 	}
 	for attempt := 1; ; attempt++ {
 		request.Now = c.now()
-		if _, err := c.store.Accept(ctx, c.scope, request); err == nil {
-			return nil
+		failed.Attempt = int32(attempt)
+		if stored, err := c.store.Accept(ctx, c.scope, request); err == nil {
+			// The row's own identifiers, which on the duplicate path are the
+			// ones the first delivery created. The ids this call minted were not
+			// stored, so recording them would invent a request that never
+			// existed and break the correlation with the two stages below.
+			outcome := telemetry.OutcomeSucceeded
+			if stored.Duplicate {
+				outcome = telemetry.OutcomeDuplicate
+			}
+			return telemetry.Result{
+				Outcome:   outcome,
+				RequestID: stored.RequestID,
+				RunID:     stored.RunID,
+				Attempt:   int32(attempt),
+			}, nil
 		}
 		if attempt >= persistAttempts {
-			return ErrAcceptFailed
+			return failed, ErrAcceptFailed
 		}
 		if err := sleepContext(ctx, persistDelay); err != nil {
-			return ErrAcceptFailed
+			return failed, ErrAcceptFailed
 		}
 	}
 }
@@ -509,13 +562,36 @@ func (c *Consumer) executeNext(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// execute answers one claimed Run, or records why it will not be answered.
+// execute answers one claimed Run, or records why it will not be answered, and
+// reports the stage once.
 func (c *Consumer) execute(
 	ctx context.Context,
 	claim channels.RunClaim,
 	deadline time.Time,
 ) error {
+	ctx, span := c.stages.Start(ctx, telemetry.StageExecute)
+	stage, err := c.answer(ctx, claim, deadline)
+	span.End(stage)
+	return err
+}
+
+// answer is that execution.
+//
+// What it returns for the record is what this attempt decided, which is not the
+// same claim as "this was durably recorded": the row in the Store is the
+// record of a Run, and a terminal write that could not be made comes back to
+// the caller as an error instead.
+func (c *Consumer) answer(
+	ctx context.Context,
+	claim channels.RunClaim,
+	deadline time.Time,
+) (telemetry.Result, error) {
 	token := runToken(claim.Run)
+	stage := telemetry.Result{
+		RequestID: claim.Run.RequestID,
+		RunID:     claim.Run.RunID,
+		Attempt:   claim.Run.Attempt,
+	}
 
 	// An attempt that already reached the Runner is never sent to it again.
 	// The Events of that attempt are not reconstructible here, so this process
@@ -524,7 +600,12 @@ func (c *Consumer) execute(
 	// a guess. The Run fails with that stated, which is the honest outcome and
 	// the one an operator can act on.
 	if claim.Run.FirstExecutionStartedAt != nil {
-		return c.finish(ctx, channels.FinishRunRequest{
+		// Recorded as its own outcome: this Run failed without the Runner being
+		// called, which is a different event from one the model answered badly.
+		stage.Outcome = telemetry.OutcomeInterrupted
+		stage.ErrorType = channels.ErrorInterruptedBeforeOutput
+		stage.RevisionID = claim.Run.RevisionID
+		return stage, c.finish(ctx, channels.FinishRunRequest{
 			Token:      token,
 			Status:     channels.RunFailed,
 			RevisionID: claim.Run.RevisionID,
@@ -548,10 +629,13 @@ func (c *Consumer) execute(
 		// Nothing has executed, so the Run can go back and be tried again. The
 		// error itself is not carried anywhere: it can quote a backend.
 		cancel()
-		return c.yield(ctx, token, startErrorType(err))
+		errorType := startErrorType(err)
+		stage.Outcome, stage.ErrorType = telemetry.OutcomeYielded, errorType
+		return stage, c.yield(ctx, token, errorType)
 	}
 
 	scope := handle.Scope()
+	stage.RevisionID = scope.RevisionID
 	// The pin is resolved now, so this is the first point at which the revision
 	// that will actually answer is known. Startup checked the published one;
 	// this checks the one in hand, because a route published in between could
@@ -559,7 +643,8 @@ func (c *Consumer) execute(
 	if err := c.revisions(runCtx, scope.TenantID, scope.AppID, scope.RevisionID); err != nil {
 		handle.Close()
 		cancel()
-		return c.finish(ctx, channels.FinishRunRequest{
+		stage.Outcome, stage.ErrorType = telemetry.OutcomeFailed, channels.ErrorPermanent
+		return stage, c.finish(ctx, channels.FinishRunRequest{
 			Token:      token,
 			Status:     channels.RunFailed,
 			RevisionID: scope.RevisionID,
@@ -569,14 +654,16 @@ func (c *Consumer) execute(
 	if err := c.store.RecordRunRevision(ctx, c.scope, token, scope.RevisionID, c.now()); err != nil {
 		handle.Close()
 		cancel()
-		return c.claimLost(ctx, err)
+		stage.Outcome, stage.ErrorType = telemetry.OutcomeSkipped, channels.ErrorInternal
+		return stage, c.claimLost(ctx, err)
 	}
 	// After this the claim may no longer be yielded, and no later attempt may
 	// call the Runner for this Run.
 	if err := c.store.MarkRunStarted(ctx, c.scope, token, c.now()); err != nil {
 		handle.Close()
 		cancel()
-		return c.claimLost(ctx, err)
+		stage.Outcome, stage.ErrorType = telemetry.OutcomeSkipped, channels.ErrorInternal
+		return stage, c.claimLost(ctx, err)
 	}
 
 	startedAt := c.now()
@@ -584,7 +671,8 @@ func (c *Consumer) execute(
 	if err != nil {
 		handle.Close()
 		cancel()
-		return c.finish(ctx, channels.FinishRunRequest{
+		stage.Outcome, stage.ErrorType = telemetry.OutcomeFailed, channels.ErrorAgentFailed
+		return stage, c.finish(ctx, channels.FinishRunRequest{
 			Token:      token,
 			Status:     channels.RunFailed,
 			RevisionID: scope.RevisionID,
@@ -634,7 +722,11 @@ func (c *Consumer) execute(
 			DeliveryTarget:  claim.DeliveryTarget,
 		}}
 	}
-	return c.finish(ctx, request)
+	stage.Outcome, stage.Events = telemetry.OutcomeSucceeded, collected.events
+	if request.Status == channels.RunFailed {
+		stage.Outcome, stage.ErrorType = telemetry.OutcomeFailed, request.ErrorType
+	}
+	return stage, c.finish(ctx, request)
 }
 
 // startErrorType classifies a failed Start for the operator record. It reads
@@ -813,12 +905,37 @@ func (c *Consumer) pendingSends(ctx context.Context) ([]channels.OutboxPart, boo
 // It is a separate step from recording the result so that a failure to record
 // can be retried without the possibility of sending again: the send is behind
 // this call, and the caller only has the result.
+//
+// The record is taken here, around that one attempt, and never around the
+// retried write in complete: a stage that counted the write would report a
+// second send that did not happen.
 func (c *Consumer) deliver(ctx context.Context, part channels.OutboxPart) channels.SendResult {
+	ctx, span := c.stages.Start(ctx, telemetry.StageDeliver)
+	result, outcome := c.send(ctx, part)
+	span.End(telemetry.Result{
+		Outcome:   outcome,
+		ErrorType: result.ErrorType,
+		RequestID: part.RequestID,
+		RunID:     part.RunID,
+		OutboxID:  part.OutboxID,
+		Attempt:   part.Attempt,
+	})
+	return result
+}
+
+// send is that attempt, and reports what the stage saw alongside what the Store
+// stores. The two are not the same judgement: the Store needs to know whether
+// the part may be tried again, and an operator needs to know whether anything
+// was put on the wire at all.
+func (c *Consumer) send(
+	ctx context.Context,
+	part channels.OutboxPart,
+) (channels.SendResult, telemetry.Outcome) {
 	if !c.ownsPart(part) {
 		return channels.SendResult{
 			Outcome:   channels.SendPermanent,
 			ErrorType: channels.ErrorPermanent,
-		}
+		}, telemetry.OutcomeSkipped
 	}
 	if part.DuplicateRisk || part.Attempt > sendAttempts {
 		// Some earlier attempt may already have been delivered. Sending again
@@ -827,14 +944,14 @@ func (c *Consumer) deliver(ctx context.Context, part channels.OutboxPart) channe
 		return channels.SendResult{
 			Outcome:   channels.SendUnknown,
 			ErrorType: channels.ErrorOutcomeUnknown,
-		}
+		}, telemetry.OutcomeSkipped
 	}
 	target, err := decodeTarget(c.binding, part.DeliveryTarget)
 	if err != nil {
 		return channels.SendResult{
 			Outcome:   channels.SendPermanent,
 			ErrorType: channels.ErrorPermanent,
-		}
+		}, telemetry.OutcomeStaleTarget
 	}
 	if ctx.Err() != nil {
 		// Shutting down. Nothing was written, so this is a plain failure and
@@ -842,9 +959,31 @@ func (c *Consumer) deliver(ctx context.Context, part channels.OutboxPart) channe
 		return channels.SendResult{
 			Outcome:   channels.SendRetryable,
 			ErrorType: channels.ErrorInternal,
-		}
+		}, telemetry.OutcomeSkipped
 	}
-	return classifySend(c.client.SendFinalText(ctx, target, part.Message.Text))
+	err = c.client.SendFinalText(ctx, target, part.Message.Text)
+	return classifySend(err), deliverOutcome(err)
+}
+
+// deliverOutcome reads the same errors classifySend reads, and splits its one
+// permanent class into the two an operator acts on differently: a reply address
+// that is spent, or that belongs to a connection which is gone, is the channel
+// working as designed, and a refused message is not.
+func deliverOutcome(err error) telemetry.Outcome {
+	switch {
+	case err == nil:
+		return telemetry.OutcomeSucceeded
+	case errors.Is(err, ErrReplyTargetExpired),
+		errors.Is(err, ErrNotConnected),
+		errors.Is(err, ErrReplyAlreadySent):
+		return telemetry.OutcomeStaleTarget
+	case errors.Is(err, ErrReplyRejected),
+		errors.Is(err, ErrTextTooLong),
+		errors.Is(err, ErrTextInvalid):
+		return telemetry.OutcomeRejected
+	default:
+		return telemetry.OutcomeUnknown
+	}
 }
 
 // classifySend maps what the protocol adapter reports onto the outcomes the

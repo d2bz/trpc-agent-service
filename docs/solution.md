@@ -103,9 +103,33 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 
 Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检查 IM 用户权限、Tool 白名单、预算和敏感输入；危险 Tool 进入人工审批；执行后进行输出脱敏和审计。密钥配置只保存 `secret_ref`，日志、Trace、错误和审计不记录明文密钥。Tool 必须显式声明是否可重放；具有副作用且允许自动重放的 Tool 使用跨模型 attempt 稳定的业务操作键，不能把可能重生的上游 `tool_call_id` 当成跨 attempt 保证。
 
+| 治理阶段 | 生产决策与失败行为 |
+| --- | --- |
+| 入站 | 根据已验证 Tenant/Principal/Binding 检查用户是否可访问 App；缺失身份或权限拒绝，不允许模型决定租户或授权 |
+| Model 前后 | Plugin 在调用前按租户预算原子预占本次有界额度，超额拒绝；完成后按供应商 usage 与版本化价格表结算。调用结果未知时保留预占并进入对账，不把未知费用当作零 |
+| Tool 前 | Callback 以租户已授权 Policy 的交集裁决 Tool；危险操作的批准绑定 Tenant、主体、操作、参数摘要和有效期。参数变化、审批拒绝或过期均不执行，不以聊天中的一句确认直接放行 |
+| 输出前 | Guardrail 在最终回复或每个可发布流式片段离开服务前检查。需要全文才能判断的策略缓冲完整输出并降级为最终回复；已发送内容无法靠事后脱敏撤销 |
+| 审计 | 记录 allow/deny/approve/redact/limit 等决策与稳定错误分类，使用[审计字段](data-model.md#37-inboxrunoutbox-与-audit)。`latency_ms` 对应题目 latency 的毫秒值，费用或 Trace 尚不可得时明确为空/未知 |
+
+上表是治理设计。当前实现为静态身份与 SecretRef entitlement、Tool/Policy 交集、Tool callback 结构化审计和循环上限；用户级 IM 动态授权、预算预占结算、危险操作审批、输出 Guardrail 和持久 Audit Store 尚未实现。现有 Secret 边界及局限见[安全说明](security-and-governance.md)，不因本轮观测接入扩大治理实现。
+
 ### 5.7 可观测性
 
-OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Memory 和 Outbox。核心指标包括每租户请求量、并发 Run、模型/Tool/后端延迟、错误率、IM 投递成功率、token、费用和队列等待时间。审计记录至少包含题目指定的 `tenant_id`、`channel`、`user_id`、`session_id`、`agent_name`、`tool_name`、`decision`、`latency`、`error_type`、`cost` 和 `trace_id`。
+目标设计中 OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Memory 和 Outbox。核心指标包括每租户请求量、并发 Run、模型/Tool/后端延迟、错误率、IM 投递成功率、token、费用和队列等待时间。审计记录至少包含题目指定的 `tenant_id`、`channel`、`user_id`、`session_id`、`agent_name`、`tool_name`、`decision`、`latency`、`error_type`、`cost` 和 `trace_id`。
+
+| 指标 | 采集点和统计口径 |
+| --- | --- |
+| 新请求与重复入站 | Inbox 首次提交计一个新请求，重复命中单独计数；持久化内部重试不能重复增加受理次数 |
+| 阶段、模型、Tool、后端与排队耗时 | 各阶段起止点记录带明确单位的直方图，区分等待与实际调用；失败样本保留 outcome，不能只统计成功耗时。当前阶段指标使用毫秒 `ms` |
+| IM 投递结果 | 平台明确成功 ACK / 实际发送尝试数为成功率；拒绝、未知、目标过期分开。Outbox 状态写入重试不是新发送，ACK 不表示用户已读 |
+| 错误率与并发 | 错误阶段数 / 同阶段处理总数；活跃 Run 为已开始且未结束数量，不能将排队数计作运行并发 |
+| token 与租户成本 | 模型返回的 usage 按输入/输出及供应商语义记录，以模型与价格版本计算费用；缺失 usage 或价格时标记未知，不填零。跨租户查询由受控成本明细按租户聚合 |
+
+完整 Trace 为目标设计：受理端创建上下文，将 W3C `traceparent` 随 Inbox/Run/Outbox 持久化，Worker/发送器恢复上下文，Runner、Model、Tool 与存储适配器传递同一 Context；异步派生 Memory 使用父上下文或 Span Link 关联。当前表结构没有持久 Trace 上下文字段。
+
+本轮[最小观测切片](observability-slice.md)选择独立 provider，在受理、执行、发送三个阶段生成 Span、次数与耗时，以已有持久 `request_id` 关联；阶段可能属于不同 Trace，不宣称已完成跨队列连续父子 Trace、Model/Tool/Session/Memory 细分采集或成本统计。指标标签只用有限阶段、通道、结果类别及静态绑定的内部租户/App；request/user/session 等高基数 ID 不进入指标。观测只采集白名单字段，上游默认可能包含正文的自动 tracing 保持关闭，具体实现与验证状态以切片记录为准。
+
+当前 `trpc.channel.stage.count` 统计阶段处理次数，`trpc.channel.stage.duration` 记录对应毫秒耗时。`execute` 的结果是本次执行决策，不能替代持久 Run 终态；`deliver` 还含发送前跳过和旧目标记录，计算实际投递率时须区分 outcome，不直接用全部阶段次数作分母。启用时 OTel 进程级错误处理器只输出固定诊断，避免 SDK 将 Collector 原文写入日志；它不安装全局 provider，但会影响进程中其他 OTel 错误的诊断详细度，关闭遥测时不安装。
 
 ### 5.8 故障恢复
 

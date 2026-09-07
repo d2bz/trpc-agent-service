@@ -12,6 +12,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -127,6 +128,10 @@ type wecomChannel struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	failures chan error
+	// observer is nil unless telemetry was turned on. It is owned here because
+	// the consumer below is the only thing in this process that records: a
+	// provider outliving its one recorder would have nothing left to flush.
+	observer *telemetry.Telemetry
 }
 
 // startWeComChannel starts the channel, or reports that it is off. A nil
@@ -138,6 +143,7 @@ type wecomChannel struct {
 func startWeComChannel(
 	ctx context.Context,
 	cfg storageConfig,
+	observability telemetry.Config,
 	stack *storageStack,
 	runs *sessionrun.Service,
 	getenv func(string) string,
@@ -195,21 +201,32 @@ func startWeComChannel(
 	if err != nil {
 		return nil, err
 	}
+	// Built only for a channel that is going to run, and after the refusals
+	// above: a process that will not serve this bot opens no exporter.
+	observer, err := telemetry.Open(ctx, observability)
+	if err != nil {
+		return nil, err
+	}
 	consumer, err := wecom.NewConsumer(wecom.ConsumerConfig{
 		Binding:   binding,
 		Client:    client,
 		Store:     store,
 		Runs:      runs,
 		Revisions: wecomRevisionCheck(stack.repository),
+		Telemetry: observer,
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, observer.Shutdown(ctx))
 	}
 
 	// A context of its own, rooted at Background rather than at the startup
 	// deadline above, so the channel lives until stop ends it.
 	runCtx, cancel := context.WithCancel(context.Background())
-	channel := &wecomChannel{cancel: cancel, failures: make(chan error, 2)}
+	channel := &wecomChannel{
+		cancel:   cancel,
+		failures: make(chan error, 2),
+		observer: observer,
+	}
 	channel.start(runCtx, "connection", client.Run)
 	channel.start(runCtx, "consumer", consumer.Run)
 	return channel, nil
@@ -264,6 +281,11 @@ func (w *wecomChannel) stop() error {
 	for err := range w.failures {
 		errs = append(errs, err)
 	}
+	// Flushed after both halves have returned, so the last stage of the last
+	// message it handled is queued before the queue is drained. Shutdown is
+	// bounded on its own, because a collector that has gone away must not hold
+	// the process open.
+	errs = append(errs, w.observer.Shutdown(context.Background()))
 	return errors.Join(errs...)
 }
 
