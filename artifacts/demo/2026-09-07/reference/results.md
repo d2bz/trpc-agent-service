@@ -60,3 +60,21 @@ ok  github.com/liuzengh/trpc-agent-service/trpcservice/web 3.145s
 首次脚本调试曾因服务跨工具调用退出而连接失败，随后发现验收脚本误把 `routing_policy.default_revision_id` 读成顶层字段；修正脚本后上列 8 项通过。这两项没有修改服务功能代码。
 
 `go vet ./...`、`node --check scripts/verify-reference.mjs` 和 `git diff --check` 均无输出、退出码 0。`./build.sh` 输出构建完成；`./stop.sh` 停止本轮 PID，随后 `test ! -e data/trpc-service.pid` 通过。
+
+## 干净提交复验
+
+`git archive a7484d36d3353954edef591a12e28056a23bccd1` 导出独立临时目录后，使用相同默认全仓 race 命令，退出码 0；该快照没有未提交 Channel 流水线，因此 `trpcservice/channels` 输出 `[no test files]`，其余有测试的包全部 `ok`。`go vet ./...` 和 `./build.sh` 退出码均为 0。
+
+同一 shell 内启动快照服务、运行 `node scripts/verify-reference.mjs http://127.0.0.1:18080` 并停止，退出码 0，输出：
+
+```jsonl
+{"check":"health","result":"PASS"}
+{"check":"authentication-and-credential-separation","result":"PASS"}
+{"check":"http-echo-and-server-identifiers","result":"PASS","session_id":"4556fd07-4f27-4bb8-930f-9fcc12a5da7d","request_id":"168c4105-f127-4f38-a08d-d4aecc7f1ead","revision_id":"echo-v1"}
+{"check":"sse-and-session-continuation","result":"PASS","session_id":"4556fd07-4f27-4bb8-930f-9fcc12a5da7d","revision_id":"echo-v1"}
+{"check":"tenant-assertion-refused","result":"PASS"}
+{"check":"publication-keeps-existing-session-pin","result":"PASS","old_revision":"echo-v1","new_revision":"verify-c9434ca8-07a1-45ea-9fa0-bb84d2f20df6"}
+{"check":"revision-pin-conflict","result":"PASS"}
+{"check":"rollback-keeps-existing-session-pin","result":"PASS"}
+{"result":"PASS","checks":8,"base_url":"http://127.0.0.1:18080","boundary":"Local deterministic HTTP/SSE only; no real model, IM, database or cross-worker claim."}
+```
