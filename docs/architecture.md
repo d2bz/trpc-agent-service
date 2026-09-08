@@ -2,14 +2,14 @@
 
 > 本文描述参赛实现的目标架构和组件边界。它是 8 月 27 日方案文档的详细支撑材料，原始验收要求以仓库根目录 README 为准。
 
-当前已实现网页和企微单聊文本入口：企微使用静态 Binding、串行 Consumer、共享 Session Run 及 PostgreSQL Inbox/Run/Outbox，并已完成[真实正常单聊](wecom-text-slice.md#真实单聊验证)。2026-09-08 的[社区扩展切片](im-adapter-extension.md)将串行执行提取到公共文本包，由企微适配器接入，实施与验证状态以该记录为准。下文生产拓扑中的 Redis 唤醒、通用 Worker、Memory 和完整 OTel 不代表当前接线；IM 设计与实现映射见[收口记录](im-acceptance-closure.md)。
+当前已实现网页和企微单聊文本入口：企微使用静态 Binding、串行 Consumer、共享 Session Run 及 PostgreSQL Inbox/Run/Outbox，并已完成[真实正常单聊](wecom-text-slice.md#真实单聊验证)。2026-09-08 的[社区扩展切片](im-adapter-extension.md)将串行执行提取到公共文本包；新增[飞书长连接切片](feishu-text-slice.md)通过同一契约接入，具体实施和验证状态以该记录为准。下文生产拓扑中的 Redis 唤醒、通用 Worker、Memory 和完整 OTel 不代表当前接线；原四项 IM 设计验收见[历史收口记录](im-acceptance-closure.md)，飞书最新状态以新切片为准。
 
 ## 1. 设计结论
 
 本项目采用“逻辑分层、渐进拆分”的方式：
 
 - 逻辑上分为控制面和数据面，避免管理操作与高频 Agent 请求耦合。
-- 当前使用一个 Go 进程提供网页与可选企微入口；同一二进制按角色启动属于后续部署设计。
+- 当前使用一个 Go 进程提供网页与可选企微/飞书入口；同一二进制按角色启动属于后续部署设计。
 - 生产阶段将 Gateway、Worker、Channel Adapter 和后台任务拆成独立 Deployment，分别扩缩容。
 - Agent 以不可变 Revision 发布，在 Worker 中组装为 `agent.Agent + runner.Runner` 并按需缓存；灰度期间 Session 默认固定 Revision，避免同一对话行为漂移。
 - 每次请求创建独立 Invocation；Session、Memory、配置、幂等和审计数据全部外置。
@@ -240,7 +240,7 @@ thread_id = "" when the platform has no explicit thread
 
 当前可运行的参考实现使用 `./build.sh`、`./start.sh` 和 `./stop.sh`，单进程提供 Admin API、HTTP/SSE、Runtime 和 InMemory Session，默认仅监听回环地址，无需外部数据库或模型密钥。Redis/PostgreSQL 的可选集成依赖见 `deploy/docker-compose.session.yml`。
 
-企微默认关闭；启用时要求 PostgreSQL 进程 profile、静态单机器人绑定及进程默认的持久 Session/Pin。当前 Consumer 不承诺跨 Session 并行；退出先停止连接和消费者，再关闭 Runtime 与数据库，启动和验证方式见[企微文本切片](wecom-text-slice.md)。
+企微和飞书默认关闭；启用时要求 PostgreSQL 进程 profile、静态单机器人绑定及进程默认的持久 Session/Pin。同租户的两个入口使用不同 Binding ID。当前 Consumer 不承诺同一绑定跨 Session 并行；退出先停止连接和消费者，再关闭 Runtime 与数据库，启动和验证方式见[企微文本切片](wecom-text-slice.md)和[飞书文本切片](feishu-text-slice.md)。
 
 以下为后续多角色部署设计，`--role`、SQLite 和本地 Artifact 未接入当前命令入口：
 
@@ -332,7 +332,7 @@ return runCtx.Err()
 | Agent Runtime Builder | tRPC-Agent-Go `LLMAgent` + `Runner` | Graph、Chain、Parallel、业务 Agent 或其他模型供应商 |
 | Control Plane / Session Directory | InMemory、PostgreSQL | MySQL、SQLite、Redis 或外部状态服务 |
 | Session / Memory / Knowledge / Artifact | tRPC-Agent-Go 对应 Service | Redis、向量数据库、对象存储和租户级路由实现 |
-| Channel Adapter | `channels.TextAdapter` 与公共文本 Consumer，企业微信为真实参考接线 | 飞书（已有差异设计）、微信客服、公众号、Telegram、Slack 等 |
+| Channel Adapter | `channels.TextAdapter` 与公共文本 Consumer，企业微信参考接线与飞书长连接切片 | 微信客服、公众号、Telegram、Slack 等；群聊、媒体、卡片按平台扩展 |
 | Tool / Policy | 平台白名单和 Guardrail 边界 | MCP Server、业务 Tool、审批和成本策略 |
 | Telemetry | OpenTelemetry | 不同 Trace、Metric、Log 后端 |
 

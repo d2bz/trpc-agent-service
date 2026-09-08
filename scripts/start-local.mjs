@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 try {
-  loadEnvFile(resolve(root, process.argv[2] ?? 'data/local.env'));
+  const files = process.argv.slice(2);
+  for (const file of files.length ? files : ['data/local.env']) loadEnvFile(resolve(root, file));
 } catch {
   console.error('Cannot load local environment file; check its path and permissions.');
   process.exit(1);

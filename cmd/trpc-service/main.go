@@ -159,11 +159,23 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 	// Started here and registered after the Runtime defer, so that it stops
 	// before the Runtimes it executes through and the pool it writes through are
 	// released. It is off unless configured; see startWeComChannel.
+	//
+	// Both channel configurations are cross-checked first: two enabled channels
+	// sharing one (tenant, binding) would claim each other's rows, so neither is
+	// started. See checkChannelBindings.
+	if err := checkChannelBindings(getenv); err != nil {
+		return err
+	}
 	channel, err := startWeComChannel(startupCtx, storageCfg, telemetryCfg, stack, runs, getenv)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, channel.stop()) }()
+	feishuChan, err := startFeishuChannel(startupCtx, storageCfg, telemetryCfg, stack, runs, getenv)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, feishuChan.stop()) }()
 
 	api, err := web.NewPlatformServer(
 		stack.repository,
@@ -202,7 +214,8 @@ func runWith(addr string, getenv func(string) string, deps storageDeps) (err err
 	)
 	defer stop()
 
-	return waitForStop(signalCtx, errCh, channel.failed(), httpServer, shutdownTimeout)
+	return waitForStop(
+		signalCtx, errCh, channel.failed(), httpServer, shutdownTimeout, feishuChan.failed())
 }
 
 // loopbackHostname is the only non-literal host accepted as loopback. Resolving
@@ -259,7 +272,14 @@ func waitForStop(
 	channelErrCh <-chan error,
 	server httpServerLifecycle,
 	timeout time.Duration,
+	extraChannelErrCh ...<-chan error,
 ) error {
+	// A nil channel blocks forever, so a process running one channel or none
+	// waits on the same select as one running both.
+	var secondChannelErrCh <-chan error
+	if len(extraChannelErrCh) > 0 {
+		secondChannelErrCh = extraChannelErrCh[0]
+	}
 	select {
 	case <-signalCtx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -271,6 +291,10 @@ func waitForStop(
 		}
 		return errors.Join(err, server.Close())
 	case err := <-channelErrCh:
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return errors.Join(err, shutdownHTTPServer(shutdownCtx, server))
+	case err := <-secondChannelErrCh:
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		return errors.Join(err, shutdownHTTPServer(shutdownCtx, server))

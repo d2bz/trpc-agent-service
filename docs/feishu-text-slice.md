@@ -22,11 +22,38 @@
 
 凭据已保存且非空，文件权限为 `600`。2026-09-08 用户补充权限后再次运行只读预检：应用换取 Token、机器人身份查询、企业身份查询均返回 HTTP 200 / code 0，三项校验通过，脚本退出 0。此前企业查询的 code 99991672 / `tenant:tenant:readonly` 权限缺口已解决。该结果只证明凭据有效、机器人和企业身份可读取，不证明长连接在线或消息收发成功。
 
-本切片尚未新增 Go Adapter 或启动接线。Fable 5.1 以 `max` 两次调用均因上游 HTTP 503 / No available accounts 失败，未产生有效模型回复；依赖该审查的回调生命周期与租户绑定决策暂停，没有以其他模型替代审查或宣称完成。Opus 5 `max` 的实际回复标识已核实为 `claude-opus-5`，仅做源码阅读；在审查不可用后由 Leader 中止，没有最终实现方案，也没有授权或产生代码修改。
+Fable 5.1 初期因上游 HTTP 503 不可用，用户授权本切片临时由 Astra 架构/最终审查、Opus 5 `max` 实现。服务恢复后已恢复原分工，完成 Fable 5.1 `max` 定向审查；实际回复标识分别核实为 `claude-opus-5` 与 `claude-fable-5-1`。Opus 实现、Leader 三项阻断修复复核和本地最终验证已完成，长期协作约定不变。
 
-已完成的独立准备工作为本文与 70 行只读预检脚本，共两个文件。`node --check`、缺失文件的固定错误/退出码检查及真实官方 API 预检已执行，后者如实返回企业权限缺失并退出 1；未重跑 Go 测试，因为 Go 代码和依赖均未改变。当前网页与企微服务未重启，未发送真实飞书消息。
+预检脚本已通过语法检查、缺失文件固定错误检查和真实身份查询。当前网页与企微服务未重启；真实飞书连接和消息收发尚待联调，不由本地测试替代。
 
-权限复查通过后重新调用 Fable 5.1 `max`，上游仍连续返回 HTTP 503，未取得审查结果。用户明确选择“保持现有分工，待 Fable 5.1 可用后继续”。本切片停在边界审查，不由其他模型替代、不授权 Opus 开始依赖该审查的实现；恢复时沿用现有范围和已核实的 SDK 事实。
+## 本地验收证据
+
+2026-09-08，Leader 在干净交付检出对最终代码执行以下检查，全部退出 0：
+
+```bash
+TRPC_SERVICE_MODEL_INTEGRATION=0 TRPC_SERVICE_SESSION_INTEGRATION=0 \
+  go test -race -count=1 -timeout 900s ./...
+go vet ./...
+go build ./...
+TRPC_SERVICE_MODEL_INTEGRATION=0 TRPC_SERVICE_SESSION_INTEGRATION=1 \
+  TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_session?sslmode=disable' \
+  go test -race -count=1 -timeout 300s ./trpcservice/channels/postgres \
+  ./trpcservice/channels/wecom ./trpcservice/channels/text ./trpcservice/channels/feishu
+node --check scripts/start-local.mjs
+git diff --check
+```
+
+飞书[协议测试](../trpcservice/channels/feishu/adapter_test.go)使用真实 SDK 与本地 WebSocket，覆盖持久受理后 ACK、失败停止并排空、身份过滤、错误回复和禁止重定向。[PostgreSQL 集成](../trpcservice/channels/feishu/e2e_integration_test.go)连通公共消费者、真实 Runner/Session 和持久 Store，重复投递同一消息后得到一个成功 Run、一次执行和一个 sent 回复。模型使用确定性 echo；该证据不证明真实飞书平台收发或外部模型调用。
+
+## 本次实现决策
+
+- **发布阻断约束**：启动时用固定 App 凭据取得机器人及企业身份，静态绑定内部 Tenant/App/Binding；接收事件核对 header App/企业与 sender 企业。Principal、Session 和回复目标均带完整绑定作用域。同进程启用的企微和飞书不能在同一租户复用 Binding ID，避免两个消费者扫描相同任务作用域；仅在启动配置拒绝，不改变 Store 契约。
+- **发布阻断约束**：官方 SDK 长连接回调同步调用持久受理，设置约 2 秒预算、有限并发等待和串行受理；只有持久受理成功才返回 nil。首次受理失败终止接收，保留原始受理错误给公共消费者脱敏。停止时等待 SDK 回调全部退出，不在回调中等待其自身任务组。
+- **发布阻断约束**：最终回复使用私有标准 HTTP 请求，固定官方域名、禁用重定向、超时和无发送重试，避免 SDK Reply 内部重发。JSON 明确包含成功 code 且消息 ID 非空才确认 Delivered；不确定结果按 Unknown 终结，不重跑 Agent。
+- **发布阻断约束**：SDK 注入静默 Logger；外部错误仅用固定错误类别对外呈现。正文按保守 4096 UTF-8 字节限制在公共消费者持久化前处理。
+- **风险登记**：SDK 并发回调仅保证本实现串行受理后的持久顺序，不承诺平台原始时间顺序；终止时失败 ACK 可能来不及发出，平台有限重投不能当作无限恢复保证。每次回复单独获取 Token 增加一次认证请求，当前演示不增加 Token 缓存和并发刷新机制。
+
+Opus 可基于源码或测试反驳这些决策；若需改变公共契约或扩大冻结范围，停止该部分修改并交回 Leader。
 
 ## 本地配置预检
 
@@ -47,6 +74,32 @@ node scripts/check-feishu.mjs data/feishu.env
 
 这不是消息权限检查，也不是机器人就绪探针。应用发布、事件订阅和实际文本收发需要分别验证。
 
+## 启动配置
+
+使用 [本地部署说明](local-deployment.md) 中的 PostgreSQL 单进程配置。`deploy/local.env.example` 中飞书默认关闭，开启需要：
+
+```dotenv
+TRPC_SERVICE_STORAGE_PROFILE=postgres
+TRPC_SERVICE_SESSION_COORDINATION=inmemory
+TRPC_SERVICE_FEISHU_ENABLED=true
+TRPC_SERVICE_FEISHU_TENANT_ID=demo
+TRPC_SERVICE_FEISHU_AGENT_APP_ID=echo
+TRPC_SERVICE_FEISHU_BINDING_ID=feishu-local
+```
+
+`AGENT_APP_ID` 是服务内部的应用，`APP_ID` 是飞书开发者后台的应用，不能混用。自定义内部应用须先发布 Revision，并使用当前进程默认的持久 Session/Pin。首次演示可使用预置 `demo/echo`；真实模型配置与发布见 README。
+
+凭据和运行配置可分别放在 `data/feishu.env` 与 `data/local.env`，从干净检出构建后启动：
+
+```bash
+./build.sh
+node scripts/start-local.mjs data/feishu.env data/local.env
+```
+
+文件按参数顺序读取，已有进程环境优先，其次是较早文件的值，包括空值；凭据文件应放在带空占位字段的配置模板之前。配置文件不是 shell 脚本，不执行其中的命令。单个检出使用一套启动 PID 和日志，已有网页或企微运行时应使用独立检出与空闲 loopback 端口，避免覆盖运行记录。
+
+同一飞书 App 只运行一个本实现实例。多个连接可能分摊事件，当前绑定没有跨进程注册唯一性。HTTP 健康只表示服务就绪，日志中的固定 `channel feishu connected` 表示 SDK 长连接曾建立；事件订阅与实际回复仍须单独验证。
+
 ## 飞书后台配置
 
 | 设置 | 本切片要求 |
@@ -63,14 +116,18 @@ node scripts/check-feishu.mjs data/feishu.env
 
 2026-09-08 核对官方资料：[接收消息](https://open.feishu.cn/document/server-docs/im-v1/message/events/receive)、[回复消息](https://open.feishu.cn/document/server-docs/im-v1/message/reply)、[长连接配置](https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case)、[添加事件与发布](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/subscription-event-case)、[应用可用范围](https://open.feishu.cn/document/home/introduction-to-scope-and-authorization/availability)。
 
-## SDK 核对与待决边界
+## 审查与风险
 
-核对版本为官方 `github.com/larksuite/oapi-sdk-go/v3 v3.11.0`，来源提交 `3c046e36e885437d8dbae8870b8d56fce163590d`；尚未加入项目依赖。
+依赖固定为官方 `github.com/larksuite/oapi-sdk-go/v3 v3.11.0`，来源提交 `3c046e36e885437d8dbae8870b8d56fce163590d`。Leader 三项发布阻断为 SDK bootstrap 同样禁止重定向、回复目标包含内部 Agent App、启动时拒绝 Tenant/Binding 重用；均已修复并通过回归测试。Fable 定向审查未增加新的发布阻断，Leader 已完成源码与测试复核。
 
-- **发布阻断，待设计落实**：SDK 逐事件并发调用 Handler，并在 Handler 返回后发 ACK。必须以持久受理成功决定成功 ACK，串行受理和取消排空也需明确；不能从 Handler 内等待包含自身的 SDK 任务组。
-- **发布阻断，待设计落实**：SDK 不替应用核对事件的 App ID 和 tenant_key，需以可信静态绑定及认证得到的企业身份校验，不能凭第一条事件建立租户信任。
-- **发布阻断，待设计落实**：SDK 默认日志可包含消息正文、外部 ID 和原始错误，需覆盖 Logger 并约束公开错误。
-- **发布阻断，待设计落实**：一次 SDK Reply 调用可发起两次 HTTP 请求；`Success()` 仅检查 code 0，不能单独证明完整成功响应。发送结果分类和重试行为须符合公共消费者既有保证。
-- **风险登记**：SDK 并发回调不保证平台消息的原始顺序；最终需明确本实现保证的受理顺序。平台回复 UUID 的去重窗口有限，不能作为永久 exactly-once 保证。
+Fable 建议在受理超时后继续接收，分类为风险登记/可选小修。Leader 未采用：这会改变 `AcceptFunc`/`TextAdapter.Serve` 的“任何实际受理错误均终止，原错误返回”契约；每次写入都超过预算的故障也可能被反复忽略。当前保留失败即停并登记可用性代价。Fable 提及发送最长 20 秒适用于直接调用两次 10 秒 HTTP；本公共消费者还以一个 15 秒 Context 约束 Token 和回复的总耗时。
 
-上述条目是本次接入需作出的有限决策，不扩展为新的通用调度器、重放机制或生产恢复功能。
+| 风险触发与影响 | 当前边界与监测/降级 | 生产缓解及残余风险 |
+| --- | --- | --- |
+| 数据库延迟或故障使实际受理超过 2 秒，通道与进程可能终止 | 返回受理错误并停止；观察固定失败日志及可选 accept 阶段指标，修复存储后重启 | 由进程管理器重启并按容量实测预算；平台有限重投仍可能耗尽，未落库消息可能丢失 |
+| SDK 并发调度或平台重推改变消息顺序 | 只保证串行受理后的持久顺序，不保证原始发送时间顺序 | 平台有可信序号时再评估有限重排；缺少序号时无法恢复严格原始顺序 |
+| 停止/断网时 ACK 未发出，或回复 HTTP 结果未知 | 重推按 message_id 持久去重；Unknown 终结且不重发、不重跑 Agent | 按平台查询/幂等能力设计对账；UUID 去重只有一小时，不承诺永久 exactly-once 或最终送达 |
+| Token 获取失败、限流或 Token 失效导致未回复 | Token 失败也记 Unknown，显式业务拒绝记 Rejected；观察 deliver 阶段和 Outbox，当前不自动重试 | 按 API 能力增加 Token 缓存及限频策略；当前 Unknown 不能区分“尚未发送”与“可能已发送” |
+| 同一 App 多进程运行，或订阅未注册事件 | 仅支持一个实例；应用只订阅 `im.message.receive_v1`，其他事件可能被 SDK 返回失败并反复投递 | 生产增加账号注册唯一性及已订阅事件治理；本地启动校验不能约束其他进程配置 |
+
+本次发布阻断以正常链路、安全边界和已承诺保证为准；风险登记不扩展为新的调度器、重放机制或生产恢复功能。

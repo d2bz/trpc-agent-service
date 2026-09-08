@@ -7,7 +7,7 @@
 
 2026-09-07 校准：本文描述目标架构，完整设计覆盖原题，代码只需提供有代表性的实现。文中的生产组件和预期效果不自动成为本次必须编码的任务；当前设计验收、代码状态和证据见[验收矩阵](acceptance.md)。冻结的 8 月 27 日方案保留历史内容，旧全平台排期不再执行。
 
-当前网页聊天与企业微信单聊文本均已真实运行；企微采用单进程、单静态 Binding、PostgreSQL Inbox/Run/Outbox 和共享 Session Run。下文 Redis 调度、Memory、完整治理及生产部署仍为目标设计。IM 四项要求与实现边界统一见[IM 设计验收收口](im-acceptance-closure.md)。
+当前网页聊天与企业微信单聊文本均已真实运行；企微采用单进程、单静态 Binding、PostgreSQL Inbox/Run/Outbox 和共享 Session Run。下文 Redis 调度、Memory、完整治理及生产部署仍为目标设计。IM 四项要求见[历史设计收口](im-acceptance-closure.md)，飞书当前实现和证据见[单聊长连接切片](feishu-text-slice.md)。
 
 ## 1. 背景与目标
 
@@ -67,21 +67,21 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 
 | 能力 | 企业微信智能机器人长连接 | 飞书事件订阅 |
 | --- | --- | --- |
-| 入站方式 | 主动连接 `wss://openws.work.weixin.qq.com`，发送 `aibot_subscribe`；接收 `aibot_msg_callback` | HTTPS 事件订阅；也可使用官方 SDK 长连接 |
-| 安全 | Bot ID/Secret 认证；校验事件 `aibotid` 与受信任连接绑定一致，不用自建应用 access token | Webhook 按已配置凭据验证签名、Token 与应用身份；解密不等于认证，URL challenge 单独处理，顺序见下文；长连接使用应用凭据认证 |
-| 入站确认 | 推送帧没有 HTTP 响应；只有 Inbox 事务提交后才在平台内部标记受理，不假定断连后必然补投 | Webhook 快速确认前提交 Inbox；长连接确认由 SDK/协议处理，需核对处理器和确认顺序 |
+| 入站方式 | 主动连接 `wss://openws.work.weixin.qq.com`，发送 `aibot_subscribe`；接收 `aibot_msg_callback` | 本轮采用自建应用官方 Go SDK 长连接；HTTPS Webhook 保留为扩展设计 |
+| 安全 | Bot ID/Secret 认证；校验事件 `aibotid` 与受信任连接绑定一致，不用自建应用 access token | App ID/Secret 认证查询企业身份；核对事件 App/企业和 sender 企业，静态绑定内部 Tenant/App；Webhook 签名/Token 方案见下文 |
+| 入站确认 | 推送帧没有 HTTP 响应；只有 Inbox 事务提交后才在平台内部标记受理，不假定断连后必然补投 | SDK 在处理器返回后 ACK；持久受理成功才返回 nil，回调串行受理且有限等待，停止时排空；验证状态见飞书切片 |
 | 幂等与回复关联 | `body.msgid` 作入站事件键；`headers.req_id` 用于回复关联，不等同于平台 `request_id` | `im.message.receive_v1` 按 `message_id` 在 Binding 内去重，不能只依赖 `event_id`；message/chat/thread 标识用于回复定位 |
 | 身份与会话 | `from.userid`、`chattype`、群聊 `chatid`，机器人账号先绑定 Tenant/App | App、Chat、User、Thread 共同决定绑定和会话作用域 |
 | 文本回复 | `aibot_respond_msg` 透传 `req_id`，以固定 `stream.id` 发送最终文本；收到成功回执再确认 Outbox | Bot 消息 API 按 message/chat ID 回复；平台流式/卡片更新能力与普通文本分开 |
-| 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 按消息类型和 API 限额拆分/退避；限流、凭据失效与永久错误分别处理 |
+| 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 本轮采用保守 4096 UTF-8 字节最终文本；单次 HTTP 回复，未知不重发；生产按消息类型配置限频/退避 |
 | 扩展与撤回 | 图片/文件需下载解密和媒体上传，卡片、欢迎语、主动发送有独立协议；均不进入首条文本链路 | 图片/文件、富文本、交互卡片和撤回分别映射事件与出站动作，未支持时明确拒绝或记录 |
-| 当前状态 | 单静态 Binding、单聊纯文本已实现，真实正常收发已验证；增量流、群聊、媒体、卡片和撤回仍为设计 | 保留第二类 IM 的差异设计，实现暂缓 |
+| 当前状态 | 单静态 Binding、单聊纯文本已实现，真实正常收发已验证；增量流、群聊、媒体、卡片和撤回仍为设计 | [单聊长连接切片](feishu-text-slice.md)已实现，身份预检、本地协议与 PostgreSQL 集成通过；真实连接与收发单独验收 |
 
 协议依据为[企微官方 SDK README](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/README.md) 和 [WebSocket 实现](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)，2026-09-07 核对；这里只参考协议，不将 Node SDK 引入 Go 服务。自建应用 Webhook 的 `msg_signature`/AES、HTTP 200 和 access token 发送流程是另一种接入模式，不与智能机器人长连接混用。未核实的平台回复有效期、跨连接重试能力和限频数值保持待联调，不能据 SDK 的本地请求超时推定平台保证。
 
 当前企微超长文本按 UTF-8 字节截断并带 `[truncated]` 标记，只发送一次 `finish=true`，不是逐字流式。生产限频设计在外部账号作用域分配配额、保持同会话顺序，按消息/API 类型配置额度，对已确认可重试的限流采用有上限的指数退避并遵守平台有效等待值；当前没有限频调度器，也不因发送失败自动重发。媒体下载/解密、受租户保护的附件引用和出站上传由 Adapter 负责；当前不支持的消息不进入 Runner。各项降级和待核实边界见[平台限制](im-acceptance-closure.md#平台限制的明确边界)。
 
-**飞书 HTTPS 回调设计，尚无 Adapter。** 当前只用它满足第二类 IM 的差异设计；代码和真实联调留待有余力时进行。入口拟为 `POST /channels/feishu/{account_id}/events`，每个飞书应用只登记一个回调 URL。路径中的账号 ID 仅定位服务端已登记的候选 Binding 和凭据引用（Verification Token、可选 Encrypt Key、预期 App ID 及允许的飞书 tenant_key），不是租户认证结果；不依赖请求体声明的 App/Tenant 去寻找任意密钥。
+**飞书 HTTPS 回调扩展设计，未实现。** 本轮实际接入采用[官方长连接](feishu-text-slice.md)，以下 Webhook 方案继续用于通道差异和扩展设计。入口拟为 `POST /channels/feishu/{account_id}/events`，每个飞书应用只登记一个回调 URL。路径中的账号 ID 仅定位服务端已登记的候选 Binding 和凭据引用（Verification Token、可选 Encrypt Key、预期 App ID 及允许的飞书 tenant_key），不是租户认证结果；不依赖请求体声明的 App/Tenant 去寻找任意密钥。
 
 处理顺序如下，所有鉴权前解析和解密都不触发 Inbox、Runner 或业务路由：
 
@@ -95,9 +95,9 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 
 **撤回策略仍属设计。** 收到已验证的撤回事件时，记录对原消息和 Run 的关联，不删除已经提交的 Audit 或 Session Event；撤回也不自动抵消已执行的 Tool。通道支持撤回机器人回复时，经 Outbox 提交撤回动作，否则按租户策略忽略或发送更正说明。该策略承接[冻结稿的撤回设计](submission-2026-08-27.md#55-im-接入与幂等)，不把撤回、媒体或卡片加入当前文本演示实现范围。
 
-设计上两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`，敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；生产扩展只有确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。当前企微每条最终回复最多一次发送尝试，未知结果保留 `duplicate_risk` 且不重发，连接换代后旧目标失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
+设计上两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。企微出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`；飞书按原始 `message_id` 回复，目标携带完整绑定作用域，不随 WebSocket 换代失效。敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；生产扩展只有确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。当前企微每条最终回复最多一次发送尝试，未知结果保留 `duplicate_risk` 且不重发，连接换代后旧目标失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
 
-单聊按 Binding 与可信用户映射 Session，群聊按 Binding、群和显式线程划分，规则见[Session 命名](architecture.md#54-session-命名)。首版设计限制同一 Bot 只有一个活动接收连接，避免连接互相替换；断线重连停止旧连接的待回执等待。Inbox 提交前的进程故障可能丢失尚未持久化的帧，当前没有证据保证平台必然重投：监测连接与持久化失败、明确提示用户重试，生产可评估平台回放能力或本地持久接收层。该残余风险不因采用长连接而自动消失。
+单聊按 Binding 与可信用户映射 Session，群聊按 Binding、群和显式线程划分，规则见[Session 命名](architecture.md#54-session-命名)。当前部署限制同一 Bot 一个活动实例。企微连接可能互相替换，断线重连停止旧连接的待回执等待；飞书多个连接可能分摊事件，SDK 回调并发不保证原始时间顺序。Inbox 提交前的进程故障可能丢失尚未持久化的帧；飞书虽有超时重推，也不能作为无限恢复保证。监测连接与持久化失败、明确提示用户重试，生产可评估平台回放能力或本地持久接收层。该残余风险不因采用长连接而自动消失。
 
 ### 5.6 治理与安全
 
@@ -152,7 +152,7 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 
 ## 7. 预期效果
 
-以下是目标架构的生产效果，未实现部分以设计和限制说明交付，不据此宣称代码已具备对应能力。当前已选演示方向为网页聊天与企微智能机器人长连接，飞书保留差异设计。
+以下是目标架构的生产效果，未实现部分以设计和限制说明交付，不据此宣称代码已具备对应能力。网页聊天与企微智能机器人长连接已验证，追加飞书自建应用长连接单聊已通过本地验收，真实联调以[飞书切片](feishu-text-slice.md)为准。
 
 1. 两个以上租户可以创建、发布和隔离运行各自 Agent。
 2. 企业微信与飞书完成从入站到回复的全链路演示。

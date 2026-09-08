@@ -16,7 +16,7 @@
 
 这是项目内部的设计内容复核，不是赛事最终批准，也不表示功能全部实现。[本轮验收记录](verification-2026-09-07.md)列出八类交付物、当前工作树验证和仍未完成的交付事项。
 
-IM 四项说明要求已单独[收口](im-acceptance-closure.md)：消息转换、账号安全、Session 隔离和平台限制均有设计及实现边界。真实企微单聊证据见 I17；群聊、增量流、媒体、卡片、撤回、动态 Binding 和飞书仍为设计。平台限频数值、回复有效期和补投能力待核实，按风险登记，不因此把下表所有 `partial` 变为当前开发任务。
+IM 四项说明要求已单独[收口](im-acceptance-closure.md)：消息转换、账号安全、Session 隔离和平台限制均有设计及实现边界。真实企微单聊证据见 I17，追加飞书自建应用长连接单聊的实现和验证见[新切片](feishu-text-slice.md)；早期收口文档中的“飞书暂缓”是当时范围。群聊、增量流、媒体、卡片、撤回、动态 Binding 仍为设计。平台限频数值、回复有效期和补投能力待核实，按风险登记，不因此把下表所有 `partial` 变为当前开发任务。
 
 风险清单应说明触发条件、影响、当前边界、检测或降级、生产缓解方案及残余限制，不要求本版实现全部缓解措施。实际提供的能力仍须兑现明确承诺，并解决其发布阻断问题。
 
@@ -43,9 +43,9 @@ IM 四项说明要求已单独[收口](im-acceptance-closure.md)：消息转换�
 | A11 | Redis 到 SQL 迁移 | [Session 迁移](storage-and-consistency.md#71-sessionredis-到-sql) | 待实现迁移 Job 与校验测试 | planned |
 | A12 | 本地到远端向量库迁移 | [向量迁移](storage-and-consistency.md#72-向量库迁移) | 待实现索引重建与切换测试 | planned |
 | A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | I17 的本地 mock WebSocket + 实际 Runner + PostgreSQL 集成已验证重复 msgid 只受理/执行/发送一次；重建全部 Runtime/Session 对象后再次投递不新增用户轮次。真实 Bot 已验证正常单聊，重复投递仍以本地测试为证据 | partial |
-| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 企微协议包、I17 本地单进程单绑定链路及真实 Bot 正常单聊已验证。第二类外部 IM 由飞书差异设计覆盖，飞书不在本轮实现范围；网页 I16 不替代该设计要求 | partial |
+| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 企微协议包、I17 本地单进程单绑定链路及真实 Bot 正常单聊已验证。第二类外部 IM 由飞书差异设计覆盖，并追加[自建应用长连接单聊切片](feishu-text-slice.md)；网页 I16 不替代该设计要求 | partial |
 | A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | [公共文本消费者](../trpcservice/channels/text/consumer.go)经共享 `sessionrun.Start/Run` 执行、排空 Event、持久化最终文本，由适配器发送回复；企微历史本地集成和 I17 真实 Bot 正常单聊均通过，本次提取验证见[扩展切片](im-adapter-extension.md)。[启动接线](../cmd/trpc-service/wecom.go)默认禁用、启用要求 PostgreSQL。发送成功指平台回执，不代表用户已读 | partial |
-| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 真实 Go 客户端已收到 subscribe 的 `errcode=0` ACK；静态 Binding 和身份派生已有协议测试，本地真实 PostgreSQL 已验证持久去重及 Tenant/Binding 扫描、认领、恢复隔离，含外部行排序靠前且 LIMIT=1。企微入口不使用 Webhook 验签，飞书回调安全仍为设计 | partial |
+| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 真实企微 Go 客户端已收到 subscribe 的 `errcode=0` ACK；静态 Binding 和身份派生已有协议测试，本地真实 PostgreSQL 已验证持久去重及 Tenant/Binding 扫描、认领、恢复隔离，含外部行排序靠前且 LIMIT=1。企微入口不使用 Webhook 验签；飞书长连接的应用/企业校验与回调确认见[新切片](feishu-text-slice.md)，HTTPS Webhook 安全仍为扩展设计 | partial |
 | A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 单聊 Session 派生的确定性和租户/App/Binding/用户隔离已测试；I17 使用真实 PostgreSQL Session、Pin 和配置 Repository，重建全部 Runtime/Session 对象后历史及 Pin 保留，同 Session 顺序通过。群聊仍为设计，协议包拒绝群聊输入 | partial |
 | A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 本地验证 20480 UTF-8 字节上限及截断、重连、每条终态回复最多一次发送尝试；明确拒绝不重跑 Agent，未知发送保留 duplicate_risk 且不再次发送。真实 Bot 仅验证正常单聊，平台限频及故障行为未实测，群聊、媒体、卡片不在当前范围 | partial |
 | A19 | Plugin/Guardrail/Callback 租户治理 | [Tool 与 Policy Runtime](tool-policy.md)、[治理](solution.md#56-治理与安全) | 已实现静态 Tool Registry、Revision ToolRefs、Policy 白名单交集、未知/重复/越权 fail closed、Tool callback 审计和工具循环上限；租户级 PolicyRef entitlement 已实现，在创建、发布和 Runtime 构建三处由同一个 authorizer 判定（见 I14）；预算、审批、Guardrail 和动态扩展待实现 | partial |
@@ -136,6 +136,8 @@ TRPC_PLAYWRIGHT_MODULE=/tmp/trpc-browser-qa/node_modules/playwright \
 已完成，范围与证据见[IM 文本适配器扩展](im-adapter-extension.md)。公共文本执行包与企微协议包不互相依赖，企微通过四方法 `TextAdapter` 契约复用执行链路；替代适配器在真实 Runner + PostgreSQL 下验证受理回调返回前已落库、正常回复、去重和发送拒绝不重跑。Leader 的全仓 race、build、vet 及三个相关包的 PostgreSQL 集成均通过。飞书与 Telegram 不作为本切片实现项；I17 的真实 Bot 历史证据不自动升级为本次重构后的真实联调证据。
 
 ## 已知限制
+
+飞书自建应用长连接单聊为追加参考切片，进度、代码入口和分层证据统一见[飞书切片](feishu-text-slice.md)。已有身份预检不代表消息权限、事件发布或真实收发已验证；Fable 5.1 服务恢复后已完成定向审查，最终代码和测试由 Astra 裁决。
 
 这些限制是当前切片有意接受的，不能在验收中被当作已解决：
 
