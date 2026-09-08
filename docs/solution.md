@@ -75,7 +75,7 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 | 文本回复 | `aibot_respond_msg` 透传 `req_id`，以固定 `stream.id` 发送最终文本；收到成功回执再确认 Outbox | Bot 消息 API 按 message/chat ID 回复；平台流式/卡片更新能力与普通文本分开 |
 | 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 本轮采用保守 4096 UTF-8 字节最终文本；单次 HTTP 回复，未知不重发；生产按消息类型配置限频/退避 |
 | 扩展与撤回 | 图片/文件需下载解密和媒体上传，卡片、欢迎语、主动发送有独立协议；均不进入首条文本链路 | 图片/文件、富文本、交互卡片和撤回分别映射事件与出站动作，未支持时明确拒绝或记录 |
-| 当前状态 | 单静态 Binding、单聊纯文本已实现，真实正常收发已验证；增量流、群聊、媒体、卡片和撤回仍为设计 | [单聊长连接切片](feishu-text-slice.md)已实现，身份预检、本地协议与 PostgreSQL 集成通过；真实连接与收发单独验收 |
+| 当前状态 | 单静态 Binding、单聊纯文本已实现，真实正常收发已验证；增量流、群聊、媒体、卡片和撤回仍为设计 | [单聊长连接切片](feishu-text-slice.md)已实现，身份预检、本地协议与 PostgreSQL 集成通过；真实连接及两轮正常单聊收发已验证 |
 
 协议依据为[企微官方 SDK README](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/README.md) 和 [WebSocket 实现](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)，2026-09-07 核对；这里只参考协议，不将 Node SDK 引入 Go 服务。自建应用 Webhook 的 `msg_signature`/AES、HTTP 200 和 access token 发送流程是另一种接入模式，不与智能机器人长连接混用。未核实的平台回复有效期、跨连接重试能力和限频数值保持待联调，不能据 SDK 的本地请求超时推定平台保证。
 

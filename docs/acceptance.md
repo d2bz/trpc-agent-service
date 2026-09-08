@@ -137,7 +137,7 @@ TRPC_PLAYWRIGHT_MODULE=/tmp/trpc-browser-qa/node_modules/playwright \
 
 ## 已知限制
 
-飞书自建应用长连接单聊为追加参考切片，进度、代码入口和分层证据统一见[飞书切片](feishu-text-slice.md)。已有身份预检不代表消息权限、事件发布或真实收发已验证；Fable 5.1 服务恢复后已完成定向审查，最终代码和测试由 Astra 裁决。
+飞书自建应用长连接单聊参考切片已完成本地验收与[两轮真实正常收发](feishu-text-slice.md#真实单聊验证)，两轮复用同一 Session/Revision，分别一次执行、一次发送且获平台确认；故障与去重仍以本地测试为证据。Fable 5.1 服务恢复后已完成定向审查，最终代码和测试由 Astra 裁决。
 
 这些限制是当前切片有意接受的，不能在验收中被当作已解决：
 

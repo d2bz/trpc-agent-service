@@ -28,6 +28,7 @@
 | Tenant/App/Revision、Runtime、Runner、Session 与 HTTP/SSE | [验收矩阵](acceptance.md)保留控制面、租户隔离、Pin、Tool Policy、多后端和双 Worker 的分项证据；测试日期与适用版本分别标明 |
 | 网页聊天 | [I16](acceptance.md#网页切片验收2026-09-07)，发送、SSE、停止、会话与凭据设置；页面不持久保存凭据 |
 | 企业微信单聊文本 | [I17](wecom-text-slice.md#验证结果)，持久 Inbox/Run/Outbox 与真实 Runner；[真实正常单聊](wecom-text-slice.md#真实单聊验证)已有证据，故障与去重仍为本地协议验证 |
+| 飞书单聊文本 | 官方 SDK 长连接复用公共文本消费者；[两轮真实正常收发](feishu-text-slice.md#真实单聊验证)已获平台确认，同 Session/Revision，一条最终回复；群聊、媒体、卡片仍为设计 |
 | 可选 OTel | [`f5ed53c` 验证](observability-slice.md#验证结果)，独立三阶段 Span、次数/毫秒耗时及脱敏，按持久 request_id 关联；完整 Model/Tool/存储 Trace 未实现 |
 | 本地部署 | [`29a6b90` 验证](local-deployment.md#本轮验证)，构建、8 项 HTTP/SSE、配置文件、临时 PostgreSQL schema 启动及 Collector 配置校验 |
 
@@ -37,7 +38,7 @@
 
 干净检出并准备 Go >= 1.24.1、Bash、curl 后运行 `./build.sh` 和 `./start.sh`，打开 `http://127.0.0.1:8080/`。初次下载需网络，构建后的默认 echo 演示无需外部模型、数据库或前端构建。启停、可选数据库、私密环境文件与 OTel 步骤统一见[本地部署](local-deployment.md)。
 
-推荐先演示网页发送/续聊，再展示已验证的真实企微单聊证据、三阶段本地协议测试和设计材料。飞书按[独立配置和证据](feishu-text-slice.md)准备，凭据查询成功不等于真实收发已完成。群聊、媒体、生产故障恢复不列入已完成演示。实际 Bot/模型密钥只由操作者本地配置，提交材料不携带它们。
+推荐先演示网页发送/续聊，再展示真实企微和飞书单聊、三阶段本地协议测试和设计材料。飞书的[两轮真实正常收发](feishu-text-slice.md#真实单聊验证)已有证据，独立配置见同页。群聊、媒体、生产故障恢复不列入已完成演示。实际 Bot/模型密钥只由操作者本地配置，提交材料不携带它们。
 
 ## 发布状态
 
