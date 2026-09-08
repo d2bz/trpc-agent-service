@@ -8,7 +8,7 @@
 
 | 原题要求 | 设计结论 | 当前已验收实现 |
 | --- | --- | --- |
-| 外部消息到 Runner，Event 到 IM 回复、流式或卡片 | [消息转换](architecture.md#51-统一入站消息)：规范文本转换为 `model.NewUserMessage`，经共享 Session Run 调用 `runner.Runner.Run`；最终 assistant 文本进入 Outbox。增量文本聚合后更新同一消息，卡片使用受校验模板，不能直接输出内部 Event | [Consumer](../trpcservice/channels/wecom/consumer.go) 与 [回复筛选](../trpcservice/channels/wecom/reply.go) 已接线；企微只发送一次 `finish=true` 的最终 stream 文本，没有实时增量或卡片 |
+| 外部消息到 Runner，Event 到 IM 回复、流式或卡片 | [消息转换](architecture.md#51-统一入站消息)：规范文本转换为 `model.NewUserMessage`，经共享 Session Run 调用 `runner.Runner.Run`；最终 assistant 文本进入 Outbox。增量文本聚合后更新同一消息，卡片使用受校验模板，不能直接输出内部 Event | [公共文本 Consumer](../trpcservice/channels/text/consumer.go) 与 [回复筛选](../trpcservice/channels/text/reply.go)承接原企微执行逻辑，2026-09-08 的提取状态见[扩展记录](im-adapter-extension.md)；企微只发送一次 `finish=true` 的最终 stream 文本，没有实时增量或卡片 |
 | 账号/租户绑定、Webhook、凭据、验签、去重、身份 | [Binding 模型](data-model.md#34-channel-binding-与身份映射)、[两类 IM 差异](solution.md#55-im-接入差异)：企微长连接以 Bot ID/Secret 认证，飞书设计包括 URL、Token、签名和应用/租户核对 | 企微静态 Tenant/App/Binding、保留 Secret 引用、事件 Bot 核对、用户摘要映射和 PostgreSQL Inbox 去重已验证；动态 Binding 管理和飞书 Adapter 未实现 |
 | 单聊/群聊 Session 与跨群、跨租户隔离 | [Session 命名](architecture.md#54-session-命名)明确 direct/group/group_member 的规范数组摘要，包含 Tenant/App/Binding、用户或群、话题及 epoch；共享群不注入个人私密 Memory | 单聊派生及租户/App/Binding/用户隔离已测试，当前 epoch 固定为 0；群聊输入不进入 Runner，群聊与换代仍为设计 |
 | 长度、限频、异步、媒体、撤回、失败重试 | [平台限制](solution.md#55-im-接入差异)与[幂等方案](storage-and-consistency.md#6-im-消息幂等)说明职责、失败分类、降级和残余风险 | 20480 UTF-8 字节截断、持久受理后异步执行/回复已验证；每条最终回复最多一次发送，未知结果记录风险且不重发，发送失败不重跑 Agent；限频调度、媒体和撤回未实现 |

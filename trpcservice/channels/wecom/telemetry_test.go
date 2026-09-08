@@ -2,7 +2,6 @@ package wecom
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,10 +16,13 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionrun"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
+
+// What this package still asserts about telemetry is what only a real WeCom
+// connection can show: three stages of one message correlated over the real
+// protocol, and a refused collector changing none of it. The stage records
+// themselves are the common consumer's, and are tested there.
 
 // The attribute keys this package asserts on, spelled the way an operator would
 // read them back out of a collector rather than borrowed from the constants
@@ -28,7 +30,6 @@ import (
 const (
 	keyStage    = "trpc.stage"
 	keyOutcome  = "trpc.outcome"
-	keyError    = "trpc.error_type"
 	keyRequest  = "trpc.request_id"
 	keyRun      = "trpc.run_id"
 	keyOutbox   = "trpc.outbox_id"
@@ -52,26 +53,6 @@ func inMemory(t *testing.T) (*telemetry.Telemetry, *tracetest.InMemoryExporter, 
 	return observer, spans, reader
 }
 
-func newRecordingConsumer(t *testing.T, store channels.Store) (
-	*Consumer, *tracetest.InMemoryExporter,
-) {
-	t.Helper()
-	observer, spans, _ := inMemory(t)
-	binding := testBinding()
-	client, err := New(testConfig(t, newMockServer(t), binding))
-	require.NoError(t, err)
-	consumer, err := NewConsumer(ConsumerConfig{
-		Binding:   binding,
-		Client:    client,
-		Store:     store,
-		Runs:      &sessionrun.Service{},
-		Revisions: func(context.Context, string, string, string) error { return nil },
-		Telemetry: observer,
-	})
-	require.NoError(t, err)
-	return consumer, spans
-}
-
 // stageSpans indexes what was recorded by stage, and fails a test that finds a
 // span this package did not create.
 func stageSpans(t *testing.T, spans *tracetest.InMemoryExporter) map[string][]attribute.Set {
@@ -93,179 +74,6 @@ func text(t *testing.T, attributes attribute.Set, key string) string {
 	value, ok := attributes.Value(attribute.Key(key))
 	require.Truef(t, ok, "%s was not recorded", key)
 	return value.Emit()
-}
-
-// acceptStore is the accept side of a Store, and answers with the row an
-// earlier delivery created.
-type acceptStore struct {
-	channels.Store
-	stored   channels.AcceptResult
-	requests []channels.AcceptRequest
-	fail     int
-}
-
-func (s *acceptStore) Accept(
-	_ context.Context, _ tenant.TenantContext, request channels.AcceptRequest,
-) (channels.AcceptResult, error) {
-	s.requests = append(s.requests, request)
-	if s.fail > 0 {
-		s.fail--
-		return channels.AcceptResult{}, errors.New("storage unavailable")
-	}
-	return s.stored, nil
-}
-
-func directText(text string) DirectText {
-	return DirectText{
-		PrincipalID:       "principal-a",
-		SessionID:         "session-s",
-		ExternalMessageID: msgIDMarker,
-		Text:              text,
-		ReceivedAt:        time.Now(),
-		Reply:             ReplyTarget{generation: "gen-1", reqID: "req-1", streamID: "stream-1"},
-	}
-}
-
-// A redelivery is recorded against the request the first delivery created. The
-// ids this pass minted were never stored, and reporting them would invent a
-// request that no other stage will ever mention.
-func TestAcceptRecordsTheStoredRequestOnce(t *testing.T) {
-	store := &acceptStore{
-		stored: channels.AcceptResult{
-			InboxID:   "in-first",
-			RunID:     "run-first",
-			RequestID: "req-first",
-			Duplicate: true,
-		},
-		// One write whose outcome is unknown, retried with the same ids.
-		fail: 1,
-	}
-	consumer, spans := newRecordingConsumer(t, store)
-	require.NoError(t, consumer.accept(context.Background(), directText(bodyMarker)))
-
-	require.Len(t, store.requests, 2)
-	require.Equal(t, store.requests[0].IDs, store.requests[1].IDs,
-		"the retry is the same write, not a second message")
-	minted := store.requests[0].IDs.RequestID
-
-	recorded := spans.GetSpans()
-	require.Len(t, recorded, 1, "one message is one record, however often the write was retried")
-	accepted := stageSpans(t, spans)["accept"][0]
-	require.Equal(t, "duplicate", text(t, accepted, keyOutcome))
-	require.Equal(t, "req-first", text(t, accepted, keyRequest))
-	require.Equal(t, "run-first", text(t, accepted, keyRun))
-	require.Equal(t, "2", text(t, accepted, keyAttempt))
-	require.NotContains(t, fmt.Sprintf("%+v", recorded[0]), minted)
-	requireNoMarkers(t, recorded[0])
-}
-
-// A message that could not be recorded is a failed stage, and the class of the
-// failure is a label rather than the error.
-func TestAcceptRecordsAFailureWithoutItsCause(t *testing.T) {
-	store := &acceptStore{fail: persistAttempts}
-	consumer, spans := newRecordingConsumer(t, store)
-	require.ErrorIs(t,
-		consumer.accept(context.Background(), directText(bodyMarker)), ErrAcceptFailed)
-
-	recorded := spans.GetSpans()
-	require.Len(t, recorded, 1)
-	failed := stageSpans(t, spans)["accept"][0]
-	require.Equal(t, "failed", text(t, failed, keyOutcome))
-	require.Equal(t, string(channels.ErrorInternal), text(t, failed, keyError))
-	require.Equal(t, fmt.Sprint(persistAttempts), text(t, failed, keyAttempt))
-	_, hasRequest := failed.Value(keyRequest)
-	require.False(t, hasRequest, "nothing was stored, so there is no request to name")
-	require.NotContains(t, fmt.Sprintf("%+v", recorded[0]), "storage unavailable")
-	requireNoMarkers(t, recorded[0])
-}
-
-// The send record is taken around the delivery attempt, and says what happened
-// to the attempt rather than what the Store will do about it.
-func TestDeliverRecordsWhatTheAttemptDid(t *testing.T) {
-	binding := testBinding()
-	part, _, _ := answerPart(binding, "out-a", "run-a", 1)
-	part.RequestID = "req-a"
-	part.Attempt = 1
-	part.Message = channels.OutboundMessage{Text: replyMarker}
-
-	// A target this binding cannot open is an address from a connection that is
-	// gone, which is not the platform refusing the answer.
-	stale := part
-	stale.DeliveryTarget = channels.DeliveryTarget{Channel: channels.ChannelWeCom}
-	// An attempt that may already have been delivered is not attempted again,
-	// and is not a send that failed either.
-	risky := part
-	risky.DuplicateRisk = true
-
-	for _, expected := range []struct {
-		outcome string
-		part    channels.OutboxPart
-		result  channels.SendOutcome
-	}{
-		{"stale_target", stale, channels.SendPermanent},
-		{"skipped", risky, channels.SendUnknown},
-	} {
-		consumer, spans := newRecordingConsumer(t, &orderStore{})
-		result := consumer.deliver(context.Background(), expected.part)
-		require.Equal(t, expected.result, result.Outcome,
-			"the record must not change what the Store is told")
-
-		recorded := spans.GetSpans()
-		require.Len(t, recorded, 1)
-		delivered := stageSpans(t, spans)["deliver"][0]
-		require.Equal(t, expected.outcome, text(t, delivered, keyOutcome))
-		require.Equal(t, "req-a", text(t, delivered, keyRequest))
-		require.Equal(t, "out-a", text(t, delivered, keyOutbox))
-		require.Equal(t, "1", text(t, delivered, keyAttempt))
-		requireNoMarkers(t, recorded[0])
-	}
-}
-
-// brokenExporter is a collector that refuses everything, in the place where the
-// consumer would notice: the export runs inside the End of a stage.
-type brokenExporter struct{ sdktrace.SpanExporter }
-
-func (brokenExporter) ExportSpans(context.Context, []sdktrace.ReadOnlySpan) error {
-	return errors.New("collector refused: " + bodyMarker)
-}
-
-func (brokenExporter) Shutdown(context.Context) error { return nil }
-
-// An export that fails is not a message that failed.
-func TestAFailedExportChangesNothing(t *testing.T) {
-	observer, err := telemetry.New(
-		sdktrace.NewTracerProvider(sdktrace.WithSyncer(brokenExporter{})),
-		sdkmetric.NewMeterProvider(),
-	)
-	require.NoError(t, err)
-	binding := testBinding()
-	client, err := New(testConfig(t, newMockServer(t), binding))
-	require.NoError(t, err)
-	store := &acceptStore{stored: channels.AcceptResult{
-		InboxID: "in-a", RunID: "run-a", RequestID: "req-a",
-	}}
-	consumer, err := NewConsumer(ConsumerConfig{
-		Binding:   binding,
-		Client:    client,
-		Store:     store,
-		Runs:      &sessionrun.Service{},
-		Revisions: func(context.Context, string, string, string) error { return nil },
-		Telemetry: observer,
-	})
-	require.NoError(t, err)
-	require.NoError(t, consumer.accept(context.Background(), directText(bodyMarker)))
-	require.Len(t, store.requests, 1, "a refused export is not a write to retry")
-}
-
-// A consumer without telemetry is the default, and records nothing anywhere.
-func TestAConsumerWithoutTelemetryRecordsNothing(t *testing.T) {
-	store := &acceptStore{stored: channels.AcceptResult{
-		InboxID: "in-a", RunID: "run-a", RequestID: "req-a",
-	}}
-	consumer := newTestConsumer(t, store)
-	require.Nil(t, consumer.stages)
-	require.NoError(t, consumer.accept(context.Background(), directText(bodyMarker)))
-	require.Len(t, store.requests, 1)
 }
 
 // requireNoMarkers asserts that one whole recorded span repeats nothing this

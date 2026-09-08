@@ -1,6 +1,6 @@
 # 企业微信智能机器人文本适配器
 
-本包包含企业微信智能机器人长连接协议和持久消费者，将单聊文本接入共享 Session Run 服务，并回复一条最终文本。范围为单进程、单机器人绑定；已做本地模拟平台验证，2026-09-07 完成一次真实 Bot 单聊、真实模型和 PostgreSQL 的正常收发验证，见[验收记录](../../../docs/wecom-text-slice.md#真实单聊验证)。
+本包包含企业微信智能机器人长连接协议与 `channels.TextAdapter` 的企微实现。持久消费者位于独立的 `channels/text` 包，将规范消息接入共享 Session Run 服务，并通过适配器回复一条最终文本。范围为单进程、单机器人绑定；2026-09-07 完成一次真实 Bot 单聊、真实模型和 PostgreSQL 的正常收发验证，见[历史验收记录](../../../docs/wecom-text-slice.md#真实单聊验证)。本次职责提取的验证状态见[扩展切片](../../../docs/im-adapter-extension.md)。
 
 ## 范围
 
@@ -9,7 +9,8 @@
 - WebSocket 帧编解码、`aibot_subscribe` 鉴权、心跳、指数退避重连、被接管即终止。
 - 入站单聊文本的接受与拒绝规则，以及到平台标识（Principal、Session、Stream）的确定性派生。
 - 一条 `aibot_respond_msg` 最终流式回复及其回执判定。
-- PostgreSQL Inbox 去重、按会话顺序执行真实 Runner、最终文本与 Outbox 原子落库，以及按 Tenant/Binding 限定的恢复扫描。
+- 规范输入和版本化回复目标、20480 UTF-8 字节回复上限，以及发送结果的协议分类。
+- 通过公共 `channels/text` 消费者复用 PostgreSQL Inbox 去重、按会话顺序执行真实 Runner、最终文本与 Outbox 原子落库，以及按 Tenant/Binding 限定的恢复扫描；本包不依赖执行服务或数据库实现。
 - `cmd/trpc-service` 的可选启动接线，默认禁用。
 
 不包含（本包不实现，也不声称具备）：
@@ -56,17 +57,26 @@ err = client.Run(ctx) // 阻塞直到 ctx 取消或到达终止状态
 
 ## 持久消费者
 
-`Consumer` 的受理循环按到达顺序把 `Messages()` 写入 `channels.Store`，任务循环逐条认领、执行、发送。持久任务以 Store 为准，Client 仍有有界接收缓冲。
+企微 `Adapter.Serve` 按到达顺序把 `Messages()` 转换为规范消息，通过公共消费者的持久受理回调写入 `channels.Store`。公共消费者的任务循环逐条认领、执行、发送。持久任务以 Store 为准，Client 仍有有界接收缓冲。
 
 ```go
-consumer, err := wecom.NewConsumer(wecom.ConsumerConfig{
-    Binding:   binding, // 必须与 Client 的 Binding 完全相同
-    Client:    client,
+adapter, err := wecom.NewAdapter(client)
+if err != nil {
+    return err
+}
+consumer, err := channeltext.New(channeltext.Config{
+    Identity: channels.BindingIdentity{
+        TenantID: binding.TenantID, AgentAppID: binding.AgentAppID,
+        BindingID: binding.BindingID, Channel: channels.ChannelWeCom,
+    }, // 服务端预期身份，必须与适配器的身份匹配
+    Adapter:   adapter,
     Store:     store,   // channels.Store
     Runs:      runs,    // *sessionrun.Service，与网页聊天共用
     Revisions: check,   // 每次执行前复核 revision
 })
 ```
+
+`channeltext` 对应 `trpcservice/channels/text`。`cmd` 同时运行 `client.Run` 和 `consumer.Run`，任一终止时取消另一个并等待退出，再关闭共享资源。详细扩展契约见[社区接入指南](../../../docs/im-adapter-extension.md)。
 
 进程接线由 `cmd/trpc-service` 负责。按项目 README 配好 PostgreSQL profile、DSN、schema 和服务凭据后，设置 `TRPC_SERVICE_WECOM_ENABLED=true`，并提供 `TRPC_SERVICE_WECOM_TENANT_ID`、`TRPC_SERVICE_WECOM_APP_ID`、`TRPC_SERVICE_WECOM_BINDING_ID`、`TRPC_SERVICE_WECOM_BOT_ID`。Tenant/App 必须已存在且有已发布 Revision；该 Revision 使用默认 PostgreSQL Session，不能指定独立 BackendProfile。
 

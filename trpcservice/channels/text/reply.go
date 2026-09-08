@@ -1,4 +1,4 @@
-package wecom
+package text
 
 import (
 	"strings"
@@ -9,10 +9,16 @@ import (
 )
 
 // truncationNotice replaces the tail of an answer that does not fit in one
-// WeCom stream reply. It is fixed text, and the same bytes are stored and sent:
-// a notice composed at send time would make the record disagree with what the
-// user saw.
+// reply on the channel it is going to. It is fixed text, and the same bytes are
+// stored and sent: a notice composed at send time would make the record
+// disagree with what the user saw.
 const truncationNotice = "\n[truncated]"
+
+// minReplyTextLimit is the smallest reply limit an adapter may declare: the
+// notice plus one byte of the answer it replaced. A limit below it could not
+// carry its own truncation marker, so a long answer would be silently replaced
+// by the marker rather than shortened.
+const minReplyTextLimit = len(truncationNotice) + 1
 
 // replyCollector reads one execution's event stream and keeps the single final
 // answer.
@@ -69,24 +75,29 @@ func (c *replyCollector) observe(e *event.Event) {
 	c.text = message.Content
 }
 
-// answer returns the text to store and send, empty when there is none. A failed
+// answer returns the collected final answer, empty when there is none. A failed
 // stream has no answer even if a completion arrived before the failure.
+//
+// It is the model's text as it stands. Bounding it to what the channel will
+// take is boundReply below, which the consumer applies before the answer is
+// stored — the collector does not know which channel is going to carry it.
 func (c *replyCollector) answer() string {
 	if c.failed {
 		return ""
 	}
-	return boundReply(c.text)
+	return c.text
 }
 
-// boundReply makes model output storable and sendable.
+// boundReply makes model output storable and sendable on one channel.
 //
-// Two limits apply and both are the channel's. The platform refuses a stream
-// reply over 20480 bytes, so a longer answer is cut and marked rather than
-// dropped or split — this slice sends one final reply per message, and a second
-// frame would be a second answer. The Store refuses control characters in a
-// body, so they are removed here: an answer that could not be stored would fail
-// a Run that had in fact succeeded.
-func boundReply(text string) string {
+// Two limits apply. The channel refuses a reply over limit bytes — its own
+// number, declared by its adapter and checked when the consumer is built — so a
+// longer answer is cut and marked rather than dropped or split: this slice
+// sends one final reply per message, and a second frame would be a second
+// answer. The Store refuses control characters in a body, so they are removed
+// here: an answer that could not be stored would fail a Run that had in fact
+// succeeded.
+func boundReply(text string, limit int) string {
 	cleaned := strings.Map(func(r rune) rune {
 		switch {
 		// The three the Store allows in a body, and the only ones a reply has
@@ -99,10 +110,10 @@ func boundReply(text string) string {
 			return r
 		}
 	}, strings.ToValidUTF8(text, ""))
-	if len(cleaned) <= maxReplyTextBytes {
+	if len(cleaned) <= limit {
 		return cleaned
 	}
-	cut := cleaned[:maxReplyTextBytes-len(truncationNotice)]
+	cut := cleaned[:limit-len(truncationNotice)]
 	// The cut lands anywhere, including inside a multi-byte rune. Dropping the
 	// trailing partial one keeps the result valid UTF-8, which both the Store
 	// and the protocol require.

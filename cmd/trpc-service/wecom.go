@@ -7,7 +7,9 @@ import (
 	"log"
 	"sync"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	channelspostgres "github.com/liuzengh/trpc-agent-service/trpcservice/channels/postgres"
+	channeltext "github.com/liuzengh/trpc-agent-service/trpcservice/channels/text"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
@@ -201,15 +203,27 @@ func startWeComChannel(
 	if err != nil {
 		return nil, err
 	}
+	// The platform half. Its identity comes from the binding the client
+	// validated; the consumer below is given the one this file read from the
+	// environment, and refuses to start if the two are not the same binding.
+	adapter, err := wecom.NewAdapter(client)
+	if err != nil {
+		return nil, err
+	}
 	// Built only for a channel that is going to run, and after the refusals
 	// above: a process that will not serve this bot opens no exporter.
 	observer, err := telemetry.Open(ctx, observability)
 	if err != nil {
 		return nil, err
 	}
-	consumer, err := wecom.NewConsumer(wecom.ConsumerConfig{
-		Binding:   binding,
-		Client:    client,
+	consumer, err := channeltext.New(channeltext.Config{
+		Identity: channels.BindingIdentity{
+			TenantID:   binding.TenantID,
+			AgentAppID: binding.AgentAppID,
+			BindingID:  binding.BindingID,
+			Channel:    channels.ChannelWeCom,
+		},
+		Adapter:   adapter,
 		Store:     store,
 		Runs:      runs,
 		Revisions: wecomRevisionCheck(stack.repository),
@@ -296,7 +310,7 @@ func (w *wecomChannel) stop() error {
 // publishing is live: an app repointed at a per-tenant backend profile while
 // this process runs would otherwise keep answering WeCom out of a session store
 // this channel cannot recover from.
-func wecomRevisionCheck(repository tenant.Repository) wecom.RevisionCheck {
+func wecomRevisionCheck(repository tenant.Repository) channeltext.RevisionCheck {
 	return func(ctx context.Context, tenantID, appID, revisionID string) error {
 		revision, err := repository.GetRevision(
 			ctx, tenant.TenantContext{TenantID: tenantID}, appID, revisionID)

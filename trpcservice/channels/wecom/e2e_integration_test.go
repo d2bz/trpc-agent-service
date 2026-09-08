@@ -17,6 +17,7 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	channelspostgres "github.com/liuzengh/trpc-agent-service/trpcservice/channels/postgres"
+	channeltext "github.com/liuzengh/trpc-agent-service/trpcservice/channels/text"
 	platformconfig "github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/security"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionbackend"
@@ -181,6 +182,37 @@ func (e *e2e) userTurns(t *testing.T) int {
 	return count
 }
 
+// identity is what the service configures this binding as, spelled out the way
+// cmd spells it rather than read back from the adapter, so a consumer built
+// here is held to the same identity check as one built by the process.
+func (e *e2e) identity() channels.BindingIdentity {
+	return channels.BindingIdentity{
+		TenantID:   e.binding.TenantID,
+		AgentAppID: e.binding.AgentAppID,
+		BindingID:  e.binding.BindingID,
+		Channel:    channels.ChannelWeCom,
+	}
+}
+
+// consumerFor is the wiring under test: a WeCom adapter over one Client, driven
+// by the common text consumer.
+func (e *e2e) consumerFor(t *testing.T, client *Client, now func() time.Time) *channeltext.Consumer {
+	t.Helper()
+	adapter, err := NewAdapter(client)
+	require.NoError(t, err)
+	consumer, err := channeltext.New(channeltext.Config{
+		Identity:  e.identity(),
+		Adapter:   adapter,
+		Store:     e.store,
+		Runs:      e.runs,
+		Revisions: func(context.Context, string, string, string) error { return nil },
+		Telemetry: e.observer,
+		Now:       now,
+	})
+	require.NoError(t, err)
+	return consumer
+}
+
 // start runs one Client and one Consumer against a Store that may already hold
 // this binding's rows, and returns the authenticated connection.
 func (e *e2e) start(t *testing.T) *mockConn {
@@ -197,15 +229,7 @@ func (e *e2e) start(t *testing.T) *mockConn {
 	}
 	client, err := New(testConfig(t, e.server, e.binding))
 	require.NoError(t, err)
-	consumer, err := NewConsumer(ConsumerConfig{
-		Binding:   e.binding,
-		Client:    client,
-		Store:     e.store,
-		Runs:      e.runs,
-		Revisions: func(context.Context, string, string, string) error { return nil },
-		Telemetry: e.observer,
-	})
-	require.NoError(t, err)
+	consumer := e.consumerFor(t, client, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
 	e.wg.Add(2)
@@ -440,18 +464,19 @@ func TestIntegrationRecoveryExecutesOnlyNeverStartedWork(t *testing.T) {
 			past := time.Now().Add(-10 * time.Minute)
 			client, err := New(testConfig(t, fixture.server, fixture.binding))
 			require.NoError(t, err)
-			consumer, err := NewConsumer(ConsumerConfig{
-				Binding: fixture.binding, Client: client, Store: fixture.store, Runs: fixture.runs,
-				Revisions: func(context.Context, string, string, string) error { return nil },
-				Now:       func() time.Time { return past },
-			})
+			consumer := fixture.consumerFor(t, client, func() time.Time { return past })
+			adapter, err := NewAdapter(client)
 			require.NoError(t, err)
 			key := fixture.sessionKey()
-			require.NoError(t, consumer.accept(ctx, DirectText{
+			// The work a previous process accepted, addressed to the connection
+			// that process held.
+			envelope, err := adapter.envelope(DirectText{
 				PrincipalID: key.PrincipalID, SessionID: key.SessionID,
 				ExternalMessageID: "recover-msg", Text: "recover question", ReceivedAt: past,
 				Reply: ReplyTarget{generation: "previous-process", reqID: "old-req", streamID: "old-stream"},
-			}))
+			})
+			require.NoError(t, err)
+			require.NoError(t, consumer.Accept(ctx, envelope))
 			recorded := fixture.recordedRuns(t)
 			require.Len(t, recorded, 1)
 			if state == "started" {
@@ -459,7 +484,7 @@ func TestIntegrationRecoveryExecutesOnlyNeverStartedWork(t *testing.T) {
 					channels.ClaimRunRequest{ClaimToken: "old-claim", ClaimedBy: "old-process", Now: past})
 				require.NoError(t, err)
 				require.True(t, ok)
-				token := runToken(claim.Run)
+				token := channels.RunToken{RunID: claim.Run.RunID, ClaimToken: claim.Run.ClaimToken}
 				require.NoError(t, fixture.store.RecordRunRevision(ctx, fixture.scope, token, platformconfig.DemoRevisionID, past))
 				require.NoError(t, fixture.store.MarkRunStarted(ctx, fixture.scope, token, past))
 			}

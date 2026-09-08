@@ -1,4 +1,19 @@
-package wecom
+// Package text is the durable half of a text channel: it records what a
+// platform adapter accepted, executes each message once through the shared
+// Session Run service, and sends each final answer at most once.
+//
+// It is protocol-independent by construction. Everything it needs from a
+// platform arrives through channels.TextAdapter — an identity, a reply limit, a
+// delivery loop and one send attempt — so a second channel is a second adapter
+// and not a second branch in here. Nothing in this package names a platform,
+// imports one or reads a protocol payload: a DeliveryTarget is opaque here and
+// is interpreted only by the adapter that minted it.
+//
+// What it promises is what the first WeCom slice promised before it was
+// generalised. An accepted message is durable before the adapter is told it was
+// accepted; a Run that reached the Runner is never sent to it again; a failed
+// send never re-runs an agent; one final reply is attempted once.
+package text
 
 import (
 	"context"
@@ -20,17 +35,32 @@ import (
 )
 
 var (
-	// ErrAcceptFailed reports a message that was read off the wire and could
-	// not be recorded. It is terminal: the protocol has no inbound
-	// acknowledgement, so nothing will redeliver it, and continuing would mean
-	// reading more messages this process cannot promise to answer either.
-	ErrAcceptFailed = errors.New("wecom: an accepted message could not be recorded")
+	// ErrAcceptFailed reports a message that could not be recorded. The
+	// adapter must stop accepting; a protocol with inbound acknowledgement
+	// may report failure so its platform can redeliver the event.
+	ErrAcceptFailed = errors.New("channels/text: an accepted message could not be recorded")
 
 	// ErrStorageUnavailable reports that channel storage stopped answering. It
 	// is terminal for the same reason: the durable record is the only thing
 	// keeping a claimed Run or an unsent answer from being lost, and a process
 	// that cannot write it has nothing left to be trusted with.
-	ErrStorageUnavailable = errors.New("wecom: channel storage is unavailable")
+	ErrStorageUnavailable = errors.New("channels/text: channel storage is unavailable")
+
+	// ErrAdapterStopped reports that the adapter's delivery loop ended for a
+	// reason of its own. It is a fixed sentinel because the adapter's error is
+	// not: it can quote a socket, a credential or a peer, and the error this
+	// package returns reaches a process log.
+	ErrAdapterStopped = errors.New("channels/text: the adapter stopped serving")
+
+	// ErrConfig is the sentinel behind every construction refusal, so a caller
+	// can tell a misconfigured consumer from a failing one.
+	ErrConfig = errors.New("channels/text: invalid configuration")
+
+	// errForeignEnvelope and errUnsupportedInput are refusals of one accepted
+	// event. Neither leaves this package: Accept reports ErrAcceptFailed, which
+	// names no tenant, no binding and no message.
+	errForeignEnvelope  = errors.New("channels/text: envelope does not belong to this binding")
+	errUnsupportedInput = errors.New("channels/text: message carries input this channel cannot answer")
 )
 
 // The consumer policy. These are fixed rather than configurable: they are one
@@ -106,16 +136,19 @@ const (
 // second reader of tenant configuration inside a protocol adapter.
 type RevisionCheck func(ctx context.Context, tenantID, appID, revisionID string) error
 
-// ConsumerConfig is everything a Consumer needs. Every field is required.
-type ConsumerConfig struct {
-	// Binding is the same static trust anchor the Client runs on. It decides
-	// which rows this consumer may see, claim, execute and answer.
-	Binding Binding
-	// Client is the connected adapter. The consumer reads its messages and
-	// sends replies on it, and never dials anything itself.
-	Client *Client
-	Store  channels.Store
-	Runs   *sessionrun.Service
+// Config supplies the execution dependencies and optional observation/test hooks.
+type Config struct {
+	// Identity is the static trust anchor this consumer serves, from process
+	// configuration. It decides which rows this consumer may see, claim,
+	// execute and answer, and it is checked against the adapter's own identity
+	// below: a consumer built from one binding and an adapter connected on
+	// another would record one conversation and answer a different one.
+	Identity channels.BindingIdentity
+	// Adapter is the connected platform half. The consumer takes its accepted
+	// events and sends replies through it, and never dials anything itself.
+	Adapter channels.TextAdapter
+	Store   channels.Store
+	Runs    *sessionrun.Service
 	// Revisions is re-asked before every execution; see RevisionCheck.
 	Revisions RevisionCheck
 
@@ -131,7 +164,7 @@ type ConsumerConfig struct {
 	NewID func() string
 }
 
-// Consumer is the durable half of this adapter: it records what the Client
+// Consumer is the durable half of a text channel: it records what the adapter
 // accepted, executes each Run once, and sends each answer at most once.
 //
 // It is deliberately two sequential loops and no pool. One loop writes accepted
@@ -144,13 +177,16 @@ type ConsumerConfig struct {
 // answered one after the other, and this build does not promise cross-session
 // parallelism.
 type Consumer struct {
-	binding   Binding
-	client    *Client
+	identity  channels.BindingIdentity
+	adapter   channels.TextAdapter
 	store     channels.Store
 	runs      *sessionrun.Service
 	revisions RevisionCheck
 	now       func() time.Time
 	newID     func() string
+	// replyLimit is the adapter's own byte limit, read once at construction so
+	// that one execution cannot be bounded by two different numbers.
+	replyLimit int
 
 	scope  tenant.TenantContext
 	scan   channels.ScanScope
@@ -169,23 +205,35 @@ type Consumer struct {
 	failures    int
 }
 
-// NewConsumer validates the configuration and builds a Consumer. It opens no
+// New validates the configuration and builds a Consumer. It opens no
 // connection and touches no storage.
-func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
-	if err := cfg.Binding.Validate(); err != nil {
-		return nil, err
+func New(cfg Config) (*Consumer, error) {
+	if err := cfg.Identity.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrConfig, err)
 	}
-	if cfg.Client == nil || cfg.Store == nil || cfg.Runs == nil || cfg.Revisions == nil {
-		return nil, errors.New("wecom: consumer needs a client, a store, a run service and a revision check")
-	}
-	// One binding, one connection, one consumer. The envelope this consumer
-	// writes takes its tenant, app and binding from cfg.Binding while the
-	// principal, the session and the reply target come from the Client, so two
-	// different bindings here would record one bot conversation under another
-	// tenant and answer it back down the first connection.
-	if cfg.Client.binding != cfg.Binding {
+	if cfg.Adapter == nil || cfg.Store == nil || cfg.Runs == nil || cfg.Revisions == nil {
 		return nil, fmt.Errorf(
-			"%w: consumer and client must be built from the same binding", ErrConfig)
+			"%w: a consumer needs an adapter, a store, a run service and a revision check",
+			ErrConfig)
+	}
+	// One binding, one connection, one consumer. The envelopes this consumer
+	// records are written under cfg.Identity while the principal, the session
+	// and the reply target come from the adapter, so two different identities
+	// here would record one conversation under another tenant and answer it
+	// down a connection that belongs to someone else.
+	if cfg.Adapter.Identity() != cfg.Identity {
+		return nil, fmt.Errorf(
+			"%w: consumer and adapter must be built from the same binding", ErrConfig)
+	}
+	// Read once, and refused now rather than at the first answer. A limit that
+	// cannot hold its own truncation notice would replace a long answer with
+	// the notice alone, and one above what the Store accepts would produce
+	// answers that execute and then fail to persist.
+	replyLimit := cfg.Adapter.ReplyTextLimit()
+	if replyLimit < minReplyTextLimit || replyLimit > channels.MaxMessageTextBytes {
+		return nil, fmt.Errorf(
+			"%w: the adapter reply limit must be between %d and %d bytes",
+			ErrConfig, minReplyTextLimit, channels.MaxMessageTextBytes)
 	}
 	now := cfg.Now
 	if now == nil {
@@ -206,35 +254,36 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 	// Built from this consumer's own binding rather than passed in, so a record
 	// cannot be attributed to a tenant this consumer does not serve.
 	stages, err := cfg.Telemetry.ChannelRecorder(telemetry.Binding{
-		TenantID:  cfg.Binding.TenantID,
-		AppID:     cfg.Binding.AgentAppID,
-		BindingID: cfg.Binding.BindingID,
-		Channel:   channels.ChannelWeCom,
+		TenantID:  cfg.Identity.TenantID,
+		AppID:     cfg.Identity.AgentAppID,
+		BindingID: cfg.Identity.BindingID,
+		Channel:   cfg.Identity.Channel,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &Consumer{
-		binding:   cfg.Binding,
-		client:    cfg.Client,
-		store:     cfg.Store,
-		runs:      cfg.Runs,
-		revisions: cfg.Revisions,
-		now:       now,
-		newID:     newID,
-		scope:     tenant.TenantContext{TenantID: cfg.Binding.TenantID},
+		identity:   cfg.Identity,
+		adapter:    cfg.Adapter,
+		store:      cfg.Store,
+		runs:       cfg.Runs,
+		revisions:  cfg.Revisions,
+		now:        now,
+		newID:      newID,
+		replyLimit: replyLimit,
+		scope:      cfg.Identity.Scope(),
 		scan: channels.ScanScope{
-			TenantID:  cfg.Binding.TenantID,
-			BindingID: cfg.Binding.BindingID,
+			TenantID:  cfg.Identity.TenantID,
+			BindingID: cfg.Identity.BindingID,
 		},
 		policy: policy,
-		worker: "wecom-" + cfg.Binding.BindingID,
+		worker: string(cfg.Identity.Channel) + "-" + cfg.Identity.BindingID,
 		stages: stages,
 		nudge:  make(chan struct{}, 1),
 	}, nil
 }
 
-// Run serves until ctx ends or a loop fails. It always returns a non-nil error,
+// Run serves until ctx ends or a half fails. It always returns a non-nil error,
 // and never one that repeats a message, an identifier or a backend message.
 func (c *Consumer) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -245,45 +294,68 @@ func (c *Consumer) Run(ctx context.Context) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		failures <- c.acceptLoop(ctx)
+		failures <- c.serve(ctx)
 	}()
 	go func() {
 		defer wg.Done()
 		failures <- c.taskLoop(ctx)
 	}()
 	err := <-failures
-	// The other loop is stopped and waited for before returning, so a caller
+	// The other half is stopped and waited for before returning, so a caller
 	// that goes on to close the Runtime and the pool cannot close them under a
-	// goroutine that is still executing or still writing.
+	// goroutine that is still executing or still writing. Serve returns only
+	// after the callbacks it started have finished, which is what makes waiting
+	// on the accept half enough.
 	cancel()
 	wg.Wait()
 	<-failures
 	return err
 }
 
-// acceptLoop records what the Client accepted, in arrival order.
-func (c *Consumer) acceptLoop(ctx context.Context) error {
-	messages := c.client.Messages()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case message := <-messages:
-			if err := c.accept(ctx, message); err != nil {
-				return err
-			}
-			c.wake()
-		}
+// serve is the accept half: the adapter's own delivery loop, recording each
+// event it accepts before it is told the event was accepted.
+func (c *Consumer) serve(ctx context.Context) error {
+	return scrubbed(c.adapter.Serve(ctx, c.Accept))
+}
+
+// scrubbed reduces what the adapter returned to something safe to log.
+//
+// Cancellation and this package's own sentinels pass through as themselves;
+// everything else, including a Serve that simply returned, becomes
+// ErrAdapterStopped. An adapter's error is not this package's to publish: it
+// can quote a socket, a URL, a credential or a peer message, and whatever Run
+// returns reaches a process log.
+func scrubbed(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	case errors.Is(err, ErrAcceptFailed):
+		return ErrAcceptFailed
+	case errors.Is(err, ErrStorageUnavailable):
+		return ErrStorageUnavailable
+	default:
+		return ErrAdapterStopped
 	}
 }
 
-// accept records one message and reports the stage once, however many times the
-// write below had to be retried.
-func (c *Consumer) accept(ctx context.Context, message DirectText) error {
+// Accept records one accepted event and reports the stage once, however many
+// times the write below had to be retried.
+//
+// This is the entry an adapter drives, and it implements channels.AcceptFunc: a
+// nil return means the event is durable — newly recorded, or recognised as one
+// already there — so a protocol that acknowledges its own deliveries may
+// acknowledge then and not before.
+func (c *Consumer) Accept(ctx context.Context, envelope channels.InboundEnvelope) error {
 	ctx, span := c.stages.Start(ctx, telemetry.StageAccept)
-	stage, err := c.record(ctx, message)
+	stage, err := c.record(ctx, envelope)
 	span.End(stage)
-	return err
+	if err != nil {
+		return err
+	}
+	c.wake()
+	return nil
 }
 
 // record writes one message to the Store, retrying with the same identifiers.
@@ -294,14 +366,15 @@ func (c *Consumer) accept(ctx context.Context, message DirectText) error {
 // recognised the same way, by the Store, on the external event id.
 func (c *Consumer) record(
 	ctx context.Context,
-	message DirectText,
+	envelope channels.InboundEnvelope,
 ) (telemetry.Result, error) {
 	failed := telemetry.Result{
 		Outcome:   telemetry.OutcomeFailed,
 		ErrorType: channels.ErrorInternal,
 	}
-	envelope, err := c.envelope(message)
-	if err != nil {
+	if err := c.admits(envelope); err != nil {
+		// Nothing about this event will pass on a retry, and the reason is not
+		// carried anywhere: it would quote an envelope.
 		failed.ErrorType = channels.ErrorPermanent
 		return failed, ErrAcceptFailed
 	}
@@ -342,25 +415,24 @@ func (c *Consumer) record(
 	}
 }
 
-// envelope maps one accepted message onto the durable inbound envelope. Every
-// identity field comes from the static Binding, never from the frame.
-func (c *Consumer) envelope(message DirectText) (channels.InboundEnvelope, error) {
-	target, err := encodeTarget(c.binding, message.Reply)
-	if err != nil {
-		return channels.InboundEnvelope{}, err
+// admits refuses an event this consumer must not record.
+//
+// Three checks, in decreasing order of distrust. All four identity fields are
+// compared against the configured identity first: the adapter is the component
+// this package trusts least, and a mis-wired or third-party one naming another
+// tenant, app, binding or channel would otherwise write into an inbox nobody
+// configured. Attachments are then refused rather than dropped, because this
+// slice answers text and quietly ignoring a picture would answer a message the
+// user did not send. What remains is the envelope's own validation, under the
+// configured scope — never under a scope read out of the envelope.
+func (c *Consumer) admits(envelope channels.InboundEnvelope) error {
+	if !c.identity.Owns(envelope) {
+		return errForeignEnvelope
 	}
-	return channels.InboundEnvelope{
-		TenantID:         c.binding.TenantID,
-		Channel:          channels.ChannelWeCom,
-		ChannelBindingID: c.binding.BindingID,
-		AgentAppID:       c.binding.AgentAppID,
-		PrincipalID:      message.PrincipalID,
-		SessionID:        message.SessionID,
-		ExternalEventID:  message.ExternalMessageID,
-		ReceivedAt:       message.ReceivedAt,
-		Message:          channels.InboundMessage{Text: message.Text},
-		DeliveryTarget:   target,
-	}, nil
+	if len(envelope.Message.Attachments) > 0 {
+		return errUnsupportedInput
+	}
+	return envelope.Validate(c.scope)
 }
 
 // taskLoop is the one place execution and sending happen.
@@ -456,9 +528,11 @@ func (c *Consumer) storageFailed(ctx context.Context) error {
 	return nil
 }
 
-// mint returns a fresh platform identifier.
+// mint returns a fresh identifier for this channel. The channel prefix is the
+// adapter's own type, so the identifiers one binding writes keep the shape they
+// have always had and stay distinguishable in the shared tables.
 func (c *Consumer) mint(kind string) string {
-	return "wecom-" + kind + "-" + c.newID()
+	return string(c.identity.Channel) + "-" + kind + "-" + c.newID()
 }
 
 // ownsRun reports whether a claimed row is one this consumer may act on.
@@ -468,17 +542,29 @@ func (c *Consumer) mint(kind string) string {
 // to a redundant check here is executing another tenant conversation, and
 // because the claim is the first point where the whole row is in hand.
 func (c *Consumer) ownsRun(run channels.Run) bool {
-	return run.TenantID == c.binding.TenantID &&
-		run.ChannelBindingID == c.binding.BindingID &&
-		run.AgentAppID == c.binding.AgentAppID &&
-		run.Channel == channels.ChannelWeCom
+	return run.TenantID == c.identity.TenantID &&
+		run.ChannelBindingID == c.identity.BindingID &&
+		run.AgentAppID == c.identity.AgentAppID &&
+		run.Channel == c.identity.Channel
 }
 
 // ownsPart is ownsRun for the delivery side.
 func (c *Consumer) ownsPart(part channels.OutboxPart) bool {
-	return part.TenantID == c.binding.TenantID &&
-		part.ChannelBindingID == c.binding.BindingID &&
-		part.Channel == channels.ChannelWeCom
+	return part.TenantID == c.identity.TenantID &&
+		part.ChannelBindingID == c.identity.BindingID &&
+		part.Channel == c.identity.Channel
+}
+
+// sleepContext waits, or reports that the wait was cut short.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // runToken is the fence every write of one execution carries.
@@ -703,7 +789,10 @@ func (c *Consumer) answer(
 			ExecutionMillis: c.now().Sub(startedAt).Milliseconds(),
 		},
 	}
-	answer := collected.answer()
+	// Bounded here, before it is stored, so the record and the message the user
+	// sees are the same bytes: a reply shortened at send time would leave the
+	// Store holding an answer that was never delivered.
+	answer := boundReply(collected.answer(), c.replyLimit)
 	switch {
 	case collected.failed:
 		request.Status = channels.RunFailed
@@ -816,7 +905,7 @@ func (c *Consumer) sendPending(ctx context.Context) (bool, error) {
 			}
 			claim, ok, err := c.store.ClaimOutbox(ctx, c.scope, channels.ClaimOutboxRequest{
 				OutboxID:        part.OutboxID,
-				ExpectedChannel: channels.ChannelWeCom,
+				ExpectedChannel: c.identity.Channel,
 				SendToken:       c.mint("send"),
 				SentBy:          c.worker,
 				SendTimeout:     sendTimeout,
@@ -868,7 +957,7 @@ func (c *Consumer) pendingSends(ctx context.Context) ([]channels.OutboxPart, boo
 	parts := make([]channels.OutboxPart, 0, len(candidates))
 	accepted := make(map[string]int64, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.Channel != channels.ChannelWeCom {
+		if candidate.Channel != c.identity.Channel {
 			continue
 		}
 		part, err := c.store.GetOutboxPart(ctx, c.scope, candidate.OutboxID)
@@ -927,6 +1016,12 @@ func (c *Consumer) deliver(ctx context.Context, part channels.OutboxPart) channe
 // stores. The two are not the same judgement: the Store needs to know whether
 // the part may be tried again, and an operator needs to know whether anything
 // was put on the wire at all.
+//
+// Every refusal below is this package's own, and none of them consults the
+// adapter. The one consequence worth stating: a shutdown that coincides with a
+// target the adapter would have rejected is recorded as skipped rather than as
+// a stale target, because the decode now happens behind Send. Nothing is put on
+// the wire either way.
 func (c *Consumer) send(
 	ctx context.Context,
 	part channels.OutboxPart,
@@ -946,13 +1041,6 @@ func (c *Consumer) send(
 			ErrorType: channels.ErrorOutcomeUnknown,
 		}, telemetry.OutcomeSkipped
 	}
-	target, err := decodeTarget(c.binding, part.DeliveryTarget)
-	if err != nil {
-		return channels.SendResult{
-			Outcome:   channels.SendPermanent,
-			ErrorType: channels.ErrorPermanent,
-		}, telemetry.OutcomeStaleTarget
-	}
 	if ctx.Err() != nil {
 		// Shutting down. Nothing was written, so this is a plain failure and
 		// not an unknown outcome.
@@ -961,56 +1049,36 @@ func (c *Consumer) send(
 			ErrorType: channels.ErrorInternal,
 		}, telemetry.OutcomeSkipped
 	}
-	err = c.client.SendFinalText(ctx, target, part.Message.Text)
-	return classifySend(err), deliverOutcome(err)
+	// The stored text, transmitted as it stands or refused. The adapter owns
+	// the target it minted and reports what its protocol said; it never gets to
+	// decide whether this attempt was allowed to happen.
+	report := c.adapter.Send(ctx, part.DeliveryTarget, part.Message)
+	result := report.SendResult()
+	return result, deliverOutcome(result, report)
 }
 
-// deliverOutcome reads the same errors classifySend reads, and splits its one
-// permanent class into the two an operator acts on differently: a reply address
-// that is spent, or that belongs to a connection which is gone, is the channel
-// working as designed, and a refused message is not.
-func deliverOutcome(err error) telemetry.Outcome {
-	switch {
-	case err == nil:
+// deliverOutcome reads the result the Store will store together with the report
+// it was made from, and splits that one permanent class into the two an
+// operator acts on differently: a reply address that is spent, or that belongs
+// to a connection which is gone, is the channel working as designed, and a
+// refused message is not.
+//
+// It reads the stored result first so the two can never disagree — a report
+// that failed closed on its way to a SendResult is unknown here as well.
+func deliverOutcome(
+	result channels.SendResult,
+	report channels.DeliveryReport,
+) telemetry.Outcome {
+	switch result.Outcome {
+	case channels.SendSucceeded:
 		return telemetry.OutcomeSucceeded
-	case errors.Is(err, ErrReplyTargetExpired),
-		errors.Is(err, ErrNotConnected),
-		errors.Is(err, ErrReplyAlreadySent):
-		return telemetry.OutcomeStaleTarget
-	case errors.Is(err, ErrReplyRejected),
-		errors.Is(err, ErrTextTooLong),
-		errors.Is(err, ErrTextInvalid):
+	case channels.SendPermanent:
+		if report.Outcome == channels.DeliveryTargetStale {
+			return telemetry.OutcomeStaleTarget
+		}
 		return telemetry.OutcomeRejected
 	default:
 		return telemetry.OutcomeUnknown
-	}
-}
-
-// classifySend maps what the protocol adapter reports onto the outcomes the
-// Store stores.
-//
-// Everything the adapter states definitely is permanent, including a target
-// from a connection that no longer exists: a reply address is only valid on the
-// connection that received the message, so there is no later attempt that could
-// succeed. Anything else is unknown, which is the fail-closed direction — an
-// unknown outcome is recorded as a duplicate risk and, with one attempt
-// allowed, ends the part rather than sending it again.
-func classifySend(err error) channels.SendResult {
-	switch {
-	case err == nil:
-		return channels.SendResult{Outcome: channels.SendSucceeded, ErrorType: channels.ErrorNone}
-	case errors.Is(err, ErrReplyRejected),
-		errors.Is(err, ErrReplyAlreadySent),
-		errors.Is(err, ErrReplyTargetExpired),
-		errors.Is(err, ErrNotConnected),
-		errors.Is(err, ErrTextTooLong),
-		errors.Is(err, ErrTextInvalid):
-		return channels.SendResult{Outcome: channels.SendPermanent, ErrorType: channels.ErrorPermanent}
-	default:
-		return channels.SendResult{
-			Outcome:   channels.SendUnknown,
-			ErrorType: channels.ErrorOutcomeUnknown,
-		}
 	}
 }
 
