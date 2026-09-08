@@ -56,6 +56,35 @@ func TestNewRejectsUnusableConfiguration(t *testing.T) {
 		})
 		require.ErrorIs(t, err, sessionlease.ErrInvalidConfig)
 	})
+
+	t.Run("ttl precision", func(t *testing.T) {
+		t.Parallel()
+		for _, ttl := range []time.Duration{
+			500 * time.Microsecond,
+			1500 * time.Microsecond,
+			time.Second + time.Nanosecond,
+		} {
+			_, err := redislease.New(newClosedClient(t), redislease.Options{
+				Lease: sessionlease.Config{
+					TTL: ttl, RenewInterval: ttl / 4, SafetyMargin: ttl / 4,
+				},
+			})
+			require.ErrorIs(t, err, sessionlease.ErrInvalidConfig, "ttl %s", ttl)
+		}
+	})
+
+	t.Run("whole millisecond ttl", func(t *testing.T) {
+		t.Parallel()
+		for _, config := range []sessionlease.Config{
+			{},
+			{TTL: 300 * time.Millisecond, RenewInterval: 50 * time.Millisecond, SafetyMargin: 50 * time.Millisecond},
+			{TTL: time.Millisecond, RenewInterval: 200 * time.Microsecond, SafetyMargin: 300 * time.Microsecond},
+		} {
+			coordinator, err := redislease.New(newClosedClient(t), redislease.Options{Lease: config})
+			require.NoError(t, err, "config %+v", config)
+			require.NoError(t, coordinator.Close())
+		}
+	})
 }
 
 func TestAcquireValidatesBeforeItTouchesRedis(t *testing.T) {

@@ -2,12 +2,16 @@ package web
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessiondir"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionlease"
 	"github.com/stretchr/testify/require"
@@ -282,6 +286,159 @@ func TestPlatformDoesNotReleaseWhenTheClientDisconnects(t *testing.T) {
 		context.Background(), runKey("tenant-a", principalA, "conversation-1"),
 	)
 	require.ErrorIs(t, err, sessionlease.ErrSessionBusy)
+}
+
+func TestPlatformKeepsTheSessionWhenTheClientLeavesMidRun(t *testing.T) {
+	upstream := newBlockingUpstream(t)
+	platform := newPlatformTestServerWith(t, platformTestOptions{
+		lease: sessionlease.Config{
+			TTL:           2 * time.Second,
+			RenewInterval: 400 * time.Millisecond,
+			SafetyMargin:  400 * time.Millisecond,
+		},
+	})
+	seedTenantAppRevision(
+		t, platform.handler, "tenant-a", appAssistant, "revision-1", 1, "echo-v1",
+	)
+	seedUpstreamRevision(
+		t, platform.handler, "tenant-a", appAssistant, "revision-2", 2, upstream.server.URL,
+	)
+
+	clientCtx, disconnect := context.WithCancel(context.Background())
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		request := httptest.NewRequest(http.MethodPost, chatPath, strings.NewReader(`{
+			"model":"ignored","messages":[{"role":"user","content":"hello"}]
+		}`)).WithContext(clientCtx)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(HeaderAuthorization, "Bearer "+keyTenantA)
+		request.Header.Set(HeaderAgentAppID, appAssistant)
+		request.Header.Set(HeaderSessionID, "conversation-1")
+		platform.handler.ServeHTTP(httptest.NewRecorder(), request)
+	}()
+	// Drain the request before the platform's cleanup waits for its Runtime.
+	t.Cleanup(func() {
+		disconnect()
+		upstream.answer()
+		select {
+		case <-served:
+		case <-time.After(10 * time.Second):
+			t.Error("chat request did not finish during cleanup")
+		}
+	})
+
+	upstream.awaitEntered(t)
+	disconnect()
+	upstream.awaitGone(t)
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a disconnected chat request never returned from ServeHTTP")
+	}
+
+	peer := platform.peerCoordinator(t)
+	key := runKey("tenant-a", principalA, "conversation-1")
+	_, err := peer.Acquire(context.Background(), key)
+	require.ErrorIs(t, err, sessionlease.ErrSessionBusy,
+		"an interrupted run released its session before the lease expired")
+
+	var taken sessionlease.Lease
+	require.Eventually(t, func() bool {
+		lease, acquireErr := peer.Acquire(context.Background(), key)
+		if acquireErr != nil {
+			return false
+		}
+		taken = lease
+		return true
+	}, 10*time.Second, 10*time.Millisecond, "the interrupted run stranded the conversation")
+	require.NoError(t, taken.Release(context.Background()))
+}
+
+func seedUpstreamRevision(
+	t *testing.T,
+	handler http.Handler,
+	tenantID, appID, revisionID string,
+	revisionNo uint64,
+	baseURL string,
+) {
+	t.Helper()
+	body := fmt.Sprintf(`{
+		"id":%q,
+		"revision_no":%d,
+		"config":{
+			"agent_name":"test-agent",
+			"instruction":"Answer through the upstream endpoint.",
+			"model":{"provider":%q,"name":"test-model","base_url":%q}
+		}
+	}`, revisionID, revisionNo, platformagent.ProviderOpenAICompatible, baseURL+"/v1")
+	requireStatus(
+		t, handler, http.MethodPost,
+		fmt.Sprintf("/admin/v1/tenants/%s/apps/%s/revisions", tenantID, appID),
+		body, adminHeaders(adminKeyPlatform), http.StatusCreated,
+	)
+	publishRevisionThroughAPI(t, handler, tenantID, appID, revisionID)
+}
+
+type blockingUpstream struct {
+	server      *httptest.Server
+	entered     chan struct{}
+	gone        chan struct{}
+	release     chan struct{}
+	enteredOnce sync.Once
+	goneOnce    sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingUpstream(t *testing.T) *blockingUpstream {
+	t.Helper()
+	upstream := &blockingUpstream{
+		entered: make(chan struct{}),
+		gone:    make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	upstream.server = httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, request *http.Request) {
+			if err := json.NewDecoder(request.Body).Decode(&map[string]any{}); err != nil {
+				return
+			}
+			upstream.enteredOnce.Do(func() { close(upstream.entered) })
+			select {
+			case <-upstream.release:
+			case <-request.Context().Done():
+				upstream.goneOnce.Do(func() { close(upstream.gone) })
+				return
+			}
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = writer.Write([]byte("data: [DONE]\n\n"))
+		}))
+	t.Cleanup(func() {
+		upstream.answer()
+		upstream.server.Close()
+	})
+	return upstream
+}
+
+func (u *blockingUpstream) answer() {
+	u.releaseOnce.Do(func() { close(u.release) })
+}
+
+func (u *blockingUpstream) awaitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-u.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the model call never reached the upstream endpoint")
+	}
+}
+
+func (u *blockingUpstream) awaitGone(t *testing.T) {
+	t.Helper()
+	select {
+	case <-u.gone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the disconnect never reached the model call")
+	}
 }
 
 // A lease that was already lost is not released either. Releasing is

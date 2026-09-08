@@ -171,6 +171,11 @@ func New(client goredis.UniversalClient, opts Options) (*Coordinator, error) {
 	if err := opts.Lease.Validate(); err != nil {
 		return nil, err
 	}
+	// Keep Redis PX expiry and local lease deadlines on the same duration.
+	if ttl := opts.Lease.WithDefaults().TTL; ttl%time.Millisecond != 0 {
+		return nil, fmt.Errorf("%w: ttl %s must be a whole number of milliseconds",
+			sessionlease.ErrInvalidConfig, ttl)
+	}
 	return &Coordinator{
 		client: client,
 		prefix: prefix,
