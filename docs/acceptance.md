@@ -31,8 +31,8 @@ Memory/Summary、Knowledge/Artifact 路由、在线迁移、群聊、媒体/卡�
 
 | 检查 | 已取得的证据 | 适用范围 |
 | --- | --- | --- |
-| 最终功能代码回归 | 2026-09-08，`f6bb709` 对应代码通过全仓 race、vet、build | 默认测试关闭外部模型与存储门控；日期之后的文档整理不改变代码 |
-| PostgreSQL 与 IM 公共链路 | 同日四包集成通过：postgres、wecom、text、feishu | 模拟平台、真实 Runner/Session/Store，验证去重、顺序、隔离、发送失败与保守恢复 |
+| 最终功能代码回归 | 2026-09-08，`650f504` 对应代码通过全仓 race、vet、build，含 Redis 租约 TTL 精度校验与执行中取消回归 | 默认测试关闭外部模型与存储门控；后续仅文档修改不改变该代码版本 |
+| PostgreSQL 与 IM 公共链路 | 2026-09-08，`650f504` 对应代码通过 postgres、wecom、text、feishu 四包集成 | 真实本地 PostgreSQL、模拟平台、真实 Runner/Session/Store，验证去重、顺序、隔离、发送失败与保守恢复 |
 | 真实企业微信 | 2026-09-07，构建 `0378175`：1 条 Inbox、Run succeeded/attempt=1、Outbox sent/attempt=1、duplicate_risk=false，明确 errcode=0 | 正常单聊、真实模型与 PostgreSQL；该平台记录早于公共消费者提取，当前代码通过本地集成回归 |
 | 真实飞书 | 2026-09-08，构建 `f6bb709`：2 条 Inbox/Run/Outbox，同一 Principal/Session/Revision；每轮一次执行和发送，均 succeeded/sent、有平台消息 ID、duplicate_risk=false | 官方长连接、真实模型与 PostgreSQL，正常两轮单聊 |
 | 网页与部署 | 2026-09-07，部署提交 `29a6b90`，Go 功能代码同 `f5ed53c`；默认网页 8 项 HTTP/SSE、临时 PostgreSQL schema 启动和 Collector 配置校验通过 | 健康、认证隔离、续聊、发布/回滚保持 Pin；Collector 只验证配置，未联调真实 Bot 遥测，未验证生产部署 |
