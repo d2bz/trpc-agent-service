@@ -1,6 +1,6 @@
 # 本地部署
 
-本指南提供单进程网页、PostgreSQL、企业微信/飞书文本和可选 Collector 的运行方式。生产节点拓扑见[架构设计](architecture.md#6-节点部署)，当前能力与验证结果见[验收说明](acceptance.md)。
+本指南提供单进程网页、PostgreSQL、企业微信/飞书文本和可选 Collector 的运行方式。生产节点拓扑见[架构设计](architecture.md#6-节点部署)，当前能力与验证结果见[实现与验证](acceptance.md)。
 
 ## 环境与版本
 
@@ -73,7 +73,7 @@ TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_s
 go test -race -count=1 -timeout 120s ./trpcservice/channels/wecom ./trpcservice/telemetry
 ```
 
-结束服务后可用 `docker compose -f deploy/docker-compose.session.yml stop postgres` 停库，保留卷；其他服务也在使用该库时保持运行。不要为本次演示执行 `down -v` 删除已有数据。
+结束服务后可用 `docker compose -f deploy/docker-compose.session.yml stop postgres` 停库，保留卷；其他服务也在使用该库时保持运行。`down -v` 会删除已有数据，需要保留数据时请使用 `stop`。
 
 ## 可选飞书
 

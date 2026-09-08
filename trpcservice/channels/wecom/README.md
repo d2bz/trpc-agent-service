@@ -1,6 +1,6 @@
 # 企业微信智能机器人文本适配器
 
-本包包含企业微信智能机器人长连接协议与 `channels.TextAdapter` 的企微实现。持久消费者位于独立的 `channels/text` 包，将规范消息接入共享 Session Run，并回复一条最终文本。配置与社区扩展见 [IM 指南](../../../docs/im-channels.md)，真实正常单聊与当前集成测试范围见[验收说明](../../../docs/acceptance.md#验证结果)。
+本包包含企业微信智能机器人长连接协议与 `channels.TextAdapter` 的企微实现。持久消费者位于独立的 `channels/text` 包，将规范消息接入共享 Session Run，并回复一条最终文本。配置与社区扩展见 [IM 指南](../../../docs/im-channels.md)，真实正常单聊与当前集成测试范围见[实现与验证](../../../docs/acceptance.md#验证结果)。
 
 ## 范围
 

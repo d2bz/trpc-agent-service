@@ -1,13 +1,13 @@
 # 身份、权限与密钥治理
 
-本文描述当前**已实现**的安全机制：控制面认证、角色模型、Security Manifest、租户 Entitlement 和 Runtime 构建顺序。所有描述以 `trpcservice/identity`、`trpcservice/security`、`trpcservice/secretref`、`trpcservice/web/admin.go`、`trpcservice/agent/agent.go` 和 `start.sh` 的源码与测试为准。第 10 节列出仍未实现的能力，不能在验收中被当作已解决。
+本文描述当前**已实现**的安全机制：控制面认证、角色模型、Security Manifest、租户 Entitlement 和 Runtime 构建顺序。所有描述以 `trpcservice/identity`、`trpcservice/security`、`trpcservice/secretref`、`trpcservice/web/admin.go`、`trpcservice/agent/agent.go` 和 `start.sh` 的源码与测试为准。未实现能力及其安全影响见第 10 节。
 
 ## 1. 一句话边界
 
 - 控制面（Admin API）和对话面（`/v1/chat/completions`）都要求 Bearer 凭据，且**使用两套互不相通的凭据体系**。
 - 凭据是静态的：进程启动时一次读入，运行期不可变更，没有热加载、轮转、过期或撤销。
 - 授权粒度是**角色 + 租户**（`platform_admin` / `tenant_admin`）和**租户 Entitlement**（某租户的 Revision 可以引用哪些 SecretRef 和 PolicyRef），不是动态 RBAC。
-- 进程仍然只允许绑定回环地址。原因已经变了：不再是"Admin 未认证"，而是本进程只服务明文 HTTP，可路由的监听地址会把 Admin Bearer token 明文放到网络上；且 demo profile 仍然可以用公开的开发 chat key 启动。TLS 终止属于反向代理，不属于本二进制的环境变量。
+- 进程只允许绑定回环地址。当前服务使用明文 HTTP，可路由监听会使 Admin Bearer token 暴露在网络传输中；demo profile 可使用公开的开发 chat key 启动。TLS 由外部反向代理终止，本二进制不提供 TLS 配置。
 
 ## 2. 两条凭据链路
 
@@ -83,7 +83,7 @@ Admin Key 的下限是 chat 的两倍，这是有意的：一个 chat key 只能
 
 Admin 的任何响应——成功和失败——都**不带任何 `Access-Control-Allow-*` 头**，也没有预检分支。`OPTIONS` 不被特殊处理：它和别的请求一样先认证，然后作为这些路由不接受的方法得到 `405`。
 
-配合"所有 POST 必须 `Content-Type: application/json`"，浏览器页面既读不到 Admin 响应，也**发不出** Admin 写操作：`application/json` 让每个写请求都落在 CORS "simple request" 集合之外，浏览器必须先发预检，而预检没有任何东西可以成功。`Content-Type` 检查不是为了解析（`decodeAdminJSON` 本来就会拒绝非 JSON，publish 甚至不带 body），就是为了这条。测试见 `web.TestAdminNeverPublishesCORSHeaders`、`TestAdminWritesRequireJSONContentType`。
+所有 POST 必须声明 `Content-Type: application/json`，包括不带 body 的 publish 请求。该类型不属于 CORS "simple request" 允许的类型，跨源浏览器写请求必须先通过预检；Admin 不提供 CORS 许可，因此跨源页面无法读取响应或提交写操作。JSON 内容由 `decodeAdminJSON` 单独校验。测试见 `web.TestAdminNeverPublishesCORSHeaders`、`TestAdminWritesRequireJSONContentType`。
 
 对话面 `/v1/chat/completions` 仍然发布 CORS 头，两者是不同的边界。
 
@@ -212,7 +212,7 @@ security 文件是最不能容忍"解析器忽略了它不认识的那部分"的
 
 `cmd/trpc-service/main.go` 把 `securityCfg.Revisions` **同一个实例**同时交给 `web.NewPlatformServer`、Runtime 和 Storage Factory。不是三个等价的值：Admin 接受而数据面拒绝（或者反过来）是一次关于“这个租户能做什么”的分歧，而这种分歧在请求期没有正确的解法。
 
-创建时就检查（而不是只在 publish 检查），是为了不让一个 draft 攒着看起来被接受的引用，然后在运维最难判断"是配置错了还是平台错了"的地方失败。
+创建时校验可在保存 draft 前拒绝未授权引用，避免错误配置延迟到发布或运行时才暴露。
 
 Admin 拒绝一律是同一个 `403 not_entitled`，措辞固定，不说明是哪个引用被拒。对“环境变量存在”和“不存在”、“策略已注册”和“从没听说过”都给出同一个答案；Profile 创建和 Revision 的两次门禁都不会读取环境。Runtime/Factory 的拒绝再统一塌缩为 `409 revision_unavailable`，不把平台配置原因告诉对话调用方。
 
@@ -267,7 +267,7 @@ demo profile 下 `TRPC_SERVICE_ADMIN_API_KEY` 没有默认值，所以 `start.sh
 
 ## 10. 明确未实现
 
-这些能力**没有**实现，不能在验收中被当作已解决：
+当前未实现以下能力：
 
 - **JWT / OIDC / 任何动态身份提供方。** 只有静态 API Key，没有轮转、过期、撤销、按 Principal 的配额与限流。轮转目前只能表现为"manifest 里给同一个 principal 配两个 key，然后重启"。
 - **动态 RBAC。** 角色是编译期闭集的两个值，权限是代码里的分支，不是可配置的策略表。
@@ -283,4 +283,4 @@ demo profile 下 `TRPC_SERVICE_ADMIN_API_KEY` 没有默认值，所以 `start.sh
 
 - [Admin API 与动态路由](admin-api.md)：端点、请求示例、路由顺序和错误码。
 - [Tool 与 Policy Runtime](tool-policy.md)：Tool Registry、Policy 交集、工具循环上限和 Tool 审计字段。
-- [验收说明](acceptance.md)：设计映射、参考实现、验证结果与已知限制。
+- [实现与验证](acceptance.md)：设计映射、参考实现、验证结果与已知限制。

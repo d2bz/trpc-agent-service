@@ -1,6 +1,6 @@
 # IM 接入与社区扩展
 
-企业微信智能机器人和飞书企业自建应用均通过 `channels.TextAdapter` 接入公共文本消费者。当前支持单进程、每类通道一个静态绑定、单聊纯文本和一条最终回复。配置见[本地部署](local-deployment.md)，验证范围见[验收说明](acceptance.md)。群聊、Webhook、媒体、卡片、撤回及生产重试方案见[IM 差异设计](solution.md#55-im-接入差异)。
+企业微信智能机器人和飞书企业自建应用均通过 `channels.TextAdapter` 接入公共文本消费者。当前支持单进程、每类通道一个静态绑定、单聊纯文本和一条最终回复。配置见[本地部署](local-deployment.md)，验证范围见[实现与验证](acceptance.md)。群聊、Webhook、媒体、卡片、撤回及生产重试方案见[IM 差异设计](solution.md#55-im-接入差异)。
 
 ## 职责与依赖
 

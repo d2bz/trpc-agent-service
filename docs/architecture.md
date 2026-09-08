@@ -1,6 +1,6 @@
 # 总体架构设计
 
-本文描述目标架构、组件边界与当前接线。网页、企业微信和飞书共享 Session Run；两类 IM 经公共文本消费者使用 PostgreSQL Inbox/Run/Outbox。Redis 唤醒、通用 Worker、Memory 和完整 OTel 属于生产扩展设计。实现范围与验证见[验收说明](acceptance.md)，适配器职责见[IM 指南](im-channels.md)。
+本文描述目标架构、组件边界与当前接线。网页、企业微信和飞书共享 Session Run；两类 IM 经公共文本消费者使用 PostgreSQL Inbox/Run/Outbox。Redis 唤醒、通用 Worker、Memory 和完整 OTel 属于生产扩展设计。实现范围与验证见[实现与验证](acceptance.md)，适配器职责见[IM 指南](im-channels.md)。
 
 ## 1. 设计结论
 
@@ -180,7 +180,7 @@ type InboundEnvelope struct {
 | 规范输入 -> Runner | 公共文本 Consumer claim Run 后调用共享 `sessionrun.Start` 取得 Session/Revision，以 `model.NewUserMessage(Message.Text)` 交给 `Handle.Run`，后者调用真实 `runner.Runner.Run`；企微适配器只受理单聊文本，公共文本入口拒绝附件输入 |
 | Agent Event -> 最终文本 | [`text/reply.go`](../trpcservice/channels/text/reply.go)只取完成且非 partial、无错误、无 Tool 调用的 assistant chat completion；持续排空 Event，后续错误使 Run 失败。Tool 结果、runner completion 和推理字段不作回复 |
 | 文本 -> IM 回复 | 公共层按适配器字节上限与 Store 上限清洗、截断文本，超长追加 `[truncated]`，与 Run 终态原子写入一个 Outbox；企微上限保持 20480 UTF-8 字节，适配器以原回调 `req_id`、稳定 `stream.id`、`finish=true` 最多发送一次，明确 `errcode=0` 回执后记为 sent，不代表用户已读 |
-| 流式和卡片扩展 | 支持时聚合 assistant 文本增量、按通道限频更新同一消息，完成后结束流；卡片只使用已定义模板及受校验字段。不支持时降级为最终纯文本，不能把任意 Event JSON 发给用户；本次企微文本演示不承诺实时增量或卡片 |
+| 流式和卡片扩展 | 支持时聚合 assistant 文本增量、按通道限频更新同一消息，完成后结束流；卡片只使用已定义模板及受校验字段。不支持时降级为最终纯文本，不能把任意 Event JSON 发给用户；当前企微实现只发送最终文本，未支持实时增量或卡片 |
 
 当前异步链路由适配器按约定顺序提交规范消息，公共文本 Consumer 的受理回调写 PostgreSQL Inbox/Run；回调成功表示持久受理完成或命中重复。另一串行循环按可信 Tenant/Binding 扫描、执行和发送，本地通知只缩短轮询等待。生产目标使用 Redis Streams Consumer Group 低延迟唤醒；Stream 只携带内部 `tenant_id`、`run_id` 和 W3C `traceparent`，Worker 回查持久记录，不能以 Stream 代替数据真相。Redis 唤醒和独立 Worker/Dispatcher 尚未接入当前运行链路。
 
@@ -238,7 +238,7 @@ thread_id = "" when the platform has no explicit thread
 
 当前可运行的参考实现使用 `./build.sh`、`./start.sh` 和 `./stop.sh`，单进程提供 Admin API、HTTP/SSE、Runtime 和 InMemory Session，默认仅监听回环地址，无需外部数据库或模型密钥。Redis/PostgreSQL 的可选集成依赖见 `deploy/docker-compose.session.yml`。
 
-企微和飞书默认关闭；启用时要求 PostgreSQL 进程 profile、静态单机器人绑定及进程默认的持久 Session/Pin。同租户的两个入口使用不同 Binding ID。当前 Consumer 不承诺同一绑定跨 Session 并行；退出先停止连接和消费者，再关闭 Runtime 与数据库，启动方式见[本地部署](local-deployment.md)，验证结果见[验收说明](acceptance.md#验证结果)。
+企微和飞书默认关闭；启用时要求 PostgreSQL 进程 profile、静态单机器人绑定及进程默认的持久 Session/Pin。同租户的两个入口使用不同 Binding ID。当前 Consumer 不承诺同一绑定跨 Session 并行；退出先停止连接和消费者，再关闭 Runtime 与数据库，启动方式见[本地部署](local-deployment.md)，验证结果见[实现与验证](acceptance.md#验证结果)。
 
 以下为后续多角色部署设计，`--role`、SQLite 和本地 Artifact 未接入当前命令入口：
 
@@ -309,11 +309,11 @@ return runCtx.Err()
 
 ## 8. 实现边界
 
-初期不采用服务网格、自研工作流引擎、跨地域多活、通用事件总线或复杂插件市场。它们不会直接提高本题验收覆盖率，却会显著增加三周内的实现风险。组件间先使用 Go 接口和明确数据契约，确认存在独立扩缩容需求后再拆进程。
+当前实现采用单进程部署，组件间通过 Go 接口和明确的数据契约协作，减少网络调用、分布式协调和运维依赖。Gateway、Worker 和 Channel 出现独立扩缩容或故障隔离需求时，可按既有职责边界拆分进程。服务网格、跨地域多活和事件总线的引入取决于部署规模、可用性目标及运维条件。
 
 ## 9. 社区扩展原则
 
-本项目在完成验收要求的同时，保留面向开源社区的扩展边界。原则是“核心稳定、外围可替换”：平台核心保证租户隔离、身份认证、Revision Pin、幂等、审计和资源生命周期；社区扩展实现 Agent 类型、存储后端、IM 通道、Tool/MCP、治理策略和 Telemetry Exporter。扩展不得绕过核心不变量，也不能直接依赖某个厂商 SDK 或数据库表结构。
+平台核心负责租户隔离、身份认证、Revision Pin、幂等、审计和资源生命周期的统一契约；Agent 类型、存储后端、IM 通道、Tool/MCP、治理策略和 Telemetry Exporter 通过扩展接口接入。厂商 SDK 与数据库表结构封装在适配层，扩展实现必须遵守核心不变量；各项能力的实现状态与限制见[实现与验证](acceptance.md)。
 
 ### 9.1 稳定核心与扩展 SPI
 
@@ -340,7 +340,7 @@ IM 文本扩展的具体契约、生命周期、受理确认、发送结果、�
 
 ### 9.2 插件实现与验证方式
 
-第一阶段采用编译期注册的 Go Factory/Registry。它跨平台、易调试，并且能让社区实现与主仓库共享类型和测试；不直接依赖 Go 动态插件机制，也不提前建设插件市场。需要独立发布或隔离运行时，再把同一份契约映射为 gRPC、HTTP 或 MCP 进程外服务。
+扩展采用编译期注册的 Go Factory/Registry，便于跨平台构建、调试以及共享类型和测试。需要独立发布或隔离运行时，可将同一份契约映射为 gRPC、HTTP 或 MCP 进程外服务。
 
 每个新适配器至少应提供：
 

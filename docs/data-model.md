@@ -176,7 +176,7 @@ accepted → running → succeeded | failed
 
 当前企微最多写入一个最终文本 Outbox，发送最多尝试一次；版本化目标含 Tenant/Binding、连接 generation、req_id 和 stream_id，持久保存不代表跨连接仍有效。旧连接目标记失败，未知回执保留 `duplicate_risk` 并停止发送；明确 `errcode=0` 才记 sent，不表示用户已读。媒体、卡片、增量流及跨连接补发未实现。
 
-`audit_logs` 是追加写记录，至少包含题目要求的全部字段：
+`audit_logs` 采用追加写模型，字段定义如下：
 
 | 字段 | 说明 |
 | --- | --- |

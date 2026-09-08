@@ -4,9 +4,9 @@
 
 Redis 可以作为租户 Session 后端，但不作为整套控制面的进程 profile；配置与 Pin 仍由 PostgreSQL 提供。能力与一致性取舍见[多后端设计](storage-and-consistency.md)。
 
-## 1. 交付范围
+## 1. 模块组成
 
-| 交付物 | 路径 | 说明 |
+| 组件 | 路径 | 说明 |
 | --- | --- | --- |
 | 后端工厂 | `trpcservice/sessionbackend/sessionbackend.go` | `New(Config) (session.Service, error)`，三种后端 |
 | 单元测试 | `trpcservice/sessionbackend/sessionbackend_test.go` | 不触网，随 `go test ./...` 默认执行 |
@@ -226,7 +226,7 @@ Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis）�
 
 顺序本身就是实现的主要内容，逐条都有原因：
 
-1. 先校验监听地址。本进程只服务明文 HTTP，可路由的监听地址会把 Admin Bearer token 明文放到网络上，因此这条守卫必须排在任何可能连数据库的动作之前。（早期版本的理由是"Admin API 无鉴权"；Admin 现在已认证，守卫的位置不变，理由换了。）
+1. 先校验监听地址。本进程只服务明文 HTTP，可路由的监听地址会把 Admin Bearer token 明文放到网络上，因此必须在连接数据库前拒绝非回环监听配置。
 2. 加载并整体校验安全配置（Security Manifest 或 demo profile）。凭据、角色和租户 entitlement 全部在这一步定型，排在存储之前：一份配错的清单不该先建出连接池、跑完迁移再失败。详见[身份、权限与密钥治理](security-and-governance.md#8-启动顺序)。
 3. 读取并整体校验存储配置，此时还没有创建任何资源；schema 拼错在这一步就失败，而不是迁移跑到一半才失败。
 4. 解析 pgx 连接池配置，把校验过的 schema 写进 `search_path`（写在 pool config 上而不是 checkout 后 `SET`，这样连接池后来新开的连接也带同一个 `search_path`）。
@@ -236,7 +236,7 @@ Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis）�
 8. 构造 Repository 与 Directory（共用同一个池，两者都只借用、都不关闭）；再构造上游 Session 服务（它自己持有并拥有另一个池）。
 9. 最后才 `SeedDemo`——它要写控制面，必须在迁移之后。
 
-关闭顺序是它的严格逆序：HTTP 优雅关闭（在 `waitForStop` 里）→ Runtime Resolver（等待在途 runtime 交还租约并关闭缓存）→ Storage Router（等待全部 Bundle lease）→ Session 服务 → 共享连接池。启动中途失败时只关闭已经建成的那些资源，同样逆序；**关闭错误用 `errors.Join` 合并进进程退出错误，不再是打条日志就丢掉**——一个"关闭时没刷完"的 Session 服务，一周后表现为"每段会话最后一轮不见了"。
+关闭顺序是它的严格逆序：HTTP 优雅关闭（在 `waitForStop` 里）→ Runtime Resolver（等待在途 runtime 交还租约并关闭缓存）→ Storage Router（等待全部 Bundle lease）→ Session 服务 → 共享连接池。启动中途失败时只关闭已经建成的资源，同样逆序。关闭错误用 `errors.Join` 合并进进程退出错误，使 Session 刷写失败等问题能够被调用方识别。
 
 ### 8.4 快速开始
 

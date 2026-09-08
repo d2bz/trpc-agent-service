@@ -1,6 +1,6 @@
 # 多租户节点化 Agent 平台方案
 
-本方案覆盖多租户、节点部署、数据同步、多后端、IM、治理监控和故障恢复。交付采用完整设计与代表性实现：网页、企业微信和飞书文本通过共享 Session Run 执行真实 Agent，未实现的生产能力以设计和风险边界标明。材料与验证见[交付说明](delivery.md)和[验收说明](acceptance.md)。
+本方案覆盖多租户、节点部署、数据同步、多后端、IM、治理监控和故障恢复。当前实现中，网页、企业微信和飞书文本通过共享 Session Run 执行真实 Agent；生产扩展设计分别标明实现状态、前置条件和风险。相关文档见[文档索引](delivery.md)，代码能力及运行记录见[实现与验证](acceptance.md)。
 
 ## 1. 背景与目标
 
@@ -32,7 +32,7 @@
 
 目标架构中，企业微信智能机器人 Adapter 通过 Bot ID/Secret 订阅长连接，只处理已认证连接上、机器人标识匹配的消息。Gateway 根据受信任的账号绑定确定 Tenant/App，在一个 PostgreSQL 事务内插入或命中 Inbox 并为首次事件创建 `accepted` Run，提交后再通过 Redis Streams 投递 `run_id`。Run Coordinator 获取 Session 租约并成功 claim PostgreSQL Run 后，Runtime Manager 才加载指定 Revision 的 Agent/Runner。Worker 调用 tRPC-Agent-Go Runner，读取 Session/Memory、检索 Knowledge、执行 Tool/MCP，并持续消费流式 Event。结果写入 Session、Memory、Run 和 Audit，最终通过 Outbox 发送到企业微信。长连接没有 HTTP 200 确认步骤；消息推送、Inbox 提交、回复回执是三个不同事实，边界见下文 IM 设计。
 
-当前公共文本消费者在可信 Tenant/Binding 范围扫描 PostgreSQL 任务，claim 后调用 `sessionrun.Start/Run`；Session 忙时在执行预算内等待。它排空 Event，原子完成 Run 和最终文本 Outbox，再由企微或飞书适配器发送。消息与恢复契约见 [IM 指南](im-channels.md)，验证结果见[验收说明](acceptance.md#验证结果)。
+当前公共文本消费者在可信 Tenant/Binding 范围扫描 PostgreSQL 任务，claim 后调用 `sessionrun.Start/Run`；Session 忙时在执行预算内等待。它排空 Event，原子完成 Run 和最终文本 Outbox，再由企微或飞书适配器发送。消息与恢复契约见 [IM 指南](im-channels.md)，验证结果见[实现与验证](acceptance.md#验证结果)。
 
 `trace_id` 贯穿 IM callback、Gateway、Runner、Model、Tool、Session/Memory 和 IM 回复；跨 Redis Streams 时显式携带 W3C `traceparent` 并在 Worker 恢复上下文。`request_id` 贯穿幂等、取消、状态查询、成本和审计。完整时序见 [核心消息时序](sequence.md)。
 
@@ -62,12 +62,12 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 | --- | --- | --- |
 | 入站方式 | 主动连接 `wss://openws.work.weixin.qq.com`，发送 `aibot_subscribe`；接收 `aibot_msg_callback` | 当前采用自建应用官方 Go SDK 长连接；HTTPS Webhook 保留为扩展设计 |
 | 安全 | Bot ID/Secret 认证；校验事件 `aibotid` 与受信任连接绑定一致，不用自建应用 access token | App ID/Secret 认证查询企业身份；核对事件 App/企业和 sender 企业，静态绑定内部 Tenant/App；Webhook 签名/Token 方案见下文 |
-| 入站确认 | 推送帧没有 HTTP 响应；只有 Inbox 事务提交后才在平台内部标记受理，不假定断连后必然补投 | SDK 在处理器返回后 ACK；持久受理成功才返回 nil，回调串行受理且有限等待，停止时排空；验证范围见验收说明 |
+| 入站确认 | 推送帧没有 HTTP 响应；只有 Inbox 事务提交后才在平台内部标记受理，不假定断连后必然补投 | SDK 在处理器返回后 ACK；持久受理成功才返回 nil，回调串行受理且有限等待，停止时排空；验证范围见实现与验证 |
 | 幂等与回复关联 | `body.msgid` 作入站事件键；`headers.req_id` 用于回复关联，不等同于平台 `request_id` | `im.message.receive_v1` 按 `message_id` 在 Binding 内去重，不能只依赖 `event_id`；message/chat/thread 标识用于回复定位 |
 | 身份与会话 | `from.userid`、`chattype`、群聊 `chatid`，机器人账号先绑定 Tenant/App | App、Chat、User、Thread 共同决定绑定和会话作用域 |
 | 文本回复 | `aibot_respond_msg` 透传 `req_id`，以固定 `stream.id` 发送最终文本；收到成功回执再确认 Outbox | Bot 消息 API 按 message/chat ID 回复；平台流式/卡片更新能力与普通文本分开 |
 | 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 当前采用保守 4096 UTF-8 字节最终文本；单次 HTTP 回复，未知不重发；生产按消息类型配置限频/退避 |
-| 扩展与撤回 | 图片/文件需下载解密和媒体上传，卡片、欢迎语、主动发送有独立协议；均不进入首条文本链路 | 图片/文件、富文本、交互卡片和撤回分别映射事件与出站动作，未支持时明确拒绝或记录 |
+| 扩展与撤回 | 图片/文件需下载解密和媒体上传，卡片、欢迎语、主动发送有独立协议；当前均未实现 | 图片/文件、富文本、交互卡片和撤回分别映射事件与出站动作，未支持时明确拒绝或记录 |
 | 当前状态 | 单静态 Binding、单聊纯文本已实现，真实正常收发已验证；增量流、群聊、媒体、卡片和撤回仍为设计 | [飞书接入](im-channels.md)已实现，身份预检、本地协议与 PostgreSQL 集成通过；真实连接及两轮正常单聊收发已验证 |
 
 协议依据为[企微官方 SDK README](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/README.md) 和 [WebSocket 实现](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)，2026-09-07 核对；这里只参考协议，不将 Node SDK 引入 Go 服务。自建应用 Webhook 的 `msg_signature`/AES、HTTP 200 和 access token 发送流程是另一种接入模式，不与智能机器人长连接混用。未核实的平台回复有效期、跨连接重试能力和限频数值保持待联调，不能据 SDK 的本地请求超时推定平台保证。
@@ -86,7 +86,7 @@ Event 和 StateDelta 通过上游 `AppendEvent` 原子提交。Summary、Memory 
 
 以上依据为 2026-09-07 核对的飞书官方[Webhook 配置与 challenge](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/choose-a-subscription-mode/send-notifications-to-developers-server)、[事件安全校验与解密](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/encrypt-key-encryption-configuration-case)和[接收消息事件](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/events/receive)。官方 Go SDK 固定版本 [`b059ee1` 的 Dispatcher](https://github.com/larksuite/oapi-sdk-go/blob/b059ee1824d45444306559b5c33c3f268c0de10d/event/dispatcher/dispatcher.go)会先解析/解密、对 challenge 跳过签名、无 Encrypt Key 时直接跳过签名，并仅在 challenge 分支校验 Token；普通事件的 Token/App/租户绑定校验仍由平台负责，不能只构造 SDK Dispatcher 就宣称完成认证。
 
-**撤回策略仍属设计。** 收到已验证的撤回事件时，记录对原消息和 Run 的关联，不删除已经提交的 Audit 或 Session Event；撤回也不自动抵消已执行的 Tool。通道支持撤回机器人回复时，经 Outbox 提交撤回动作，否则按租户策略忽略或发送更正说明。该策略承接[通道设计](im-channels.md)，不把撤回、媒体或卡片加入当前文本演示实现范围。
+**撤回策略尚未实现。** 设计上，收到已验证的撤回事件时，记录对原消息和 Run 的关联，不删除已经提交的 Audit 或 Session Event；撤回也不自动抵消已执行的 Tool。通道支持撤回机器人回复时，经 Outbox 提交撤回动作，否则按租户策略忽略或发送更正说明。当前支持的消息类型见[IM 接入指南](im-channels.md)。
 
 设计上两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。企微出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`；飞书按原始 `message_id` 回复，目标携带完整绑定作用域，不随 WebSocket 换代失效。敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；生产扩展只有确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。当前企微每条最终回复最多一次发送尝试，未知结果保留 `duplicate_risk` 且不重发，连接换代后旧目标失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
 
@@ -102,13 +102,13 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 | Model 前后 | Plugin 在调用前按租户预算原子预占本次有界额度，超额拒绝；完成后按供应商 usage 与版本化价格表结算。调用结果未知时保留预占并进入对账，不把未知费用当作零 |
 | Tool 前 | Callback 以租户已授权 Policy 的交集裁决 Tool；危险操作的批准绑定 Tenant、主体、操作、参数摘要和有效期。参数变化、审批拒绝或过期均不执行，不以聊天中的一句确认直接放行 |
 | 输出前 | Guardrail 在最终回复或每个可发布流式片段离开服务前检查。需要全文才能判断的策略缓冲完整输出并降级为最终回复；已发送内容无法靠事后脱敏撤销 |
-| 审计 | 记录 allow/deny/approve/redact/limit 等决策与稳定错误分类，使用[审计字段](data-model.md#37-inboxrunoutbox-与-audit)。`latency_ms` 对应题目 latency 的毫秒值，费用或 Trace 尚不可得时明确为空/未知 |
+| 审计 | 记录 allow/deny/approve/redact/limit 等决策与稳定错误分类，使用[审计字段](data-model.md#37-inboxrunoutbox-与-audit)。`latency_ms` 以毫秒记录延迟，费用或 Trace 尚不可得时明确为空/未知 |
 
-上表是治理设计。当前实现为静态身份与 SecretRef entitlement、Tool/Policy 交集、Tool callback 结构化审计和循环上限；用户级 IM 动态授权、预算预占结算、危险操作审批、输出 Guardrail 和持久 Audit Store 尚未实现。现有 Secret 边界及局限见[安全说明](security-and-governance.md)，不因当前实现观测接入扩大治理实现。
+上表是治理设计。当前实现为静态身份与 SecretRef entitlement、Tool/Policy 交集、Tool callback 结构化审计和循环上限；用户级 IM 动态授权、预算预占结算、危险操作审批、输出 Guardrail 和持久 Audit Store 尚未实现。现有 Secret 边界及局限见[安全说明](security-and-governance.md)。
 
 ### 5.7 可观测性
 
-目标设计中 OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Memory 和 Outbox。核心指标包括每租户请求量、并发 Run、模型/Tool/后端延迟、错误率、IM 投递成功率、token、费用和队列等待时间。审计记录至少包含题目指定的 `tenant_id`、`channel`、`user_id`、`session_id`、`agent_name`、`tool_name`、`decision`、`latency`、`error_type`、`cost` 和 `trace_id`。
+目标设计中 OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Memory 和 Outbox。核心指标包括每租户请求量、并发 Run、模型/Tool/后端延迟、错误率、IM 投递成功率、token、费用和队列等待时间。审计记录包含 `tenant_id`、`channel`、`user_id`、`session_id`、`agent_name`、`tool_name`、`decision`、`latency`、`error_type`、`cost` 和 `trace_id`。
 
 | 指标 | 采集点和统计口径 |
 | --- | --- |
@@ -120,7 +120,7 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 
 完整 Trace 为目标设计：受理端创建上下文，将 W3C `traceparent` 随 Inbox/Run/Outbox 持久化，Worker/发送器恢复上下文，Runner、Model、Tool 与存储适配器传递同一 Context；异步派生 Memory 使用父上下文或 Span Link 关联。当前表结构没有持久 Trace 上下文字段。
 
-当前[可选观测](local-deployment.md#观测边界)使用独立 provider，在受理、执行、发送三个阶段生成 Span、次数与耗时，以持久 `request_id` 关联；阶段可能属于不同 Trace，尚未实现跨队列连续父子 Trace、Model/Tool/Session/Memory 细分采集或成本统计。指标标签只用有限阶段、通道、结果类别及静态绑定的内部租户/App；request/user/session 等高基数 ID 不进入指标。观测只采集白名单，上游自动 tracing 保持关闭，具体结果见[验收说明](acceptance.md#验证结果)。
+当前[可选观测](local-deployment.md#观测边界)使用独立 provider，在受理、执行、发送三个阶段生成 Span、次数与耗时，以持久 `request_id` 关联；阶段可能属于不同 Trace，尚未实现跨队列连续父子 Trace、Model/Tool/Session/Memory 细分采集或成本统计。指标标签只用有限阶段、通道、结果类别及静态绑定的内部租户/App；request/user/session 等高基数 ID 不进入指标。观测只采集白名单，上游自动 tracing 保持关闭，具体结果见[实现与验证](acceptance.md#验证结果)。
 
 当前 `trpc.channel.stage.count` 统计阶段处理次数，`trpc.channel.stage.duration` 记录对应毫秒耗时。`execute` 的结果是本次执行决策，不能替代持久 Run 终态；`deliver` 还含发送前跳过和旧目标记录，计算实际投递率时须区分 outcome，不直接用全部阶段次数作分母。启用时 OTel 进程级错误处理器只输出固定诊断，避免 SDK 将 Collector 原文写入日志；它不安装全局 provider，但会影响进程中其他 OTel 错误的诊断详细度，关闭遥测时不安装。
 
@@ -141,27 +141,27 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 - 峰值 20 RPS 时，Worker 数量至少为 `ceil(20 / 4) = 5`，再增加 1 个故障冗余，共 6 个。
 - 每轮平均写入 6 个 Event，则 Session Backend 峰值写 QPS 约 `20 × 6 = 120`，按两倍突发准备 240 QPS。
 - 每轮输入输出合计 4,000 token，20 RPS 时模型消耗约 `80,000 token/s`，必须按租户和模型供应商设置预算与限速。
-- IM 回调按日均峰值系数 10 估算，Inbox 和 Gateway 保留至少两倍突发余量；若提供压测，报告应区分实测结果与这些假设，原题未要求达到示例容量。
+- IM 回调按日均峰值系数 10 估算，Inbox 和 Gateway 保留至少两倍突发余量。以上数值是容量规划假设，不是实测吞吐；部署前需通过压测校准。
 
 ## 7. 预期效果
 
-以下是目标架构的生产效果，未实现部分以设计和限制说明交付。网页、企微和飞书文本链路的实现与真实运行范围见[验收说明](acceptance.md#验证结果)。
+以下描述目标架构的生产能力，其中部分尚未实现。网页、企微和飞书文本链路的当前能力与真实运行范围见[实现与验证](acceptance.md#验证结果)。
 
 1. 两个以上租户可以创建、发布和隔离运行各自 Agent。
-2. 企业微信与飞书完成从入站到回复的全链路演示。
+2. 企业微信与飞书通过统一消息契约完成入站、Agent 执行和回复。
 3. 两个 Worker 无需 sticky session 即可继续同一持久化会话。
-4. Redis、PostgreSQL、PGVector 和对象存储职责清楚，并演示 Session/索引迁移。
+4. Redis、PostgreSQL、PGVector 和对象存储按数据语义分工，Session 和索引按冻结、校验、切换流程迁移。
 5. 重复 IM 消息只产生一个 Run；纯函数 Tool 或具备跨 attempt 业务幂等的 Tool 可保证一次业务副作用，其他 Tool 的未知结果转显式失败处理而不自动重放。
 6. 单次请求可以通过 `trace_id` 查询模型、Tool、存储和回复耗时，通过 `request_id` 查询状态、成本和审计。
 7. Worker 重启、模型超时和后端短暂故障有明确、可测试的恢复行为。
 
 ## 8. 部署与验证
 
-[本地部署](local-deployment.md)提供默认网页、可选持久化、IM 和 Collector 的运行步骤。[验收说明](acceptance.md)给出七项设计映射、代码范围和可复现检查。生产独立 Gateway/Worker、共享后端与租户级配置传播见[节点部署](architecture.md#6-节点部署)。
+[本地部署](local-deployment.md)提供默认网页、可选持久化、IM 和 Collector 的运行步骤。[实现与验证](acceptance.md)列出设计主题、代码范围和可复现检查。生产独立 Gateway/Worker、共享后端与租户级配置传播见[节点部署](architecture.md#6-节点部署)。
 
 ## 9. 主要风险
 
-此表列目标架构的风险与缓解方向，不是功能实施清单。当前参考版本采用的措施、未实施措施及残余限制需分别标明；未来后端、极端故障和平台不提供的强保证不因进入本表而自动增加实现范围。
+下表按触发条件列出风险，区分当前控制措施、残余限制和生产缓解方案。部署时应结合后端能力、故障模型与业务可用性目标，确定监测、降级和恢复策略。
 
 | 风险与触发条件 | 当前边界与残余风险 | 检测/降级与生产缓解方案 |
 | --- | --- | --- |
@@ -178,6 +178,6 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 | Runtime/连接缓存持续增长 | 已有引用计数与关闭顺序；Runtime/Bundle 无完整 TTL/LRU，每租户 Profile 有上限，总租户数仍影响资源量 | 监测缓存数、活跃租约、连接和内存；生产按资源预算淘汰空闲对象，先拒绝新引用再等待活动引用退出 |
 | 遥测导出失败或标签基数失控 | 当前只采集白名单和有限标签，阶段依赖 request_id 关联；进程崩溃可丢未导出记录，指标不是持久账本 | 监测 Collector 队列、导出失败和内存；生产配置采样、保留期和容量，故障不影响业务执行与发送 |
 
-## 10. 交付与验收
+## 10. 相关文档
 
-交付包括方案总稿、架构图、时序图、数据模型、同步和幂等方案、多后端方案、风险清单、运行代码与可复现演示。详细要求到证据的映射见[验收矩阵](acceptance.md)，演示场景和证据采集方式见[本地部署](local-deployment.md)。
+架构图、时序图、数据模型、同步与幂等策略、多后端方案及源码入口见[文档索引](delivery.md)。代码能力与测试记录见[实现与验证](acceptance.md)，运行步骤及状态检查方式见[本地部署](local-deployment.md)。

@@ -2,11 +2,11 @@
 
 ## 1. 当前边界
 
-当前接口用于本地开发和验收最小闭环。控制面默认使用 InMemory Repository，也可通过 `TRPC_SERVICE_STORAGE_PROFILE=postgres` 使用 PostgreSQL。
+Admin API 提供租户、应用、Revision 和 BackendProfile 的配置管理。控制面默认使用 InMemory Repository，也可通过 `TRPC_SERVICE_STORAGE_PROFILE=postgres` 使用 PostgreSQL。
 
 Admin API **要求 Bearer 凭据**，凭据体系与对话面完全独立：admin key 和 chat key 是不同的 Go 类型、不同的认证方法和 `PlatformServer` 上的两个独立字段，因此一个 chat key 送到 Admin 面只会得到 `401`。角色为 `platform_admin` 或 `tenant_admin`（见第 2.1 节）。完整规则见[身份、权限与密钥治理](security-and-governance.md)。
 
-进程仍然只允许绑定回环地址，但理由已经变了：不再是"Admin 未认证"，而是本进程只服务明文 HTTP，可路由的监听地址会把 Admin Bearer token 明文放到网络上；且 demo profile 仍可用公开的开发 chat key 启动。TLS 终止属于外部反向代理。
+进程只允许绑定回环地址。当前服务使用明文 HTTP，可路由监听会使 Admin Bearer token 暴露在网络传输中；demo profile 可使用公开的开发 chat key 启动。TLS 由外部反向代理终止。
 
 本地默认 profile 下，admin key 由 `start.sh` 生成到 `data/admin-api-key`（`0600`），重启复用，脚本只打印路径。下文示例统一使用：
 
@@ -166,7 +166,7 @@ Revision 引用的 `model.secret_ref` 和 `policy_refs` 必须先被**该租户*
 | `POST .../revisions/{id}/publish` | 读出存储的 Revision 之后 | `403 not_entitled` |
 | Runtime 构建 | digest 核验之后，Tool Registry 与 Secret 解析**之前** | `409 revision_unavailable` |
 
-创建时就检查，是为了不让一个 draft 攒着看起来被接受的引用，然后在运维最难判断"是配置错了还是平台错了"的地方失败。Runtime 里 entitlement 先于 Secret 解析，意味着未授权的引用被拒绝时，那个环境变量**根本没有被读取**。
+创建时校验可在保存 draft 前拒绝未授权引用，避免错误配置延迟到发布或运行时才暴露。Runtime 中 entitlement 检查先于 Secret 解析，未授权引用会在读取环境变量前被拒绝。
 
 默认 demo profile 只授权 `demo` 租户使用 `builtin.safe-tools`，**不授权任何 SecretRef**。要让某个租户引用模型 key，需要提供自定义 manifest，示例见 [README 运行真实模型](../README.md#运行真实模型)，规则见[身份、权限与密钥治理](security-and-governance.md#6-租户-entitlement)。
 
@@ -277,7 +277,7 @@ Runtime 的框架 `AppName` 为 `t/{tenant_id}/a/{app_id}`，不包含 Revision�
 
 CORS 预检允许 `Authorization`、`X-Tenant-ID`、`X-Agent-App-ID`、`X-Agent-Revision-ID`、`X-Session-ID`，并向浏览器暴露 `X-Session-ID` 和 `X-Agent-Revision-ID`。预检本身不认证，因为浏览器不会在预检请求上附带凭据。**这一节只适用于对话面**：Admin 面完全不发布 CORS 头，也没有预检分支（见第 2 节）。
 
-## 5. 尚未完成
+## 5. 未实现能力
 
 - 管理操作审计：谁在什么时候创建了租户、发布了哪个 Revision，目前只有 Revision 上的 `created_by` 一个字段，没有独立、不可篡改、可查询的 Audit Store。
 - 静态 API Key 之外的凭据体系：JWT/OIDC、动态 RBAC、轮转、过期、撤销、按 Principal 的配额与限流。Security Manifest 只在启动时读一次，改文件必须重启进程。

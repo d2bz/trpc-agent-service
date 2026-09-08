@@ -4,9 +4,9 @@
 
 当前实现是一把合作型 Run 租约：同一 Session 的其他 Worker 在入口收到 `409 session_busy`，持有者失效后可按 TTL 接管。它不提供存储写入 fencing，无法原子拒绝已在写入的旧 Worker；具体边界见第 4 节。
 
-## 1. 交付范围
+## 1. 模块组成
 
-| 交付物 | 路径 | 说明 |
+| 组件 | 路径 | 说明 |
 | --- | --- | --- |
 | 核心包 | `trpcservice/sessionlease/sessionlease.go`、`lease.go`、`digest.go` | `Coordinator`/`Lease`/`Holder` 接口、共享续约循环、Key 摘要 |
 | 内存参考实现 | `trpcservice/sessionlease/memory.go` | 进程内默认实现，也是契约基线 |
@@ -35,7 +35,7 @@ Key 里只有版本化的定长 SHA-256 摘要。租户、主体、Session ID �
 
 `Acquire(ctx, key)` 里的 `ctx` 就是这次 Run 的生命周期。它结束（客户端断开、进程关闭、Run 正常走完）时，续约立即停止，**锁被留给 TTL 自然过期，而不是被删掉**。协调器 `Close()` 同理。
 
-这不是省事，是必需的：上游 Runner 在 Context 被取消之后，仍然会通过 `context.WithoutCancel` 继续写大约一秒的终态 Event。如果关闭时就把锁删掉，另一个 Worker 会在这一秒里拿到租约并和它并发写同一个 Session。把锁留给 TTL，等于给这段收尾留出它仍然独占的窗口。
+上游 Runner 在 Context 被取消之后，仍然会通过 `context.WithoutCancel` 继续写大约一秒的终态 Event。如果关闭时就把锁删掉，另一个 Worker 会在这一秒里拿到租约并和它并发写同一个 Session。把锁留给 TTL，等于给这段收尾留出它仍然独占的窗口。
 
 只有一种情况会真正删除锁：Run 干净跑完后显式 `Release`。
 
@@ -107,7 +107,7 @@ Redis 脚本返回本版本不认识的值时，也归到未知一类（`ErrUnav
 
 ### 4.1 部署形态
 
-**单实例 Redis 是本次验证过的部署。** 主从切换下，锁 key 可能随着没收到它的副本一起丢失，fence 计数器也可能回退。因此**不宣称**在 failover 下仍然互斥，也**不宣称** fence 在 failover 下仍然单调。需要这条保证的部署得先解决 Redis 侧的问题，不是在这一层加代码能补上的。
+**当前只验证了单实例 Redis 部署。** 主从切换可能丢失尚未复制的锁 key，并使 fence 计数器回退，因此不保证 failover 下的互斥和 fence 单调性。需要这些保证的部署必须采用具备相应一致性语义的协调存储；平台租约层无法弥补后端已确认状态的丢失。
 
 ### 4.2 已知限制
 

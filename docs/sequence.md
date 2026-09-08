@@ -2,7 +2,7 @@
 
 ## 1. 企业微信完整链路
 
-以下图示为生产目标架构，含通用 Worker、Redis 唤醒、Memory 和完整 OTel。当前企微与飞书通过公共 Consumer 接通真实 Runner 和 PostgreSQL Inbox/Run/Outbox；正常单聊证据见[验收说明](acceptance.md#验证结果)。Webhook 的持久受理后 HTTP 确认不能套到企微长连接。
+以下图示为生产目标架构，含通用 Worker、Redis 唤醒、Memory 和完整 OTel。当前企微与飞书通过公共 Consumer 接通真实 Runner 和 PostgreSQL Inbox/Run/Outbox；正常单聊证据见[实现与验证](acceptance.md#验证结果)。Webhook 的持久受理后 HTTP 确认不能套到企微长连接。
 
 当前运行顺序是：受信任连接的单聊文本 → 静态 Binding/用户映射 → Store.Accept 持久受理 → Tenant/Binding 范围内 ClaimNextRun → 共享 Session Run 获取租约、Pin 和 Runtime → MarkRunStarted → Runner → 排空 Event 并筛选最终文本 → Close Handle → FinishRun 原子写终态与一个 Outbox → 最多一次 `finish=true` 回复 → 记录成功/失败/未知。Memory、Redis 通知及完整 OTel 仍为设计；当前没有实时增量、卡片或媒体回复。
 

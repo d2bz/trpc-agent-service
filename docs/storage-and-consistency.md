@@ -80,7 +80,7 @@ type BackendCapabilities struct {
 | Redis | 低延迟、TTL、原子命令 | 内存成本高，复杂查询弱，通知可丢失 | 热 Session、租约、限流、Worker 唤醒 |
 | PostgreSQL/MySQL | 事务、唯一约束、查询和审计能力强 | 写延迟高于 Redis，需维护索引 | 配置、持久 Session、Run、Audit |
 | SQLite | 部署简单 | 多节点和高并发写受限 | 本地单节点 |
-| PGVector | 与 SQL 共用运维体系、事务边界清楚 | 超大规模向量性能有限 | 参赛生产参考实现 |
+| PGVector | 与 SQL 共用运维体系、事务边界清楚 | 超大规模向量性能有限 | 与 PostgreSQL 共用运维体系的向量检索场景 |
 | Qdrant/Milvus | 专用向量检索和水平扩展 | 新增运维组件，元数据事务分离 | 大规模独立向量场景 |
 | S3/COS | 低成本、高耐久、大对象友好 | 不适合频繁小状态更新 | Artifact 和知识源文件 |
 

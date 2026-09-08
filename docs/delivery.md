@@ -1,10 +1,10 @@
-# 交付说明
+# 文档与运行入口
 
-本项目交付完整架构设计与基于 tRPC-Agent-Go 的参考实现。阅读顺序为方案、架构与时序、数据设计、运行指南、验收结果；目标生产能力与当前实现分别标明。
+本项目包含多租户 Agent 平台的架构设计与基于 tRPC-Agent-Go 的参考实现。建议依次阅读平台方案、架构与时序、数据设计、运行指南和验证结果；各文档分别标明目标生产能力与当前实现。
 
-## 八类交付物
+## 架构与源码
 
-| 交付物 | 内容入口 |
+| 主题 | 内容入口 |
 | --- | --- |
 | 架构设计文档 | [平台方案](solution.md)，含租户、拓扑、生命周期、IM、治理、安全、容量与故障恢复 |
 | 系统架构图 | [总体架构](architecture.md#2-系统架构图)，展示 Gateway、Worker、Channel、Storage、治理与 Telemetry |
@@ -13,13 +13,13 @@
 | 同步与幂等策略 | [存储与一致性](storage-and-consistency.md)，含并发、派生数据、入站去重、恢复与迁移 |
 | 多后端方案 | [数据放置](storage-and-consistency.md#2-数据放置)，覆盖 SQL、Redis、向量库、对象存储 |
 | 风险与缓解 | [十二项生产风险](solution.md#9-主要风险)，说明触发条件、当前边界、监测/降级和生产缓解 |
-| GitHub 实现代码 | [参赛仓库](https://github.com/d2bz/trpc-agent-service/tree/feature/d2bz)，分支 `feature/d2bz`；代码入口为 `cmd/trpc-service` 与 `trpcservice` |
+| GitHub 实现代码 | [源码仓库](https://github.com/d2bz/trpc-agent-service/tree/feature/d2bz)，分支 `feature/d2bz`；代码入口为 `cmd/trpc-service` 与 `trpcservice` |
 
 ## 运行与验证
 
 按[本地部署](local-deployment.md)构建并启动，默认网页使用确定性模型，无需外部凭据。通过[IM 接入指南](im-channels.md)可配置企业微信智能机器人和飞书自建应用的单聊文本。
 
-[验收说明](acceptance.md)列出七项题目要求的映射、实现范围、可复现检查与真实消息结果。建议演示网页发送/续聊和版本 Pin，再展示企微、飞书的正常收发及持久 Run/Outbox 状态。平台成功回执不代表用户已读，真实正常路径不替代故障测试。
+[实现与验证](acceptance.md)列出设计主题、代码能力、可复现检查与真实消息结果，覆盖网页发送/续聊、版本 Pin，以及企微、飞书的正常收发和持久 Run/Outbox 状态。平台成功回执不代表用户已读，真实正常路径不替代故障测试。
 
 ## 技术参考
 
@@ -30,4 +30,4 @@
 
 ## 实现边界
 
-参考实现包含多租户配置、Revision、Runtime/Runner、持久 Session、HTTP/SSE、网页、两类 IM 文本、工具权限及可选三阶段观测。Memory/Summary、媒体/卡片、迁移、完整 Trace/成本治理和生产节点编排以具体设计与风险说明交付。示例配置只包含开发占位值，真实密钥由运行者在本地提供。
+参考实现包含多租户配置、Revision、Runtime/Runner、持久 Session、HTTP/SSE、网页、两类 IM 文本、工具权限及可选三阶段观测。Memory/Summary、媒体/卡片、迁移、完整 Trace/成本治理和生产节点编排已有设计及风险说明，尚未实现。示例配置只包含开发占位值，真实密钥由运行者在本地提供。
