@@ -1,145 +1,70 @@
-# 验收矩阵
+# 验收说明
+
+本文将原题设计要求、参考实现和验证范围分别列明。目标架构不代表全部生产能力已经编码；完整风险与缓解方案见[方案](solution.md#9-主要风险)。
 
 ## 原题设计验收
 
-2026-09-07 按[原题](../README.md#验收标准)重新确定交付口径：设计须覆盖完整要求，并提供与设计对应的 GitHub 实现代码；原题明确不要求完整系统，也没有逐功能全部编码的清单。下面七项按设计内容验收，不能由功能实现状态代替。
-
-| 原题项 | 必须说明的内容 | 设计证据入口 | 复核状态 |
-| --- | --- | --- | --- |
-| 1 | 多租户、节点化部署、同步、多后端、IM、治理监控、故障恢复 | [方案](solution.md)、[架构](architecture.md) | 2026-09-07 内容复核通过 |
-| 2 | tenant、agent、binding、session、event、memory、summary、audit 关系 | [数据模型](data-model.md) | 2026-09-07 内容复核通过，已统一账号绑定唯一性 |
-| 3 | 至少两类 IM 的接入差异，包含微信或企微 | [企微与飞书差异](solution.md#55-im-接入差异) | 2026-09-07 内容复核通过，企微已对齐智能机器人长连接 |
-| 4 | 至少三类后端的存储和同步策略 | [存储与一致性](storage-and-consistency.md) | 2026-09-07 内容复核通过，已限定迁移回退条件 |
-| 5 | 完整消息时序及 trace_id 或 request_id 的贯穿方式 | [核心时序](sequence.md) | 2026-09-07 内容复核通过，主图已渲染检查 |
-| 6 | 至少八项生产风险和缓解措施 | [当前十二项风险](solution.md#9-主要风险)、本页已知限制 | 2026-09-07 内容复核通过，含当前边界、检测/降级和缓解方案 |
-| 7 | tRPC-Agent-Go 复用能力与平台新增职责 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) | 2026-09-07 内容复核通过 |
-
-这是项目内部的设计内容复核，不是赛事最终批准，也不表示功能全部实现。[本轮验收记录](verification-2026-09-07.md)列出八类交付物、当前工作树验证和仍未完成的交付事项。
-
-IM 四项说明要求已单独[收口](im-acceptance-closure.md)：消息转换、账号安全、Session 隔离和平台限制均有设计及实现边界。真实企微单聊证据见 I17，追加飞书自建应用长连接单聊的实现和验证见[新切片](feishu-text-slice.md)；早期收口文档中的“飞书暂缓”是当时范围。群聊、增量流、媒体、卡片、撤回、动态 Binding 仍为设计。平台限频数值、回复有效期和补投能力待核实，按风险登记，不因此把下表所有 `partial` 变为当前开发任务。
-
-风险清单应说明触发条件、影响、当前边界、检测或降级、生产缓解方案及残余限制，不要求本版实现全部缓解措施。实际提供的能力仍须兑现明确承诺，并解决其发布阻断问题。
-
-## 设计与实现追踪
-
-以下 A01-A28、D01-D08、F01 及 I01-I17 保留为细化追踪，不是原题要求全部实现的清单。状态按代码/证据完成度记录：`planned` 表示尚无已验收实现，`partial` 表示已有部分实现或验证，`done` 表示该条明确范围所需证据齐备；它们不代表上表设计验收是否通过，也不自动形成开发排期。
-
-2026-09-07 历史完整实验工作树已修复跨租户碰撞测试的 Run ID 夹具，并通过全仓默认 race、vet、构建和 8 项 HTTP/SSE 检查；当时未运行真实 PostgreSQL/Redis 门控集成，证据见[本轮验收记录](verification-2026-09-07.md)。随后提交的网页和企微协议包是前置检查点；企微当前本地执行链路的最终证据单列于 I17。
-
-已选择性纳入的 Store 检查点另有历史证据：在基线 `6e549b1` 的干净快照上只加入 11 个既有文件（净增 6610 行），于 `/tmp/trpc-channel-selection.VKE9k1` 通过全仓默认 race、vet、build 和本地真实 PostgreSQL Store race。该候选不包含原实验的 Worker、Dispatcher、Waker、Scanner 或未提交的 `sessionrun` 修改，范围及命令见[Channel 选择记录](channel-selection.md)。基于 `deeb137` 的[企微文本切片](wecom-text-slice.md)已完成实际 Runner、PostgreSQL 消费链路和启动接线的本地验收；2026-09-07 又完成真实 Bot 正常单聊收发验证，具体证据与范围见 I17。
-
-| ID | 验收要求 | 设计证据 | 代码/测试证据 | 状态 |
-| --- | --- | --- | --- | --- |
-| A01 | 多租户模型与配置 | [数据模型](data-model.md#31-tenant)、[总体架构](architecture.md#4-控制面) | 已实现 Admin API、不可变 Revision、发布/路由和隔离测试；Repository 有内存与 PostgreSQL 两套实现，由 I10 的进程存储 profile 选择；对话面与控制面各有一套互不相交的静态凭据，Admin 按 `platform_admin`/`tenant_admin` 授权，`tenant_admin` 触碰别的租户一律 404 且不触发任何 Repository 调用（见 I14）；JWT/OIDC、动态 RBAC 和凭据轮转待实现 | partial |
-| A02 | Gateway、Worker、Channel、Storage、Admin、Telemetry 节点协作 | [架构图](architecture.md#2-系统架构图) | 待实现多角色启动和 Compose | planned |
-| A03 | 多节点水平扩展与 Session 路由 | [数据面](architecture.md#5-数据面)、[节点部署](architecture.md#6-节点部署) | 已有双 Worker 集成测试：两个独立构建的 Worker 共享一个 PostgreSQL schema 和一个 Redis，经 HTTP 验证同 Session 互斥、异 Session 放行、TTL 接管（见 I11）。多角色节点启动、Compose/K8s 部署与压测仍未实现 | partial |
-| A04 | 无 sticky session 与共享 Session/Memory | [设计结论](architecture.md#1-设计结论)、[并发](storage-and-consistency.md#4-同一-session-并发) | 已有跨 Worker 连续会话测试：第一个 Worker 结束后，第二个 Worker 接着同一段会话继续对话并读到完整历史，不需要 sticky session（见 I11）。Memory/Summary 尚未实现，本项只覆盖 Session | partial |
-| A05 | 配置、数据、工具、日志、密钥隔离 | [设计原则](project-foundation.md#9-不可破坏的设计原则)、[Tool 与 Policy Runtime](tool-policy.md)、[治理](solution.md#56-治理与安全) | 已实现配置仓库与 Runtime 缓存租户隔离；对话面租户与 Session 归属由凭据推导，静态 API Key 只保留 SHA-256 摘要；Revision ToolRefs 经静态 Registry 与 Policy 交集 fail closed，Tool 审计不记录参数/结果/错误正文；模型与 BackendProfile 的 `env:VAR_NAME`、PolicyRef 都必须先被**该租户**的 entitlement 授权，租户之间不能互相引用，任何租户都不能被授权引用持有平台自身凭据的变量或 `TRPC_SERVICE_` 命名空间，未授权引用不会触发环境读取；动态存储 Factory 的错误边界会把解析后的连接值整体脱敏并切断可泄密的 unwrap 链（见 I14、I15、A23）。全链路日志脱敏和生产 Secret Manager 待实现 | partial |
-| A06 | 多租户选择多种后端 | [统一路由](storage-and-consistency.md#1-统一后端路由)、[数据放置](storage-and-consistency.md#2-数据放置) | 已实现租户作用域的不可变 BackendProfile Create/Get/List、内存/PostgreSQL 同契约 Repository、每租户 32 个硬上限，以及 `(tenant, profile)` Router、singleflight 缓存、引用租约和指纹漂移拒绝；生产 Router 与 Admin 共用同一 ProfileRepository，Factory 可按 Profile 动态构建 InMemory/PostgreSQL/Redis Session Bundle，并拒绝不安全的进程组合（见 I15） | partial |
-| A07 | Session/Memory/Summary/Artifact/Knowledge/Audit 存储 | [核心实体](data-model.md#3-核心实体)、[数据放置](storage-and-consistency.md#2-数据放置) | Session 已有 InMemory/PostgreSQL/Redis Adapter、进程默认存储 profile、租户 BackendProfile 和 Storage Router；Bundle 当前只包含实际被 Runtime 消费的 Session，Memory/Summary/Artifact/Knowledge 与持久 Audit Store 尚未实现 | partial |
-| A08 | 同 Session 多节点并发一致性 | [并发方案](storage-and-consistency.md#4-同一-session-并发)、[并发时序](sequence.md#3-同一-session-同时收到两条消息) | 已实现并验证 Run 租约（合作型入口互斥、TTL 接管、失去租约取消 Run，见 I11）。**没有**实现有界队列，也**没有**实现 fencing/CAS 写入准入——上游 `AppendEvent` 无 fence/CAS 入口，过期 Worker 的写入不会被原子拒绝 | partial |
-| A09 | Event/State/Summary 更新顺序 | [更新顺序](storage-and-consistency.md#5-eventstatesummary-和-memory-顺序)、[时序规则](sequence.md#2-关键顺序规则) | 待实现乱序/旧 Summary 测试 | planned |
-| A10 | Memory 跨节点可见性 | [Memory 顺序](storage-and-consistency.md#53-memory) | 待实现双 Worker 可见性测试 | planned |
-| A11 | Redis 到 SQL 迁移 | [Session 迁移](storage-and-consistency.md#71-sessionredis-到-sql) | 待实现迁移 Job 与校验测试 | planned |
-| A12 | 本地到远端向量库迁移 | [向量迁移](storage-and-consistency.md#72-向量库迁移) | 待实现索引重建与切换测试 | planned |
-| A13 | IM 重复投递幂等 | [IM 幂等](storage-and-consistency.md#6-im-消息幂等)、[故障时序](sequence.md#4-worker-故障与重试) | I17 的本地 mock WebSocket + 实际 Runner + PostgreSQL 集成已验证重复 msgid 只受理/执行/发送一次；重建全部 Runtime/Session 对象后再次投递不新增用户轮次。真实 Bot 已验证正常单聊，重复投递仍以本地测试为证据 | partial |
-| A14 | 至少两类 IM 接入差异设计，包含微信体系 | [IM 差异](solution.md#55-im-接入差异) | 企微协议包、I17 本地单进程单绑定链路及真实 Bot 正常单聊已验证。第二类外部 IM 由飞书差异设计覆盖，并追加[自建应用长连接单聊切片](feishu-text-slice.md)；网页 I16 不替代该设计要求 | partial |
-| A15 | IM 到 Runner 与 Event 到回复转换 | [完整时序](sequence.md#1-企业微信完整链路) | [公共文本消费者](../trpcservice/channels/text/consumer.go)经共享 `sessionrun.Start/Run` 执行、排空 Event、持久化最终文本，由适配器发送回复；企微历史本地集成和 I17 真实 Bot 正常单聊均通过，本次提取验证见[扩展切片](im-adapter-extension.md)。[启动接线](../cmd/trpc-service/wecom.go)默认禁用、启用要求 PostgreSQL。发送成功指平台回执，不代表用户已读 | partial |
-| A16 | Webhook、验签、去重、身份映射 | [身份模型](data-model.md#34-channel-binding-与身份映射)、[IM 差异](solution.md#55-im-接入差异) | 真实企微 Go 客户端已收到 subscribe 的 `errcode=0` ACK；静态 Binding 和身份派生已有协议测试，本地真实 PostgreSQL 已验证持久去重及 Tenant/Binding 扫描、认领、恢复隔离，含外部行排序靠前且 LIMIT=1。企微入口不使用 Webhook 验签；飞书长连接的应用/企业校验与回调确认见[新切片](feishu-text-slice.md)，HTTPS Webhook 安全仍为扩展设计 | partial |
-| A17 | 群聊/单聊 Session 规则 | [Session 命名](architecture.md#54-session-命名)、[群聊策略](data-model.md#5-群聊策略) | 单聊 Session 派生的确定性和租户/App/Binding/用户隔离已测试；I17 使用真实 PostgreSQL Session、Pin 和配置 Repository，重建全部 Runtime/Session 对象后历史及 Pin 保留，同 Session 顺序通过。群聊仍为设计，协议包拒绝群聊输入 | partial |
-| A18 | IM 长度、限频、异步、媒体、失败重试 | [IM 差异](solution.md#55-im-接入差异)、[Outbox](storage-and-consistency.md#62-出站) | 本地验证 20480 UTF-8 字节上限及截断、重连、每条终态回复最多一次发送尝试；明确拒绝不重跑 Agent，未知发送保留 duplicate_risk 且不再次发送。真实 Bot 仅验证正常单聊，平台限频及故障行为未实测，群聊、媒体、卡片不在当前范围 | partial |
-| A19 | Plugin/Guardrail/Callback 租户治理 | [Tool 与 Policy Runtime](tool-policy.md)、[治理](solution.md#56-治理与安全) | 已实现静态 Tool Registry、Revision ToolRefs、Policy 白名单交集、未知/重复/越权 fail closed、Tool callback 审计和工具循环上限；租户级 PolicyRef entitlement 已实现，在创建、发布和 Runtime 构建三处由同一个 authorizer 判定（见 I14）；预算、审批、Guardrail 和动态扩展待实现 | partial |
-| A20 | 指标与租户成本 | [可观测性](solution.md#57-可观测性)、[容量估算](solution.md#6-容量估算方法) | 已实现可选企微阶段计数与毫秒耗时，标签限制为静态租户/App、通道、阶段、结果和错误类别；白名单与真实 PostgreSQL 本地集成通过。模型/Tool/后端细分延迟、token 和费用仍为设计，见[观测切片](observability-slice.md) | partial |
-| A21 | 全链路 Trace | [完整时序](sequence.md#1-企业微信完整链路) | 已实现企微 accept/execute/deliver 三阶段独立 Span，通过持久 request_id 关联，重复投递沿用原请求 ID；没有持久 traceparent，Model/Tool/Session/Memory 连续 Trace 仍为设计，见[观测切片](observability-slice.md) | partial |
-| A22 | 审计字段完整 | [Audit 模型](data-model.md#37-inboxrunoutbox-与-audit)、[Tool 审计](tool-policy.md#3-执行与审计) | 已实现 Tool before/after 结构化事件，可信 RunContext 作用域、call ID、成功状态和耗时有字段与泄漏测试；Revision 与 BackendProfile 的 `created_by` 都只来自认证后的 Admin Principal，请求体不能声明该字段。持久化 Audit Store、查询、保留期、管理操作流水与全链路审计待实现 | partial |
-| A23 | 密钥管理和脱敏 | [控制面配置](architecture.md#42-配置传播)、[治理](solution.md#56-治理与安全) | 已实现模型和 BackendProfile `SecretRef` 的 `env:VAR_NAME` 授权后解析、缺失拒绝和错误不泄漏测试；动态存储 Factory 先整体替换解析后的 DSN/URL，再用 `sessionbackend.Scrub` 处理驱动改写的密码片段，替换后不保留原错误链。调用模型上游前还会删除进程环境派生的 `Authorization`、`OpenAI-Organization` 和 `OpenAI-Project` 三个请求头。这些是明确边界上的防护，**不是**进程级 Secret 隔离或全链路脱敏；`base_url` 仍不受 entitlement 约束，生产 Secret Manager、轮转、撤销和审计仍未实现 | partial |
-| A24 | 节点/IM/数据库/模型/Tool 故障恢复 | [故障恢复](solution.md#58-故障恢复)、[故障降级](storage-and-consistency.md#8-故障与降级) | `TestIntegrationRecoveryExecutesOnlyNeverStartedWork` 已在真实 PostgreSQL 验证未启动任务继续、已启动过期任务失败且不进入 Runner、旧连接目标终态失败；不承诺跨连接/跨重启最终送达或完整生产恢复 | partial |
-| A25 | Context、goroutine、Event Channel 排空 | [并发与故障边界](architecture.md#7-并发与故障边界) | 企微消费者取消、Event 排空及关闭次序相关测试通过；`TestWeComFailureStopsTheProcess` 验证通道终止失败触发 HTTP drain 和服务退出。全仓 race 通过，证据范围为本地参考实现 | partial |
-| A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及 Session Revision Pin：发布和回滚都不会改变已开始的会话；`postgres` profile 下 Pin 与控制面同库，重启和多进程都能读到同一个 Pin（见 I10），权重灰度待实现 | partial |
-| A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
-| A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署)、[本地运行](local-deployment.md) | 已验证单进程网页启动/HTTP/SSE/停止、私密环境文件启动及临时 schema 下的 PostgreSQL 启动；已有数据库 Compose 配置和本地 Collector 配置通过校验。多角色、Kubernetes、生产部署与真实 Bot 遥测组合仍为设计或待联调 | partial |
-| D01 | 架构方案，原题建议 2000-4000 字 | [当前方案](solution.md)、[交付入口](delivery.md) | 当前七项设计内容已复核；8 月 27 日 3288 字稿保留为历史版本，当前详细方案明确设计与实现边界 | done |
-| D02 | 系统架构图 | [当前架构图](architecture.md#2-系统架构图) | 9 月 7 日 Mermaid CLI 11.12.0 渲染与视觉检查通过，见[记录](verification-2026-09-07.md#4-实际验证) | done |
-| D03 | 核心时序图 | [当前企微时序](sequence.md#1-企业微信完整链路) | 9 月 7 日长连接目标时序已渲染检查；当前实现不包含图中的全部生产组件 | done |
-| D04 | 数据模型 | [数据模型](data-model.md) | ER 图由 Mermaid CLI 11.12.0 渲染通过；原题允许表结构或 JSON Schema，不要求全部数据库迁移 | partial |
-| D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | Session Run Lease、Revision Pin、Storage Router 的并发与关闭测试已实现；I17 选定的 Inbox/Outbox 本地文本链路已验收，其余原实验未纳入，Memory/Summary 和迁移一致性仍为设计 | partial |
-| D06 | 多后端适配方案 | [后端路由与取舍](storage-and-consistency.md#1-统一后端路由) | Session 三种 Adapter、不可变租户 BackendProfile、生产 Router 和动态 InMemory/PostgreSQL/Redis Factory 已实现；Memory/Knowledge/Artifact 后端与完整能力矩阵仍待实现 | partial |
-| D07 | 至少 8 个风险与缓解 | [当前风险清单](solution.md#9-主要风险) | 12 项已记录并完成复核，含当前边界、残余风险、检测/降级与生产缓解；不要求全部缓解方案实现 | done |
-| D08 | GitHub 实现代码 | [交付版本与发布状态](delivery.md#发布状态) | 29a6b90 的参考实现及复现证据已收口，远端仍为 ab64d81，待推送；原题不要求完整平台功能 | partial |
-| F01 | 明确上游复用与平台新增 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) | 已固定上游依赖并验证 LLMAgent、Runner、Session、OpenAI Server，以及 `model/openai` 的 OpenAI-compatible 模型构造；其余平台职责以设计和明确实现范围分别验收 | partial |
-
-## 阶段性实现证据
-
-| ID | 能力 | 代码证据 | 自动化证据 | 状态 |
-| --- | --- | --- | --- | --- |
-| I01 | 最小 Agent Runtime | `trpcservice/agent/agent.go`、`model.go`：真实 `LLMAgent`、`Runner`、InMemory Session、确定性模型和 OpenAI-compatible 模型工厂，并由 Runtime 自有唯一 OpenAI Adapter | `go test -race ./trpcservice/agent`：多轮 Session、确定性路径、OpenAI-compatible 本地端点、SecretRef、生成参数、环境派生请求头在空和显式 SecretRef 两条路径上均缺席（并有一个反向对照测试证明同样的环境本会产生这三个头）、Adapter→Runner→自有 Session 关闭顺序、并发幂等关闭与错误保留、共享 Session 不被关闭 | partial |
-| I02 | OpenAI-compatible HTTP 服务 | `trpcservice/agent/agent.go`、`trpcservice/agent/model.go`、`trpcservice/web/platform.go`、`cmd/trpc-service/main.go`：健康检查、非流式/SSE、优雅退出与超时后强制 `Close`；Runtime Revision 可选择 OpenAI-compatible 端点 | `go test -race ./trpcservice/web ./cmd/trpc-service ./trpcservice/agent`：健康、普通对话、SSE `[DONE]`、SSE 期间 Runtime 租约保持、Shutdown 失败后强制关闭、本地 OpenAI-compatible SSE 请求和配置参数断言 | partial |
-| I03 | 可构建和启动 | `build.sh`、`start.sh`、`stop.sh`：构建、就绪检查、PID 生命周期 | `./build.sh` 后通过 `/healthz` 和 `/v1/chat/completions` 手工验证 | partial |
-| I04 | 多租户配置与发布 | `trpcservice/tenant/tenant.go`、`repository.go`：Tenant、App、Revision、摘要、发布、固定版本和回滚 | `go test ./trpcservice/tenant`：深拷贝不可变、租户隔离、版本路由、错误路径 | partial |
-| I05 | Runtime 解析与缓存 | `trpcservice/agent/resolver.go`：三元组缓存、singleflight、入缓存前的完整性与身份复核、生命周期租约，Resolver 是 Runtime 及其 Adapter 的唯一所有者 | `go test -race ./trpcservice/agent`：并发单次构建、取消隔离、关闭等待、跨租户缓存隔离、半成品/身份不符 Runtime 被关闭且不入缓存、关闭时释放缓存内资源 | partial |
-| I06 | Admin API 与动态对话 | `trpcservice/web/admin.go`、`platform.go`、`cmd/trpc-service/main.go`：控制面 HTTP、凭据驱动的对话路由、请求期内路由到 Runtime 自有协议适配器和共享 Session | `go test -race ./trpcservice/web`：创建/发布/对话/回滚、跨租户、SSE、CORS、SSE 全程持有 Runtime 租约、Resolver 关闭后返回 `runtime_unavailable` | partial |
-| I07 | 可信 Chat 身份 | `trpcservice/identity/`：Identity/Authenticator、静态 API Key 只存 SHA-256 摘要、`RunContext` 经不可导出 context key 传递；`trpcservice/agent/contextrunner.go`：协议层 `userID`/`sessionID` 被丢弃，作用域与 Runtime 不符则 fail closed | `go test -race ./trpcservice/identity ./trpcservice/agent ./trpcservice/web`：摘要映射与拷贝隔离、未知凭据 fail closed、无 RunContext 拒绝执行、包装器 `Close` 不关闭真实 Runner、认证矩阵 401/403、请求体 `user` 无法进入 Session 键空间 | partial |
-| I08 | Session Revision Pin | `trpcservice/sessiondir/`：`{tenant, app, principal, session, epoch}` 键、单锁 `EnsurePin` 首写即线性化点；`trpcservice/web/platform.go`：查 Pin → 解析候选 → EnsurePin → 落败方释放 Runtime 租约后改用胜出版本 | `go test -race ./trpcservice/sessiondir ./trpcservice/web`：32 并发候选唯一胜出、租户/主体隔离、发布与回滚不改旧 Pin、相同 hint 放行且不同 hint `409`、屏障化并发首轮两侧同版本且 `resolver.Close` 能完成（证明落败的 Runtime 租约已释放） | partial |
-| I09 | 持久化 Session 后端 Spike | `trpcservice/sessionbackend/sessionbackend.go`：`New(Config)` 构造 InMemory/PostgreSQL/Redis 三种 `session.Service`，校验先于会 panic 的上游选项、拒绝会静默回退到 localhost 的空 DSN、对自产错误脱敏连接串口令；`deploy/docker-compose.session.yml` 提供仅监听 `127.0.0.1` 的本地依赖。脱敏逻辑现已导出为 `Scrub(error, string) error`，供 I10 的连接池与迁移错误路径复用。工厂本身不选择后端，进程用哪一个由 I10 决定 | `go test -race ./trpcservice/sessionbackend`（默认不触网）；`TRPC_SERVICE_SESSION_INTEGRATION=1` 下对真实 PostgreSQL 16/Redis 7 验证往返、`GetSession` 缺失返回 `(nil,nil)`、`CreateSession` 二次调用的后端分歧、Delete 后从读路径消失、`Close` 幂等、Redis key 前缀隔离；`Scrub` 的公开测试覆盖 URL userinfo、percent-encoded 拼写、libpq 引号形式、**连接串本身解析失败**（密码含未编码 `/` 时 authority 提前截断，pgx 把 `/` 之前那段当端口原样引用出来的那条路径，已用真实 pgx 输出固定；含单字符片段的按位置脱敏与端口笔误不被误伤两条断言）以及脱敏后不保留 unwrap 链，命令见 [Session 后端 Spike](session-backend.md#7-集成测试的运行方式) | partial |
-| I10 | 进程存储 Profile | `cmd/trpc-service/storage.go`、`main.go`：`TRPC_SERVICE_STORAGE_PROFILE` 一次决定三者去向——`inmemory`（默认，零依赖、不触网）或 `postgres`（`tenant/postgres` Repository + `sessiondir/postgres` Directory 共享一个调用方持有的 pgxpool，上游 `sessionbackend` PostgreSQL Session 服务自持另一个池，同一 DSN 与 schema）。整份配置先校验后建资源；顺序为校验监听地址 → 校验存储配置 → 建池并即刻登记关闭 → 有界 `Ping` → 两族 `Migrate` → 构造组件 → `SeedDemo`；关闭严格逆序并用 `errors.Join` 合并关闭错误。DSN 从不写日志，相关错误全部经 `sessionbackend.Scrub`。`SeedDemo` 改为仅在应用尚无默认 Revision 时发布，重启不再回退已发布版本 | `go test -race ./cmd/trpc-service ./trpcservice/config`（默认不触网）：默认与显式 `inmemory` 均忽略环境里遗留的 DSN/schema、未知 profile（`redis`/`Postgres`/`pg`/带空格）被拒并列出合法值、`postgres` 缺失或空白 DSN 在任何构造器之前失败、非法与超长 schema 同样前置失败、连接串解析错误不泄漏明文或 percent-encoded 口令、启动中途失败按逆序关闭且关闭错误不被吞掉、监听地址拒绝仍先于存储；`TRPC_SERVICE_SESSION_INTEGRATION=1` 下对真实 PostgreSQL 走完整 profile 构造路径：两族迁移表与上游 6 张 Session 表齐备、Pin 与真实会话历史跨"重启"存活且 Pin 指向的 Revision 仍可解析、重启后的 `SeedDemo` 不把已发布的 `echo-v2` 改回 `echo-v1`，命令见 [进程存储 Profile](session-backend.md#8-进程存储-profile) | partial |
-| I11 | Session Run Lease | `trpcservice/sessionlease/`：`Coordinator`/`Lease`/`Holder` 接口与所有后端共用的续约循环——续约的"未知"结果一律按失败处理并重试到 `expires - SafetyMargin`，本进程先于其他 Worker 被允许接管的时刻停止认领；Run 结束、协调器关闭都只停止续约、**把锁留给 TTL** 而不删除，以覆盖上游 Runner 取消后经 `context.WithoutCancel` 继续写约一秒终态 Event 的尾巴；`redis/redis.go` 用三段 Lua 原子完成获取/续约/释放，key 只含版本化定长 SHA-256 摘要（无租户/主体/Session ID 进入 keyspace），释放从不删 fence；获取的确认迟到时**不交付租约**——`Lifetime.HandOut` 在后端回答之后再量一次实际耗时，超出 `TTL - SafetyMargin - RenewInterval` 就按 `ErrUnavailable` 拒绝并把锁 owner-matched 归还（协调器已关闭、调用方 Context 已结束同样如此，三者返回不同错误），因为这道检查在共享层，任何后端都绕不开、也不依赖客户端是否遵守 deadline；`cmd/trpc-service/storage.go`：`TRPC_SERVICE_SESSION_COORDINATION` 独立于存储 profile，`redis` + `inmemory` 存储被**启动拒绝**（共享锁配不共享 Session 是假安全），未知取值同样拒绝而不回退，租约客户端由本进程建且显式设置 `ContextTimeoutEnabled`（否则本包设的 deadline 到不了 socket），关闭严格逆序、协调器先于它借用的客户端；`trpcservice/web/platform.go`：解析 Pin 与 Runtime **之前**取租约（被拒请求不建 Pin、不进 Runtime 缓存），`409 session_busy` + `Retry-After: 2` 与 `503 coordination_unavailable`（不带 `Retry-After`）分开，只有干净跑完才 `Release`，释放失败不改动已写出的响应，fence 不进响应头或响应体 | `go test -race ./trpcservice/sessionlease/... ./trpcservice/web ./cmd/trpc-service`（默认不触网）：共享一致性套件覆盖两个实现（单赢家、TTL 接管、陈旧释放不打扰新持有者、关闭不删锁、fail closed、未确认续约丢租约；内存实现没有"后端不可达"这一失败模式，相关子测试 `t.Skip` 而非伪造通过）、摘要不可伪造与字段隔离、HTTP 层 409/503/释放规则/不发布 fence；迟到确认的三条分支是确定性单测（把 `acquiredAt` 往前推等价于回复迟到，不 sleep、不触网）：旧 `acquiredAt` 被拒且锁回到 store、调用方已取消的迟到成功不交付且锁仍回到 store、预算内的确认照常交付；租约客户端的 `ContextTimeoutEnabled` 只读回工厂建出的 options，`NewClient` 惰性不发包；`TRPC_SERVICE_SESSION_INTEGRATION=1` 下对真实 Redis 验证契约与 key 布局，并用 `cmd/trpc-service/dualworker_test.go` 跑两个独立构建的 Worker（各自存储栈、Resolver、协调器、HTTP server）共享一个 PostgreSQL schema 与一个 Redis：同 Session 被拒、异 Session 放行、跨 Worker 续聊读到完整历史、停止续约后按 TTL 接管且 fence 前进，并经 `openStorage` 验证 `coordination=redis` 真的接到默认 key 前缀。命令见 [Session Run Lease](session-lease.md#63-集成测试的运行方式) | partial |
-| I12 | Revision 驱动的真实模型 | `trpcservice/agent/model.go`：`deterministic` / `openai-compatible` 模型工厂、显式 `base_url`、`env:` SecretRef、生成参数和 ambient header 抑制；`agent.go` 在不可变 Revision 构建 Runtime 时消费这些配置 | `go test -race ./trpcservice/agent` 默认只访问本地 `httptest` 端点并断言 SSE、目标地址、显式凭据、温度和 token 上限；设置 `TRPC_SERVICE_MODEL_INTEGRATION=1` 后可按 [README](../README.md#运行真实模型) 对真实端点执行受门控 smoke test | partial |
-| I13 | Revision Tool/Policy Runtime | `trpcservice/tool/`、`trpcservice/agent/agent.go`、[Tool 与 Policy Runtime](tool-policy.md)：编译期 Registry、两个安全 Function Tool、Policy 交集、结构化 callback 审计和 4 轮上限 | `go test -race -count=1 ./trpcservice/tool ./trpcservice/agent`：schema/确定性/溢出、未知/重复/缺 Policy/越权 fail closed、历史 Revision 无 tools、可信审计与载荷不泄漏；离线真实 OpenAI Adapter SSE 两轮闭环断言第二次模型请求包含按 call ID 关联的 Tool Result，循环模型第 5 轮在执行 Tool 前终止 | partial |
-| I14 | 控制面身份与租户 Entitlement | `trpcservice/identity/admin.go`：`AdminIdentity`/`AdminAuthenticator` 与对话面的 `Identity`/`Authenticator` 是两套独立类型，方法名 `AuthenticateAdmin` 与 `Authenticate` 不同，任何值都不可能同时满足两个接口；`platform_admin` 不带租户且是唯一能创建租户的角色，`tenant_admin` 恰好绑定一个租户并按精确字符串比较；静态 Key 只以 SHA-256 长期保存，admin 下限 32 字符、chat 16 字符。`trpcservice/identity/credential.go`：构造期拒绝无法作为 Bearer 可靠传输的 key（空、首尾空白、含 header 非法字节）。`trpcservice/security/`：严格版本化的 Security Manifest（`version` 必须为 1、上限 256 KiB、仅普通文件、`DisallowUnknownFields`、任意层级的重复成员按大小写折叠拒绝、只允许一个 JSON 值），`tenant_entitlements` 按租户组织 `allowed_secret_refs`/`allowed_policy_refs`，加载期就拒绝把持有平台凭据的变量或 `TRPC_SERVICE_` 命名空间授权给任何租户；`entitlement.go` 的 `RevisionAuthorizer` 是 Runtime 的必填构造参数，无能力的调用方显式传 `DenyCapabilities()`。`trpcservice/web/admin.go`：Admin Bearer 认证排在路由、方法、Content-Type 和 Repository 之前，`adminFirst` 在 `ServeMux` 之前接管整个 `/admin` 子树（避免路径清洗把未认证调用方 301 走），跨租户一律统一 404 且零 Repository 调用，`created_by` 只来自认证后的 Principal，Admin 面不发布任何 CORS 头，所有 POST 必须是 `application/json`。`trpcservice/agent/agent.go`：发布态 Revision 在构建时重算并逐字节比对 `config_digest`，随后按 entitlement → Tool Registry → 模型/Secret 的顺序构建。`cmd/trpc-service/main.go`：`security.Load` 排在存储之前，监听地址校验再排在它之前。`start.sh`：首次启动生成 `data/admin-api-key`（0600），重启复用，只打印路径 | `go test -race -count=1 ./trpcservice/identity ./trpcservice/security ./trpcservice/secretref ./trpcservice/web ./trpcservice/agent ./cmd/trpc-service`：`TestAdminAndChatAuthenticatorsAreDistinctTypes`（两套凭据体系不可互换）、`TestStaticAdminAPIKeyAuthenticatorFailsClosed`、`TestNewStaticAdminAPIKeyAuthenticatorRequiresAStrongKey`、`TestNewStaticAdminAPIKeyAuthenticatorRejectsAnUncarryableKey` 与 `TestNewStaticAPIKeyAuthenticatorRejectsAnUncarryableKey`、`TestAdminIdentityValidatesRoleShape`/`TestAdminIdentityAllowsTenant`；`TestLoadBuildsEveryTrustBoundaryFromTheManifest`、`TestLoadRejectsARepeatedMember` 与 `TestRepeatedMemberFoldingIsNotASCIIOnly`（含 U+212A KELVIN SIGN）、`TestRepeatedMemberErrorsDoNotEchoTheMember`、`TestLoadRejectsAnUnusableManifestFile`、`TestLoadRejectsTwoVariablesHoldingTheSameKey`、`TestLoadAcceptsTwoKeysForOnePrincipal`、`TestLoadRefusesToEntitleATenantToAPlatformVariable`、`TestEntitlementSeparationMatchesExactNamesOnly`、`TestLoadDemoProfile`；`TestAdminAuthenticatesBeforeRouting`、`TestAdminOddPathsAreRefusedBeforeTheRouterAnswers`/`TestAdminOddPathsAreNotRedirectedForAValidCredential`、`TestAdminTenantAdminCannotReachAnotherTenant` 与 `TestAdminCrossTenantRefusalMatchesARealNotFound`（用一个任何方法被调用就让测试失败的 Repository 断言零调用）、`TestAdminTenantCreationIsPlatformAdminOnly`、`TestAdminNeverPublishesCORSHeaders`、`TestAdminWritesRequireJSONContentType`、`TestAdminRevisionAuthorshipComesFromTheCredential`、`TestAdminRefusesUnentitledRevisionsIdentically`、`TestAdminPublishRechecksEntitlement`、`TestAdminPublishStillValidatesTheToolRegistry`；`TestRuntimeReverifiesThePublishedDigest`、`TestRuntimeRefusesTamperingThatSurvivesTheDigest`、`TestRuntimeAuthorizesBeforeItReadsTheEnvironment`、`TestRuntimeResolvesTheCredentialOnlyAfterEntitlement`、`TestRuntimeRefusalDoesNotDistinguishRealPoliciesFromInvented`、`TestRuntimeRequiresAnAuthorizer`、`TestRuntimeRunsCapabilityFreeRevisionsWithNoEntitlement`；`TestRunLoadsSecurityBeforeStorage`、`TestRunValidatesTheListenAddressFirst`。`TestRuntimeDigestDoesNotDefendAgainstAWriterWhoCanRecomputeIt` 是一条把残余风险写死的反向测试，不是通过项。详见[身份、权限与密钥治理](security-and-governance.md) | partial |
-| I15 | StorageBundle 与租户后端路由 | `trpcservice/storagebundle/`、`tenant/postgres/profiles.go`：Profile 只保存 SecretRef，ID 即不可变版本；ProfileRepository 提供 Create/Get/List、每租户 32 个硬上限和存储 fingerprint 复核，无 Update/Delete；Router 按 `(tenant_id, profile_id)` 每次解析并校验 fingerprint，以 singleflight 懒构建、缓存和引用计数管理 Bundle；Factory 在进程约束与租户 entitlement 后解析连接值，以 15 秒默认预算 probe 并构建三种 Session 后端，PostgreSQL 首次建表由目标级 advisory lock 串行化；`cmd/trpc-service` 让 Admin 与 Router 共用 ProfileRepository，并固定 `RuntimeResolver -> Router -> storageStack` 的关闭顺序 | `go test -race -count=1 ./...`：共享 Repository conformance 覆盖不可变、租户隔离、满额与重复 ID 优先级、并发上限、深拷贝、排序和指纹损坏拒绝；Factory 测试覆盖未授权时不读环境、无密码/有密码连接值整体脱敏、probe/constructor 超时、迟到资源清理和单 goroutine abandonment，并用两个模拟 Worker 证明 constructor 返回前不会释放建表锁；`TRPC_SERVICE_SESSION_INTEGRATION=1` 的真实 PostgreSQL/Redis 测试覆盖 Profile 跨重启、动态后端往返与清理 | partial |
-
-## 网页切片验收（2026-09-07）
-
-**I16：网页文本聊天，done。** [内嵌入口](../trpcservice/web/ui.go)、[页面](../trpcservice/web/ui/index.html)和[流式客户端](../trpcservice/web/ui/assets/app.js)复用现有 `/v1/chat/completions`。范围包括发送、SSE、停止、新建/切换对话、Session 续接、App/凭据设置和错误状态；没有改变 Channel、Session Run 或 Admin 的公开契约。
-
-Opus 5 `max` 完成实现及一轮 Review 修复，实际模型标识已核对；Leader 独立审查、运行浏览器并裁决。发布阻断已关闭：隐藏按钮被 CSS 覆盖、未知路径方法状态回归、切换身份后草稿残留、新版浏览器 App ID 正则失效、320px 长标题撑宽网格。原先怀疑的设置 Escape 状态问题未复现，未为该猜想添加实现。
-
-待提交代码树 `3afd1be01a2fdbd2c3348e576be34480f262c3ca` 已经 `git archive` 导出干净快照，排除了所有未提交 Channel/sessionrun 实验。下列检查均在该快照通过，之后仅补验收文档：
-
-| 检查 | 结果 |
+| 验收要求 | 交付材料 |
 | --- | --- |
-| `TRPC_SERVICE_MODEL_INTEGRATION=0 TRPC_SERVICE_SESSION_INTEGRATION=0 go test -race -count=1 -timeout 900s ./...` | 全仓默认测试通过；未启用真实数据库和外部模型门控 |
-| `go vet ./...`、`./build.sh` | 通过 |
-| [浏览器验收脚本](../scripts/verify-web.cjs) | 真实确定性后端发送/续聊；新建/切换会话；仅发送最新消息；UTF-8/SSE 分片；停止和重复提交；401/403/409；提前 EOF；文本安全；凭据/草稿清理；不写浏览器存储，全部通过 |
-| 桌面和手机截图 | Chrome 148 / Playwright 1.62.1；1440×1000、390×844、320×844，长文本与设置无横向溢出，已视觉复查 |
+| 多租户、节点化部署、数据同步、多后端、IM、治理监控和故障恢复 | [方案](solution.md)、[架构](architecture.md) |
+| tenant、agent、binding、session、event、memory、summary、audit 关系 | [数据模型](data-model.md) |
+| 至少两类 IM，包含微信体系 | [企微与飞书差异](solution.md#55-im-接入差异)、[接入指南](im-channels.md) |
+| 至少三类后端的数据放置与同步 | [存储与一致性](storage-and-consistency.md)，覆盖 SQL、Redis、向量库、对象存储 |
+| 完整消息时序与 request_id/trace_id 关联 | [核心消息时序](sequence.md) |
+| 至少八项风险和缓解 | [十二项生产风险](solution.md#9-主要风险) |
+| 框架复用能力与平台新增职责 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) |
 
-浏览器检查需要 Node.js 20+、Playwright 和 Chromium。服务须先按 README 启动；脚本默认连接 `127.0.0.1:18080`，也可传入实际本地地址。独立安装测试依赖不改变应用的无前端构建要求：
+## 参考实现范围
+
+| 已实现能力 | 代码入口与边界 |
+| --- | --- |
+| Tenant/App/Revision、发布/回滚、服务端 Session Pin | [`tenant`](../trpcservice/tenant)、[`sessiondir`](../trpcservice/sessiondir)、[Admin API](admin-api.md)；动态灰度和 Pin 换代未实现 |
+| Runtime、真实 LLMAgent/Runner、HTTP/SSE 与网页 | [`agent`](../trpcservice/agent)、[`web`](../trpcservice/web)、[`sessionrun`](../trpcservice/sessionrun)；支持确定性模型与 OpenAI-compatible 模型 |
+| Session 多后端与跨节点互斥 | [`sessionbackend`](../trpcservice/sessionbackend)、[`storagebundle`](../trpcservice/storagebundle)、[`sessionlease`](../trpcservice/sessionlease)；InMemory/PostgreSQL/Redis，租约不提供存储写入 fencing |
+| 身份、SecretRef/PolicyRef 授权与工具审计 | [安全与治理](security-and-governance.md)、[Tool Policy](tool-policy.md)；静态凭据和结构化工具日志，未实现生产 Secret Manager、预算、审批和持久 Audit |
+| 企微和飞书单聊文本 | [`channels/text`](../trpcservice/channels/text) 共用消费者与 PostgreSQL Store；独立适配器、持久去重、最终回复，详见[接入契约](im-channels.md) |
+| 可选观测与本地部署 | [部署指南](local-deployment.md)；accept/execute/deliver 三阶段 Span、次数和毫秒耗时，按 request_id 关联 |
+
+Memory/Summary、Knowledge/Artifact 路由、在线迁移、群聊、媒体/卡片、动态 Binding、完整连续 Trace、成本治理及多角色生产部署以具体设计交付，未作为已实现能力。架构图与 ER 图中的这些组件同样遵循此边界。
+
+## 验证结果
+
+| 检查 | 已取得的证据 | 适用范围 |
+| --- | --- | --- |
+| 最终功能代码回归 | 2026-09-08，`f6bb709` 对应代码通过全仓 race、vet、build | 默认测试关闭外部模型与存储门控；日期之后的文档整理不改变代码 |
+| PostgreSQL 与 IM 公共链路 | 同日四包集成通过：postgres、wecom、text、feishu | 模拟平台、真实 Runner/Session/Store，验证去重、顺序、隔离、发送失败与保守恢复 |
+| 真实企业微信 | 2026-09-07，构建 `0378175`：1 条 Inbox、Run succeeded/attempt=1、Outbox sent/attempt=1、duplicate_risk=false，明确 errcode=0 | 正常单聊、真实模型与 PostgreSQL；该平台记录早于公共消费者提取，当前代码通过本地集成回归 |
+| 真实飞书 | 2026-09-08，构建 `f6bb709`：2 条 Inbox/Run/Outbox，同一 Principal/Session/Revision；每轮一次执行和发送，均 succeeded/sent、有平台消息 ID、duplicate_risk=false | 官方长连接、真实模型与 PostgreSQL，正常两轮单聊 |
+| 网页与部署 | 2026-09-07，部署提交 `29a6b90`，Go 功能代码同 `f5ed53c`；默认网页 8 项 HTTP/SSE、临时 PostgreSQL schema 启动和 Collector 配置校验通过 | 健康、认证隔离、续聊、发布/回滚保持 Pin；Collector 只验证配置，未联调真实 Bot 遥测，不代表生产部署验收 |
+| 图表 | 系统架构图、核心时序图和 ER 图通过 Mermaid CLI 11.12.0 渲染检查 | 描述目标架构，图中生产能力不等同于代码实现 |
+
+`sent` 表示平台接受回复，不表示用户已读。真实正常收发不证明平台故障恢复；重复投递、拒绝、结果未知和对象重建恢复以本地测试为证据。验证只记录状态、计数和必要版本，不发布用户正文、外部身份、凭据或原始运行日志。
+
+## 复现命令
+
+在项目根目录执行；构建后默认网页无需外部模型或数据库，启动步骤见[本地部署](local-deployment.md)。
 
 ```bash
-npm install --prefix /tmp/trpc-browser-qa playwright@1.62.1
-/tmp/trpc-browser-qa/node_modules/.bin/playwright install chromium
-TRPC_PLAYWRIGHT_MODULE=/tmp/trpc-browser-qa/node_modules/playwright \
-  node scripts/verify-web.cjs http://127.0.0.1:8080
+TRPC_SERVICE_MODEL_INTEGRATION=0 TRPC_SERVICE_SESSION_INTEGRATION=0 \
+  go test -race -count=1 -timeout 900s ./...
+go vet ./...
+go build ./...
 ```
 
-`TRPC_CHROME_EXECUTABLE` 可指定已有 Chrome，`TRPC_WEB_SCREENSHOT_DIR` 可指定截图目录，默认输出到系统临时目录的 `trpc-web-screens`。脚本使用公开 demo chat key 和 QA 假凭据，不读取 `.env.local`、Admin Key 或模型密钥；异常响应由本地假上游提供。
+准备 [Docker 本地数据库](local-deployment.md#可选-postgresql-与企业微信) 后可运行四包集成，使用独立临时 schema，无需真实 Bot 凭据：
 
-风险登记：页面历史和凭据仅在当前页内存中，刷新不恢复；没有历史查询、Markdown、媒体或跨端同步。Stop 仅中断 HTTP，不承诺回滚已发生的服务端操作。浏览器回归脚本为显式运行，尚未接入 CI。企业微信真实收发、真实 PostgreSQL/Redis 门控及外部模型不属于这次网页验收；飞书仍为差异设计。可选优化不进入当前切片。
+```bash
+TRPC_SERVICE_MODEL_INTEGRATION=0 TRPC_SERVICE_SESSION_INTEGRATION=1 \
+  TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_session?sslmode=disable' \
+  go test -race -count=1 -timeout 300s ./trpcservice/channels/postgres \
+  ./trpcservice/channels/wecom ./trpcservice/channels/text ./trpcservice/channels/feishu
+```
 
-## 企微文本切片状态（2026-09-07）
-
-**I17：企微单聊文本执行，done，限于单进程、单绑定链路；真实 Bot 正常单聊已验证。** 范围与验收条件见[切片说明](wecom-text-slice.md)。Consumer 和 `cmd` 接线共享网页使用的 Session Run 服务；本地集成使用 mock WebSocket、实际 Runner 及真实 PostgreSQL Store、Session、Pin 和配置 Repository。真实平台验证仅覆盖下表正常路径，本地去重、拒绝、未知结果与恢复测试不升级为真实平台故障证据。飞书仅保留第二类 IM 差异设计。
-
-| 最终验证证据 | 结果 |
-| --- | --- |
-| Leader：`TRPC_SERVICE_MODEL_INTEGRATION=0 TRPC_SERVICE_SESSION_INTEGRATION=0 go test -race -count=1 -timeout 900s ./...`；Opus：`go build ./...`、`go vet ./...` | 最终代码全部通过，基于 `deeb137` 的独立切片工作树 |
-| Leader：`TRPC_SERVICE_SESSION_INTEGRATION=1 go test -race -count=1 -timeout 180s ./trpcservice/channels/postgres ./trpcservice/channels/wecom` | 真实 PostgreSQL 通过，分别 3.906s / 9.993s；DSN 使用已提交 Compose 的本地开发值 |
-| 本地文本收发、重复投递、Session 顺序、Tenant/Binding 隔离、全部 Runtime/Session 对象重建后的历史与 Pin | 通过；重投不新增用户轮次，见 `wecom/e2e_integration_test.go` 和 `postgres/scope_integration_test.go` |
-| 发送拒绝/未知不重跑、有限恢复、Web 租约等待、UTF-8 截断、取消排空、密钥边界与通道失败触发进程退出 | 通过；未启动任务继续、已启动过期任务不进入 Runner、旧目标失败，均限定为切片约定行为 |
-| 真实 Bot 正常单聊 | 2026-09-07 18:29:00 北京时间，用户手工发送 `17 乘 23`；已验收提交 `0378175` / `4121770` 对应二进制运行于 `localhost:18081`，使用真实 PostgreSQL 和 AIHubMix `gpt-4o-mini`，回复文本含 `391` |
-| 本次真实收发的持久记录与回执 | 对测试绑定过滤后 Inbox 为 1；Run `succeeded`、Attempt 1、ExecutionMillis 2526；Outbox `sent`、Attempt 1、DuplicateRisk false。`sent` 表示平台返回 `errcode=0` ACK，不宣称用户已读；不记录外部账号、用户、请求或消息标识 |
-
-本切片不承诺跨连接重发、跨重启最终送达、已启动任务重放或模型已完成但 Outbox 未提交时的答案重建；读取后落库前仍有已登记窗口。以上恢复边界以切片说明为准，不扩展为完整生产恢复承诺。
-
-## IM 社区扩展切片（2026-09-08）
-
-已完成，范围与证据见[IM 文本适配器扩展](im-adapter-extension.md)。公共文本执行包与企微协议包不互相依赖，企微通过四方法 `TextAdapter` 契约复用执行链路；替代适配器在真实 Runner + PostgreSQL 下验证受理回调返回前已落库、正常回复、去重和发送拒绝不重跑。Leader 的全仓 race、build、vet 及三个相关包的 PostgreSQL 集成均通过。飞书与 Telegram 不作为本切片实现项；I17 的真实 Bot 历史证据不自动升级为本次重构后的真实联调证据。
+PostgreSQL/Redis 后端与双 Worker 的可选验证命令见 [Session 后端](session-backend.md#7-集成测试的运行方式)和 [Session 租约](session-lease.md#6-测试)。真实 Bot 测试只在配置所有者自行发送消息后确认；不能把凭据预检当成收发验证。
 
 ## 已知限制
 
-飞书自建应用长连接单聊参考切片已完成本地验收与[两轮真实正常收发](feishu-text-slice.md#真实单聊验证)，两轮复用同一 Session/Revision，分别一次执行、一次发送且获平台确认；故障与去重仍以本地测试为证据。Fable 5.1 服务恢复后已完成定向审查，最终代码和测试由 Astra 裁决。
-
-这些限制是当前切片有意接受的，不能在验收中被当作已解决：
+以下为当前实现的明确边界，生产采用前应结合[风险清单](solution.md#9-主要风险)评估：
 
 - **合法凭据可以制造无界 Session。** Session 目录与 Session Service 都没有配额、TTL 或 LRU，一个有效 key 可以用无限多的 `X-Session-ID` 无限增长。默认 profile 下耗的是进程内存；`postgres` profile 下耗的是磁盘，且上游默认软删、不回收，只是把失败从 OOM 换成了库涨满。
 - **首轮 OpenAI 历史可以伪造。** 平台只决定会话归属，不校验请求体 `messages`；新 Session 的第一轮可以注入编造的"历史对话"。
@@ -156,7 +81,3 @@ TRPC_PLAYWRIGHT_MODULE=/tmp/trpc-browser-qa/node_modules/playwright \
 - **`config_digest` 是不带密钥的 SHA-256。** 发布态 Revision 在构建 Runtime 时会重算并逐字节比对，绕过 Admin 面直接改库会在下一次构建时被拒；但计算方式公开且无密钥，一个既能改数据行、又能重算指纹的写入方仍可改道。这一条由 `agent.TestRuntimeDigestDoesNotDefendAgainstAWriterWhoCanRecomputeIt` 显式固定，**不能**当作已解决。
 - **两条链路都只是静态 API Key。** 没有 JWT/OIDC，没有动态 RBAC，没有轮转、过期或撤销——撤销一把 key 的唯一手段是改清单并重启进程。Security Manifest 只在启动时读一次，**没有热加载**。没有独立的管理操作审计流水（只有 Revision 上的 `created_by`），没有生产 Secret Manager，没有预算、审批或 Guardrail。
 - **进程仍然只绑定本机地址，且只服务明文 HTTP。** 理由不再是"Admin 未认证"，而是可路由的监听地址会把 Admin Bearer token 明文放上网络；TLS 终止属于外部反向代理。**不能据此认为平台整体达到生产安全标准。**
-
-## 验收使用方式
-
-先复核七项原题设计验收和八类交付物，再验证选入交付的参考实现。只有设计材料也可以满足对应的设计要求，但不能因此宣称功能已实现。功能条目变为 `done` 前须补充其明确范围内的代码路径、测试命令及适用的演示证据；未选中的扩展能力保留现状和风险说明，不以清空 `planned/partial` 为目标。

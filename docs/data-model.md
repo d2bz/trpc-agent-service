@@ -1,6 +1,6 @@
 # 数据模型设计
 
-本文同时描述逻辑设计与当前数据层。企微静态 Binding、单聊键及 PostgreSQL Inbox/Run/Outbox 已接入专用 Consumer 并通过[文本链路验收](wecom-text-slice.md)；动态 Binding 表、群聊、Memory/Summary 和完整 Audit/OTel 仍为设计，不因出现在实体图中而视为已实现。
+本文描述逻辑数据模型及当前数据层。企微与飞书的静态 Binding、单聊键和 PostgreSQL Inbox/Run/Outbox 由公共消费者使用，见[IM 接入](im-channels.md)。动态 Binding 表、群聊、Memory/Summary 和完整 Audit/OTel 仍为设计。
 
 ## 1. 建模原则
 
@@ -170,7 +170,7 @@ accepted → running → succeeded | failed
 
 每次 `accepted -> running` 都原子递增 attempt 并生成新的 `claim_token`；终态和 Outbox 在同一事务内以该 token 做 CAS。`failed` 的 `error_type` 可表达取消、Tool 结果未知或永久执行错误，不增加会破坏最小状态机的旁路状态。
 
-当前 PostgreSQL 实表为 `channel_inbox_messages`、`channel_agent_runs` 和 `channel_outbox_messages`，迁移见 [`channels/postgres/migrate.go`](../trpcservice/channels/postgres/migrate.go)。企微按 msgid 持久去重，以 `first_execution_started_at` 区分从未启动与已启动未知任务；后者即使重新 claim 也只落失败，不再次进入 Runner。按 Tenant/Binding 限定范围的恢复是专用 Consumer 行为，不是原通用 Worker/Transcript 实验。
+当前 PostgreSQL 实表为 `channel_inbox_messages`、`channel_agent_runs` 和 `channel_outbox_messages`，迁移见 [`channels/postgres/migrate.go`](../trpcservice/channels/postgres/migrate.go)。企微按 msgid 持久去重，以 `first_execution_started_at` 区分从未启动与已启动未知任务；后者即使重新 claim 也只落失败，不再次进入 Runner。公共 Consumer 在可信 Tenant/Binding 范围内恢复；未知执行不自动重放。
 
 `outbox_messages` 使用 `UNIQUE (tenant_id, channel_binding_id, idempotency_key)`，记录可恢复的版本化投递目标、消息片段、稳定 `client_message_id`、尝试次数/最大尝试数、`send_token`、发送 deadline、下次重试时间、`duplicate_risk` 和投递结果。目标包含重发所需的真实外部引用，按敏感数据保护，不能只保存不可逆哈希。
 

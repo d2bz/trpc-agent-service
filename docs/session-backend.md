@@ -1,10 +1,8 @@
-# 持久化 Session 后端 Spike
+# Session 后端
 
-本文记录 `trpcservice/sessionbackend` 这一次 Spike 的验证结论。目的只有一个：在写共享 Session 之前，先把上游 PostgreSQL 与 Redis Session 实现的真实行为测出来，把它们与内存实现的语义差异写成事实，而不是等到平台层依赖了某个假设才发现。
+`trpcservice/sessionbackend` 提供 InMemory、PostgreSQL 和 Redis 的上游 Session Service 工厂；`storagebundle` 提供租户 BackendProfile 路由。默认进程 profile 为 InMemory；`postgres` profile 将控制面、Session Pin 和默认 Session 放在同一 PostgreSQL schema，支持持久化和租户动态后端。见 [§8 进程存储 Profile](#8-进程存储-profile)。
 
-**当前状态是 `partial`。** Spike 本身先交付了低层构造函数和测试；之后 `cmd/trpc-service` 接入进程级存储 profile，以及上层 `storagebundle` 的租户 BackendProfile。默认（不设 `TRPC_SERVICE_STORAGE_PROFILE`，或设为 `inmemory`）仍启动 InMemory 控制面、Pin 与默认 Session；设为 `postgres` 时三者一起切到同一个 PostgreSQL schema。只有后者具备持久 Pin，因而可安全运行租户动态 PostgreSQL/Redis Session Profile。见 [§8 进程存储 Profile](#8-进程存储-profile)和[多后端、数据同步与幂等设计](storage-and-consistency.md#1-统一后端路由)。
-
-Redis 不作为整套控制面的进程 profile，但已可通过租户 BackendProfile 启用为 Session 后端；ProfileRepository 与 Pin 仍由进程的 PostgreSQL profile 提供。Redis 的真实往返、动态路由和多 Worker 组合都由门控集成测试覆盖。
+Redis 可以作为租户 Session 后端，但不作为整套控制面的进程 profile；配置与 Pin 仍由 PostgreSQL 提供。能力与一致性取舍见[多后端设计](storage-and-consistency.md)。
 
 ## 1. 交付范围
 
@@ -20,22 +18,16 @@ Redis 不作为整套控制面的进程 profile，但已可通过租户 BackendP
 ## 2. 依赖版本与 Go 版本要求
 
 ```
-trpc.group/trpc-go/trpc-agent-go                 v1.11.2   （核心，原有）
-trpc.group/trpc-go/trpc-agent-go/session/postgres v1.11.0   （新增）
-trpc.group/trpc-go/trpc-agent-go/session/redis    v1.11.0   （新增）
+trpc.group/trpc-go/trpc-agent-go                 v1.11.2   （核心）
+trpc.group/trpc-go/trpc-agent-go/session/postgres v1.11.0   （独立子模块）
+trpc.group/trpc-go/trpc-agent-go/session/redis    v1.11.0   （独立子模块）
 ```
 
 两个 Session 子模块是独立 Go module，各自带入间接依赖 `storage/postgres v0.8.0`、`storage/redis v0.0.3`、`jackc/pgx/v5 v5.7.2`、`redis/go-redis/v9 v9.11.0`。
 
-### 2.1 go directive 被抬到 1.24.1
+### 2.1 Go 工具链下限
 
-本仓库 `go.mod` 的 go directive 从 `1.21` 变为 `1.24.1`。**这不是主动升级，是依赖强制的**：`trpc.group/trpc-go/trpc-agent-go/storage/redis@v0.0.3` 的 `go.mod` 声明 `go 1.24.1`，而 Go 1.21 起 go directive 具有传递约束力——主模块的 go 版本不得低于任何依赖声明的版本，否则 `go build` 直接报错。
-
-影响与取舍：
-
-- **构建工具链下限从 Go 1.21 抬到 Go 1.24.1。** 低于该版本的环境无法构建本仓库，CI 镜像和开发机需要相应更新。本次验证环境为 `go1.25.12 darwin/arm64`。
-- **不能靠回退依赖绕开。** 回退 `storage/redis` 会同时回退 `session/redis`，等于放弃这次要验证的目标；为了保留 1.21 而降级依赖是本末倒置，因此不做。
-- **这是一次单向决定。** 后续引入的任何依赖都不会再把下限降回去，所以文档和 CI 应直接以 1.24.1 为基线。
+Go >= 1.24.1 是依赖约束：`storage/redis@v0.0.3` 声明该 go directive，主模块不能低于依赖的下限。依赖图通过 MVS 选定版本，CI 与部署构建环境使用相同工具链要求。
 
 ## 3. 兼容性验证
 
@@ -86,7 +78,7 @@ session_summaries  app_states  user_states
 
 `WithTablePrefix` 会给每张表加前缀（不以 `_` 结尾时自动补 `_`），`WithSchema` 指定 schema。**schema 必须事先存在**——上游只建表，不建 schema。集成测试使用前缀 `spike`，实测建出 `spike_session_states` 等 6 张表。
 
-这意味着服务账号在首次启动时需要 DDL 权限。生产环境若由迁移工具管理表结构，应改用 `WithSkipDBInit(true)`，但那超出本次 Spike 范围。
+这意味着服务账号在首次启动时需要 DDL 权限。生产环境若由迁移工具管理表结构，应改用 `WithSkipDBInit(true)`，当前工厂保持自动建表行为。
 
 **默认软删。** `softDelete` 默认为 `true`，`DeleteSession` 只写 `deleted_at`。会话从读路径消失（`GetSession` 返回 `(nil, nil)`），但行和事件行都留在库里。实测：集成测试删除 2 个会话后，`spike_session_states` 仍有 2 行（`deleted_at` 均非空），`spike_session_events` 仍有 2 行。**软删的存储不会自己回收**，这是一条容量风险，不是可以忽略的实现细节。
 
@@ -131,34 +123,17 @@ session_summaries  app_states  user_states
 
 因此 `PostgresConfig.validate()` 明确拒绝空白 DSN。Redis 的空 URL 同理被拒绝。
 
-### 5.4 错误脱敏的边界
+### 5.4 错误脱敏
 
-`New` 返回错误前，会把连接串里的密码替换成 `[REDACTED]`——驱动经常把解析失败或拨号失败的连接串原样回显，未处理的错误会把密码写进调用方的日志。实现同时覆盖 URL userinfo 形式（含 percent-encoded 拼写）和 libpq keyword 形式（含单引号包裹的带空格值）。
+`Scrub` 处理完整 DSN 及其中可识别的密码拼写，包括 URL 编码和 libpq 形式。pgx 解析失败可能把未编码 `/` 之前的密码片段误当端口回显，因此不能仅依赖 `url.Parse` 成功或驱动自带脱敏。已知短密码片段按错误中的端口引用位置处理，避免破坏正常诊断文本。
 
-这段逻辑以 `Scrub(err error, connectionString string) error` 导出，因为拿着 DSN 的不只是本包：`cmd/trpc-service` 建连接池、Ping、跑迁移和关闭资源时产生的错误，全部经过同一个 `Scrub`。它是幂等的，重复调用不会二次改写。
+保证与限制：
 
-**pgx 自己的脱敏不够，这一点是这个函数存在的直接原因。** `pgconn.ParseConfigError.Error()` 只脱敏它自己保存的那份连接串副本，而它包着的解析错误是拿原始连接串去解析失败得到的，里面可能带着从原串里切出来的片段。（当前 pinned 的 pgx **不会**把整条原始 DSN 拼进消息——它把 `url.Parse` 的 `*url.Error` 拆到只剩裸消息；早前文档里"回显原文"的说法据此更正。`Scrub` 作为公开 API 仍然覆盖"驱动整条回显 DSN"这种情况，但那是通用契约，不是当前 pgx 的行为。）实测下来真正会漏的是这一条：密码里带一个未编码的 `/`，authority 就在那里截断，本该分隔 userinfo 的 `@` 根本轮不到被看见，解析器把 `/` 之前的那段当成端口原样引用出来——
-
-```
-postgres://user:s3cret/x@host:5432/db
-  -> cannot parse `postgres://user:xxxxxx@host:5432/db`:
-     failed to parse as URL (invalid port ":s3cret" after host)
-```
-
-注意 host 和 port 本身完全合法，是密码让这个串不可解析的，所以「DSN 其它部分写对了」并不构成保护；pgx 把自己那份 userinfo 改写成了 `xxxxxx`，密码照样印了出来。
-
-于是密码不能只靠 `url.Parse` 提取，因为泄漏恰好发生在解析失败的时候。`urlPasswords` 分两条路：能解析的 URL 取 `url.URL.User.Password()`（驱动真正拿去认证的解码后拼写）加上串里写的原始拼写；解析不了、且按 URL 语法的边界（authority 止于第一个 `/`、`?`、`#`，userinfo 止于其中最后一个 `@`）也切不出密码时，才退回保守猜测：取第一个 `:` 到最后一个 `@` 之间的整段，再加上这段里每个不含分隔符的片段——因为被回显的正是重新解析切出来的片段。
-
-**被引用出来的片段可以只有一个字符，所以脱敏分两遍。** 密码是 `p/secret` 时，pgx 报的就是 `invalid port ":p" after host`：全局替换单个 `p` 会把 `parse`、`port`、`host` 一起打烂，但把它留在原地就是凭据片段泄漏，两者都不能接受。所以长度 ≥ 3 的密码走全局子串替换，短于 3 的**按位置**替换——只在 `quotedPortPattern`（`invalid port ":<片段>" after host`，即目前唯一实测会回显密码片段的错误结构）命中的那个位置动手，且只在该片段确实属于本连接串的密码时才动。因此真正的端口笔误（`invalid port ":notaport"`）原样保留，仍然是可用的诊断信息；这条判断由 `TestScrubKeepsAQuotedPortThatIsNotPartOfThePassword` 钉住。
-
-**这个保证的范围必须说清楚，不能夸大：**
-
-- 只覆盖 **交给 `Scrub` 的 error**，且只按渲染出来的文本判断——藏在某个 error 结构体字段里、不出现在 `Error()` 文本中的值，够不着。
-- **不覆盖** 上游或驱动自己写到日志、metrics、trace span 或 stderr 的内容——本包看不到那些路径。
-- 脱敏后的 error 是一个全新 error，**故意不 wrap 原错误**，否则 `errors.Unwrap` 会把密码原样交回去。代价是上游的错误类型无法用 `errors.As` 取出；这是有意的取舍。
-- 只处理密码。用户名、主机、库名照常出现在错误里。
-- 按子串匹配。驱动若把密码改写成本包不认识的形状再打印，只有已知的那一种改写（`quotedPortPattern`）会被按位置脱敏；出现新的改写形状时，需要补一条同样有实验依据的定向规则。
-- `Config.Describe()` 用于日志，只报告连接串"存在/不存在"，从不输出内容。
+- 只处理传入的 error 文本，不能拦截驱动自行输出的日志、metrics、trace 或 stderr。
+- 返回全新错误，不保留可通过 `Unwrap` 找回的原始凭据；相应地不保留驱动错误类型。
+- 低层 Scrub 保护密码，用户名、主机和库名仍可作为诊断信息；上层动态 Factory 还会整体替换连接值。
+- 不认识的驱动改写形式不在既有保证内；已知解析错误由回归测试固定。
+- `Config.Describe()` 只报告连接串存在与否，不输出连接内容。
 
 ### 5.5 Close 所有权
 
@@ -166,40 +141,22 @@ postgres://user:s3cret/x@host:5432/db
 
 两个持久化后端的 `Close` 都用 `sync.Once` 保护并返回 nil，重复调用安全——`TestIntegrationCloseIsIdempotent` 对真实服务验证了这一点。Resolver 的关闭路径依赖这条性质（正常关闭一次、defer 清理再关一次）。
 
-## 6. 尚未实现的部分（准确表述）
+## 6. 一致性边界
 
-这一节的措辞需要格外小心，避免把"计划"写成"已有"。
+Session 后端不提供存储写入 fencing。当前 [Run 租约](session-lease.md)只限制 Run 入口；`Lease.Fence()` 是观测句柄，不参与写入准入。
 
-**当前仓库没有 AppendEvent hook 接入，也没有任何 fencing（写入准入）实现。**
+上游 `WithAppendEventHook` 与实际后端写入不是原子的，当前也未接入该 hook。严格单写者需要 Redis Lua 比较 token 后写入，或 SQL 条件更新；非原子 hook 不能实现过期 writer 的原子拒绝。
 
-Spike 之后交付了一把 Run 租约（`trpcservice/sessionlease`，见 [Session Run Lease](session-lease.md)），但它是**合作型**的：它决定谁被允许进入 Run，不决定谁被允许写。下面这条上游限制正是"为什么只能做到这一步"的原因，本节的结论没有因为租约的到来而改变。
+### 6.1 持久 Session 与配置 Pin 的共同生命周期
 
-上游 PostgreSQL 与 Redis Session 模块确实提供 `WithAppendEventHook` / `WithGetSessionHook` 选项，后续的写入准入检查**计划**经由 `WithAppendEventHook` 接入。但必须记录一个上游层面的限制：
+| 进程 profile | 控制面 | Revision Pin | 默认 Session |
+| --- | --- | --- | --- |
+| `inmemory` | 内存 | 内存 | 内存 |
+| `postgres` | PostgreSQL | 同库持久化 | 同库持久化 |
 
-> **hook 检查与后端写入之间不是原子的。** hook 先执行、通过后才写后端，两步之间没有任何屏障。上游没有提供原子 fence 提交的入口——没有"带 fencing token 的条件写"这类接口。因此 hook 只能做尽力而为的准入检查，**不能**用来实现"只有持有有效租约的 writer 才能写入"这种正确性保证。
+进程不允许只持久化默认 Session 而丢失配置或 Pin。这样重启后不会将旧会话静默绑定到新默认 Revision。租户动态 PostgreSQL/Redis Profile 的真相源和 Pin 仍由进程 PostgreSQL 提供；动态 InMemory 仅适用于明确接受历史易失的单 Worker 组合，多 Worker 组合由 Factory 拒绝。
 
-真正的单写者语义需要在存储层做条件写（例如 Redis Lua 脚本做 token 比较后再写，或 PostgreSQL 用带版本号的条件 UPDATE），这超出上游 Session 接口的能力，必须由平台层自建。本次 Spike 不做，租约切片同样没有做——`Lease.Fence()` 只是观测句柄，不参与写入准入。
-
-同样不在本次 Spike 范围内的能力已由后续切片逐步补齐：PostgreSQL 控制面 Repository、跨进程 Session Directory、Redis 租约、双 Worker 和租户 BackendProfile 已交付（见 [验收矩阵](acceptance.md) 的 I10、I11、I15）；Inbox/Outbox 与真实 IM 接入**仍然没有**实现。
-
-### 6.1 持久 Session 与进程内 Pin 的重启不变量破裂
-
-这是本次 Spike 发现的、必须写进已知限制的组合性问题。
-
-`trpcservice/sessiondir` 的 `MemoryDirectory` 把 Session→Revision 的 Pin 存在进程内存里。一旦 Session 改用 PostgreSQL 或 Redis 持久化，两者的生命周期就不再对齐：
-
-| | 进程重启前 | 进程重启后 |
-| --- | --- | --- |
-| Session 数据（持久后端） | 存在 | **存在** |
-| Revision Pin（内存目录） | 存在 | **丢失** |
-
-结果是：一段旧会话在重启后仍能读到完整历史，但它的 Pin 没了。下一轮对话会走"无 Pin"分支，被重新 Pin 到**当前默认 Revision**。如果期间发布过新版本，这段会话就在用户无感知的情况下换了 Agent 版本——而"发布不改变进行中会话的行为"正是 Pin 机制存在的唯一理由。
-
-**换句话说，Session 持久化会把 Pin 的不变量从"重启即全丢，语义一致"降级为"数据在但 Pin 不在，语义破裂"。** 现在 Session 在内存里，重启后会话和 Pin 一起消失，反而是自洽的；单独把 Session 持久化会打破这个自洽。
-
-**这一格已经由 §8 的进程存储 profile 关掉——只关掉了这一格。** profile 不提供"只持久化 Session"这个选项：三者绑在同一个 DSN 和同一个 schema 上，要么一起在内存里，要么一起在 PostgreSQL 里，上表右列因此无法被配置出来。
-
-多个进程指向同一个 schema 时，控制面与 Pin 是一致的。对同一个会话的并发写入，现在由 Run 租约在**入口**串行化（`TRPC_SERVICE_SESSION_COORDINATION=redis`，见 [Session Run Lease](session-lease.md)）：第二个 Worker 拿不到租约，收到 `409 session_busy`，持有者失效后按 TTL 接管。租户级 Router 与 PostgreSQL/Redis 动态 Session Profile 也已接入生产装配。仍然没有解决的是 fencing/CAS 写入准入和等待队列：Run 租约是合作型互斥，**不是**存储层的写入准入，已经在写的旧 Worker不会被原子拒绝。该限制的当前表述见[验收矩阵](acceptance.md#已知限制)。
+共享同一 schema 的 Worker 使用 Redis 入口租约协调，另一 Worker 收到 `409 session_busy`。TTL 接管不等于存储 fencing；健康续约可无限持有租约，故障转移和旧写入风险见[已知限制](acceptance.md#已知限制)。
 
 ## 7. 集成测试的运行方式
 
@@ -230,13 +187,13 @@ TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_s
 TRPC_SERVICE_REDIS_URL='redis://:trpc-local-dev@127.0.0.1:56379/0' \
 go test -race -timeout 120s ./trpcservice/sessionbackend/...
 
-# 清理（-v 一并删除 named volume）
-docker compose -f deploy/docker-compose.session.yml down -v
+# 无其他使用者时停止依赖，保留数据卷
+docker compose -f deploy/docker-compose.session.yml stop
 ```
 
-Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis），不是 5432/6379：开发机上经常已经跑着真实数据库，把 Spike 绑到真实库上比端口冲突更糟。通过 `TRPC_SERVICE_POSTGRES_PORT`、`TRPC_SERVICE_REDIS_PORT` 覆盖，用户名/密码/库名分别由 `TRPC_SERVICE_POSTGRES_USER`、`TRPC_SERVICE_POSTGRES_PASSWORD`、`TRPC_SERVICE_POSTGRES_DB`、`TRPC_SERVICE_REDIS_PASSWORD` 覆盖。
+Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis），不是 5432/6379：开发机上经常已经跑着真实数据库，避免误连已有业务数据库。通过 `TRPC_SERVICE_POSTGRES_PORT`、`TRPC_SERVICE_REDIS_PORT` 覆盖，用户名/密码/库名分别由 `TRPC_SERVICE_POSTGRES_USER`、`TRPC_SERVICE_POSTGRES_PASSWORD`、`TRPC_SERVICE_POSTGRES_DB`、`TRPC_SERVICE_REDIS_PASSWORD` 覆盖。
 
-> Compose 文件里的 `trpc-local-dev` 是**本地开发占位口令**，为了让 Spike 在空机器上可复现才写进仓库。它不是生产 secret，也不得被当作生产 secret：两个服务都只绑定 `127.0.0.1`，主机之外无法访问。真实部署必须自行通过环境变量提供凭据，绝不能继承这里的默认值。
+> Compose 文件里的 `trpc-local-dev` 是**本地开发占位口令**，用于可复现的本地测试。它不是生产 secret，也不得被当作生产 secret：两个服务都只绑定 `127.0.0.1`，主机之外无法访问。真实部署必须自行通过环境变量提供凭据，绝不能继承这里的默认值。
 
 健康检查两处细节值得留意，都会影响 `up --wait` 的正确性：`pg_isready` 必须带 `-h 127.0.0.1`，因为首次 initdb 期间入口脚本会先起一个只监听 unix socket 的临时服务，走 socket 的探测会过早报告就绪；`redis-cli ping` 必须匹配 `PONG` 而不是只看退出码，因为数据集加载中的 `LOADING` 回复退出码同样是 0。
 
@@ -246,7 +203,7 @@ Compose 默认宿主端口为 **55432**（PostgreSQL）和 **56379**（Redis）�
 
 ### 8.1 一个 profile，不是三个开关
 
-进程要存的三样东西——控制面（租户 / 应用 / Revision）、Session→Revision 的 Pin、会话历史——是一组，不是三个独立选择。§6.1 那张表就是拆开配置的后果：Pin 活过重启但它指向的 Revision 随内存控制面一起没了，等于没有 Pin；反过来 Pin 丢了而会话还在，会话会被静默重新 Pin 到当前默认 Revision。因此 profile 只有一个，三者一起动。
+进程要存的三样东西——控制面（租户 / 应用 / Revision）、Session→Revision 的 Pin、会话历史——是一组，不是三个独立选择。§6.1 的配置组合保证三者生命周期一致：Pin 活过重启但它指向的 Revision 随内存控制面一起没了，等于没有 Pin；反过来 Pin 丢了而会话还在，会话会被静默重新 Pin 到当前默认 Revision。因此 profile 只有一个，三者一起动。
 
 **Redis 不是一个 profile。** 工厂能构造 Redis Session 服务，但仓库里没有 Redis 的控制面 Repository，也没有 Redis 的 Session Directory；把它开出来，开出来的恰好就是上面那个已知会坏的组合。
 

@@ -1,6 +1,6 @@
 # 企业微信智能机器人文本适配器
 
-本包包含企业微信智能机器人长连接协议与 `channels.TextAdapter` 的企微实现。持久消费者位于独立的 `channels/text` 包，将规范消息接入共享 Session Run 服务，并通过适配器回复一条最终文本。范围为单进程、单机器人绑定；2026-09-07 完成一次真实 Bot 单聊、真实模型和 PostgreSQL 的正常收发验证，见[历史验收记录](../../../docs/wecom-text-slice.md#真实单聊验证)。本次职责提取的验证状态见[扩展切片](../../../docs/im-adapter-extension.md)。
+本包包含企业微信智能机器人长连接协议与 `channels.TextAdapter` 的企微实现。持久消费者位于独立的 `channels/text` 包，将规范消息接入共享 Session Run，并回复一条最终文本。配置与社区扩展见 [IM 指南](../../../docs/im-channels.md)，真实正常单聊与当前集成测试范围见[验收说明](../../../docs/acceptance.md#验证结果)。
 
 ## 范围
 
@@ -76,13 +76,13 @@ consumer, err := channeltext.New(channeltext.Config{
 })
 ```
 
-`channeltext` 对应 `trpcservice/channels/text`。`cmd` 同时运行 `client.Run` 和 `consumer.Run`，任一终止时取消另一个并等待退出，再关闭共享资源。详细扩展契约见[社区接入指南](../../../docs/im-adapter-extension.md)。
+`channeltext` 对应 `trpcservice/channels/text`。`cmd` 同时运行 `client.Run` 和 `consumer.Run`，任一终止时取消另一个并等待退出，再关闭共享资源。详细扩展契约见[社区接入指南](../../../docs/im-channels.md#社区接入契约)。
 
 进程接线由 `cmd/trpc-service` 负责。按项目 README 配好 PostgreSQL profile、DSN、schema 和服务凭据后，设置 `TRPC_SERVICE_WECOM_ENABLED=true`，并提供 `TRPC_SERVICE_WECOM_TENANT_ID`、`TRPC_SERVICE_WECOM_APP_ID`、`TRPC_SERVICE_WECOM_BINDING_ID`、`TRPC_SERVICE_WECOM_BOT_ID`。Tenant/App 必须已存在且有已发布 Revision；该 Revision 使用默认 PostgreSQL Session，不能指定独立 BackendProfile。
 
 Bot Secret 只从固定的 `TRPC_SERVICE_WECOM_BOT_SECRET` 读取，由启动代码按精确租户和引用放行，不进入租户 Entitlement。密钥由进程环境提供，不写入聊天、日志或版本库。
 
-最多发送一次最终回复；拒绝、连接目标过期和回执未知都不会重跑 Agent。未知结果记为 `duplicate_risk`，不自动重发。恢复时未启动任务可继续；已启动的未知任务明确失败。连接重建使旧目标失效，不承诺跨重启最终送达。读取消息到落库前仍有丢失窗口，详见[切片说明](../../../docs/wecom-text-slice.md)。
+最多发送一次最终回复；拒绝、连接目标过期和回执未知都不会重跑 Agent。未知结果记为 `duplicate_risk`，不自动重发。恢复时未启动任务可继续；已启动的未知任务明确失败。连接重建使旧目标失效，不承诺跨重启最终送达。读取消息到落库前仍有丢失窗口，详见[恢复边界](../../../docs/im-channels.md#恢复与平台限制)。
 
 ## 凭据与日志
 

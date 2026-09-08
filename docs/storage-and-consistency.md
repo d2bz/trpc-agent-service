@@ -110,7 +110,7 @@ Run Coordinator 使用 Redis Lua 脚本完成：
 
 **没有实现、并且在当前上游接口下做不出来的是用 fencing token 做写入准入。** 上游 `session.Service.AppendEvent` 没有 fence 或 CAS 参数，PostgreSQL/Redis Session 模块的 `WithAppendEventHook` 在写入之前执行、两步之间没有屏障，不是原子的。因此"Session 装饰器把 token 传给 Backend、Backend 原子拒绝落后写入"无法在这一层补出来，**不能宣称过期 Worker 的写入被原子拒绝**，token 目前只是观测句柄。被暂停或分区后在 TTL 内恢复的持有者、以及上游 Runner 取消后仍通过 `context.WithoutCancel` 写约一秒终态 Event 的行为，都不被阻止；取消是尽力而为且最终一致的。
 
-真正的单写者语义需要存储层的条件写（Redis Lua 比对 token 后再写，或 PostgreSQL 带版本号的条件 UPDATE），这超出上游 Session 接口的能力，必须由平台自建，本切片不做。等待队列同样未实现：被拒绝的 Worker 不排队。
+真正的单写者语义需要存储层的条件写（Redis Lua 比对 token 后再写，或 PostgreSQL 带版本号的条件 UPDATE），这超出上游 Session 接口的能力，需由平台扩展实现，当前未接线。等待队列同样未实现：被拒绝的 Worker 不排队。
 
 单实例 Redis 是已验证的部署形态。failover 下锁 key 可能随未同步的副本丢失、fence 可能回退，因此**不宣称** failover 下仍然互斥或 fence 仍然单调。无法接入 fencing/CAS 的上游后端不能宣称网络分区下的线性一致。这一限制必须在 Backend Capabilities 中显式展示。
 

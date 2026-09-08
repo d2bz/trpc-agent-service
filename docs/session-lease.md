@@ -1,8 +1,8 @@
 # Session Run Lease
 
-本文记录 `trpcservice/sessionlease` 这一次切片：多个 Worker 同时收到同一个 Session 的请求时，谁被允许运行，以及**这件事到底保证到什么程度**。
+本文描述 `trpcservice/sessionlease` 的运行契约：同一 Session 的入口互斥、TTL 接管、取消与资源释放。
 
-**当前状态是 `partial`。** 已经交付的是一把合作型的 Run 租约：一个 Session 同时只有一个 Worker 拿到 Run 入口，其余 Worker 在入口被 `409 session_busy` 挡住；持有者崩溃或卡住时，租约按 TTL 过期，另一个 Worker 可以接管。**没有**交付、并且在当前上游接口下**做不出来**的是 enforcement fencing：已经在写的旧 Worker 不会被存储层原子拒绝。第 4 节把这条边界写死。
+当前实现是一把合作型 Run 租约：同一 Session 的其他 Worker 在入口收到 `409 session_busy`，持有者失效后可按 TTL 接管。它不提供存储写入 fencing，无法原子拒绝已在写入的旧 Worker；具体边界见第 4 节。
 
 ## 1. 交付范围
 
@@ -16,7 +16,7 @@
 | HTTP 接入 | `trpcservice/web/platform.go` | 入口获取租约、409/503、派生 Run Context、释放规则 |
 | 双 Worker 证据 | `cmd/trpc-service/dualworker_test.go` | 两个独立构建的 Worker 共用一个 PostgreSQL schema 和一个 Redis |
 
-刻意没有做的：PostgreSQL 租约后端（多一个实现只会多一份要维护的语义，Redis 已经够证明跨进程这一维）、等待队列/Inbox/Outbox、`MaxRunDuration`、后端注册表。fencing token 不进入任何对外 API。
+本模块不包含 PostgreSQL 租约后端、等待队列、Inbox/Outbox 或 `MaxRunDuration`。IM 的持久受理和执行预算由公共文本消费者负责；fencing token 不进入对外 API。
 
 ## 2. 租约是什么
 
@@ -97,7 +97,7 @@ Redis 脚本返回本版本不认识的值时，也归到未知一类（`ErrUnav
 
 > **fence 目前不参与 Session 写入准入。** 上游 `session.Service.AppendEvent` 没有 fence 或 CAS 参数；PostgreSQL/Redis Session 模块的 `WithAppendEventHook` 在写入之前执行，两步之间没有屏障，不是原子的。因此**不能**说"过期 writer 被原子拒绝"，也不能把这套机制叫做 enforcement fencing。
 
-具体地说，下面这些写入仍然会发生，本切片不阻止：
+具体地说，下面这些写入仍然会发生，当前实现不阻止：
 
 - **被暂停或被网络分区的持有者，在 TTL 内恢复后照样写。** 它的租约还没过期，它自己也不知道发生过什么。
 - **Context 被取消后的 Runner 仍然写终态 Event**，通过 `context.WithoutCancel` 持续约一秒。这是上游有意的行为，租约靠"锁留给 TTL 过期"来覆盖这段尾巴，而不是靠拦住它。
@@ -131,7 +131,7 @@ TRPC_SERVICE_REDIS_URL=redis://...                  # 仅 coordination=redis 时
 | --- | --- | --- |
 | `inmemory` | `inmemory` | 默认。单进程，零依赖，`go test ./...` 不触网 |
 | `postgres` | `inmemory` | **合法**：持久化存储上的单 Worker 部署 |
-| `postgres` | `redis` | 多 Worker 部署，本切片的目标形态 |
+| `postgres` | `redis` | 多 Worker 部署，共享持久化部署 |
 | `inmemory` | `redis` | **启动即拒绝** |
 
 最后一行是刻意的：Session 存在各自进程的内存里，此时用一把共享锁去仲裁它们，锁保护的是它根本管不到的状态。**一把共享锁配不共享的 Session 是假安全**，它只会让人以为并发问题解决了。未知的 coordination 取值同样是拒绝而不是回退到默认值。

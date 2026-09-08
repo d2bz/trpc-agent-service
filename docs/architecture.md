@@ -1,8 +1,6 @@
 # 总体架构设计
 
-> 本文描述参赛实现的目标架构和组件边界。它是 8 月 27 日方案文档的详细支撑材料，原始验收要求以仓库根目录 README 为准。
-
-当前已实现网页和企微单聊文本入口：企微使用静态 Binding、串行 Consumer、共享 Session Run 及 PostgreSQL Inbox/Run/Outbox，并已完成[真实正常单聊](wecom-text-slice.md#真实单聊验证)。2026-09-08 的[社区扩展切片](im-adapter-extension.md)将串行执行提取到公共文本包；新增[飞书长连接切片](feishu-text-slice.md)通过同一契约接入，具体实施和验证状态以该记录为准。下文生产拓扑中的 Redis 唤醒、通用 Worker、Memory 和完整 OTel 不代表当前接线；原四项 IM 设计验收见[历史收口记录](im-acceptance-closure.md)，飞书最新状态以新切片为准。
+本文描述目标架构、组件边界与当前接线。网页、企业微信和飞书共享 Session Run；两类 IM 经公共文本消费者使用 PostgreSQL Inbox/Run/Outbox。Redis 唤醒、通用 Worker、Memory 和完整 OTel 属于生产扩展设计。实现范围与验证见[验收说明](acceptance.md)，适配器职责见[IM 指南](im-channels.md)。
 
 ## 1. 设计结论
 
@@ -155,7 +153,7 @@ PostgreSQL 是配置真相源。Worker 使用“通知 + 版本检查”更新�
 
 ### 5.1 统一入站消息
 
-Channel Adapter 校验平台身份并完成 Binding/Principal 解析后，把不同平台消息转换为统一 `InboundEnvelope`。以下为持久输入的核心字段；完整契约及实验边界见 [Channel 输入契约](channel-pipeline.md#2-输入契约)，不是另一个同名 DTO：
+Channel Adapter 校验平台身份并完成 Binding/Principal 解析后，把不同平台消息转换为统一 `InboundEnvelope`。以下为持久输入的核心字段；完整数据类型见 [`channels.InboundEnvelope`](../trpcservice/channels/channels.go)，持久受理与恢复约束见 [IM 指南](im-channels.md#消息转换与持久化)：
 
 ```go
 type InboundEnvelope struct {
@@ -180,11 +178,11 @@ type InboundEnvelope struct {
 | --- | --- |
 | 平台文本 -> 规范输入 | 企微 `body.text.content` 写入 `Message.Text`，`body.msgid` 写入 `ExternalEventID`；`from.userid` 经 Binding 作用域映射为 Principal；回调 `headers.req_id` 保留在受保护的回复目标中 |
 | 规范输入 -> Runner | 公共文本 Consumer claim Run 后调用共享 `sessionrun.Start` 取得 Session/Revision，以 `model.NewUserMessage(Message.Text)` 交给 `Handle.Run`，后者调用真实 `runner.Runner.Run`；企微适配器只受理单聊文本，公共文本入口拒绝附件输入 |
-| Agent Event -> 最终文本 | [`text/reply.go`](../trpcservice/channels/text/reply.go)只取完成且非 partial、无错误、无 Tool 调用的 assistant chat completion；持续排空 Event，后续错误使 Run 失败。Tool 结果、runner completion 和推理字段不作回复。实验 `Hold` / `TranscriptEntry` 对账未纳入当前链路 |
+| Agent Event -> 最终文本 | [`text/reply.go`](../trpcservice/channels/text/reply.go)只取完成且非 partial、无错误、无 Tool 调用的 assistant chat completion；持续排空 Event，后续错误使 Run 失败。Tool 结果、runner completion 和推理字段不作回复 |
 | 文本 -> IM 回复 | 公共层按适配器字节上限与 Store 上限清洗、截断文本，超长追加 `[truncated]`，与 Run 终态原子写入一个 Outbox；企微上限保持 20480 UTF-8 字节，适配器以原回调 `req_id`、稳定 `stream.id`、`finish=true` 最多发送一次，明确 `errcode=0` 回执后记为 sent，不代表用户已读 |
 | 流式和卡片扩展 | 支持时聚合 assistant 文本增量、按通道限频更新同一消息，完成后结束流；卡片只使用已定义模板及受校验字段。不支持时降级为最终纯文本，不能把任意 Event JSON 发给用户；本次企微文本演示不承诺实时增量或卡片 |
 
-当前异步链路由适配器按约定顺序提交规范消息，公共文本 Consumer 的受理回调写 PostgreSQL Inbox/Run；回调成功表示持久受理完成或命中重复。另一串行循环按可信 Tenant/Binding 扫描、执行和发送，本地通知只缩短轮询等待。生产目标使用 Redis Streams Consumer Group 低延迟唤醒；Stream 只携带内部 `tenant_id`、`run_id` 和 W3C `traceparent`，Worker 回查持久记录，不能以 Stream 代替数据真相。该 Redis 唤醒与原通用 Worker/Dispatcher 实验未进入当前运行链路。
+当前异步链路由适配器按约定顺序提交规范消息，公共文本 Consumer 的受理回调写 PostgreSQL Inbox/Run；回调成功表示持久受理完成或命中重复。另一串行循环按可信 Tenant/Binding 扫描、执行和发送，本地通知只缩短轮询等待。生产目标使用 Redis Streams Consumer Group 低延迟唤醒；Stream 只携带内部 `tenant_id`、`run_id` 和 W3C `traceparent`，Worker 回查持久记录，不能以 Stream 代替数据真相。Redis 唤醒和独立 Worker/Dispatcher 尚未接入当前运行链路。
 
 ### 5.2 确定性路由
 
@@ -240,7 +238,7 @@ thread_id = "" when the platform has no explicit thread
 
 当前可运行的参考实现使用 `./build.sh`、`./start.sh` 和 `./stop.sh`，单进程提供 Admin API、HTTP/SSE、Runtime 和 InMemory Session，默认仅监听回环地址，无需外部数据库或模型密钥。Redis/PostgreSQL 的可选集成依赖见 `deploy/docker-compose.session.yml`。
 
-企微和飞书默认关闭；启用时要求 PostgreSQL 进程 profile、静态单机器人绑定及进程默认的持久 Session/Pin。同租户的两个入口使用不同 Binding ID。当前 Consumer 不承诺同一绑定跨 Session 并行；退出先停止连接和消费者，再关闭 Runtime 与数据库，启动和验证方式见[企微文本切片](wecom-text-slice.md)和[飞书文本切片](feishu-text-slice.md)。
+企微和飞书默认关闭；启用时要求 PostgreSQL 进程 profile、静态单机器人绑定及进程默认的持久 Session/Pin。同租户的两个入口使用不同 Binding ID。当前 Consumer 不承诺同一绑定跨 Session 并行；退出先停止连接和消费者，再关闭 Runtime 与数据库，启动方式见[本地部署](local-deployment.md)，验证结果见[验收说明](acceptance.md#验证结果)。
 
 以下为后续多角色部署设计，`--role`、SQLite 和本地 Artifact 未接入当前命令入口：
 
@@ -274,7 +272,7 @@ Gateway 和 Worker 都保持无状态。运行中的 HTTP/SSE 连接只绑定当
 
 ## 7. 并发与故障边界
 
-以下通用 Worker 的并行与重放策略描述生产目标。当前公共文本 Consumer 仍按单绑定串行处理各 Session，只恢复尚未启动的任务；已启动但结果未知的 Run 明确失败，企微旧连接投递目标失败，发送失败不重跑 Agent。没有接入实验 Hold/Transcript 或跨连接补发，详见[切片恢复边界](wecom-text-slice.md#接线与恢复边界)。
+以下通用 Worker 的并行与重放策略描述生产目标。当前公共文本 Consumer 仍按单绑定串行处理各 Session，只恢复尚未启动的任务；已启动但结果未知的 Run 明确失败，企微旧连接投递目标失败，发送失败不重跑 Agent。未实现答案重建和跨连接补发，详见[恢复边界](im-channels.md#恢复与平台限制)。
 
 - 同一 Session 默认串行执行。Run Coordinator 使用 Redis 租约锁，锁值是随机 owner token，由 Worker 续约；失去租约立即取消 `context.Context`，第二个 Worker 在 Run 入口收到 `409 session_busy`。**这把租约是合作型的**：它把并发写者挡在入口，但不阻止已经在运行的写者继续写。获取租约时 `INCR` 出的单调 token 目前只是观测句柄，**不参与 Session 写入准入**——上游 `session.Service.AppendEvent` 没有 fence/CAS 参数，`WithAppendEventHook` 与后端写入之间也不是原子的，因此"装饰器在写入前拒绝落后 token"在当前上游接口下做不出来，不能称为 enforcement fencing。实现与边界见 [Session Run Lease](session-lease.md)。
 - 不同 Session 可并行执行。同一租户和 Agent 还受并发数、token 和费用配额约束。
@@ -332,13 +330,13 @@ return runCtx.Err()
 | Agent Runtime Builder | tRPC-Agent-Go `LLMAgent` + `Runner` | Graph、Chain、Parallel、业务 Agent 或其他模型供应商 |
 | Control Plane / Session Directory | InMemory、PostgreSQL | MySQL、SQLite、Redis 或外部状态服务 |
 | Session / Memory / Knowledge / Artifact | tRPC-Agent-Go 对应 Service | Redis、向量数据库、对象存储和租户级路由实现 |
-| Channel Adapter | `channels.TextAdapter` 与公共文本 Consumer，企业微信参考接线与飞书长连接切片 | 微信客服、公众号、Telegram、Slack 等；群聊、媒体、卡片按平台扩展 |
+| Channel Adapter | `channels.TextAdapter` 与公共文本 Consumer，企业微信与飞书长连接 | 微信客服、公众号、Telegram、Slack 等；群聊、媒体、卡片按平台扩展 |
 | Tool / Policy | 平台白名单和 Guardrail 边界 | MCP Server、业务 Tool、审批和成本策略 |
 | Telemetry | OpenTelemetry | 不同 Trace、Metric、Log 后端 |
 
 接口保持小而稳定。新增能力优先通过独立接口、Options 或 capability 声明实现，避免向已有接口无条件追加方法而破坏所有社区实现。后端不具备事务、CAS、流式或幂等能力时必须显式声明并拒绝不满足前置条件的功能，不能把不同语义伪装成相同实现。
 
-IM 文本扩展的具体契约、生命周期、受理确认、发送结果、接入步骤和验证证据见[适配器扩展指南](im-adapter-extension.md)。公共执行包与平台适配器共同依赖 `channels` 契约，彼此不导入；由 `cmd` 组装。新增通道不需要复制持久消费者或修改 Store/Session Run。该边界只覆盖当前文本链路，不代表已经实现多副本调度或全部平台能力。
+IM 文本扩展的具体契约、生命周期、受理确认、发送结果、接入步骤和验证证据见[适配器扩展指南](im-channels.md#社区接入契约)。公共执行包与平台适配器共同依赖 `channels` 契约，彼此不导入；由 `cmd` 组装。新增通道不需要复制持久消费者或修改 Store/Session Run。该边界只覆盖当前文本链路，不代表已经实现多副本调度或全部平台能力。
 
 ### 9.2 插件实现与验证方式
 

@@ -1,6 +1,6 @@
 # 身份、权限与密钥治理
 
-本文描述当前**已实现**的安全切片：控制面认证、角色模型、Security Manifest、租户 Entitlement 和 Runtime 构建顺序。所有描述以 `trpcservice/identity`、`trpcservice/security`、`trpcservice/secretref`、`trpcservice/web/admin.go`、`trpcservice/agent/agent.go` 和 `start.sh` 的源码与测试为准。第 10 节列出仍未实现的能力，不能在验收中被当作已解决。
+本文描述当前**已实现**的安全机制：控制面认证、角色模型、Security Manifest、租户 Entitlement 和 Runtime 构建顺序。所有描述以 `trpcservice/identity`、`trpcservice/security`、`trpcservice/secretref`、`trpcservice/web/admin.go`、`trpcservice/agent/agent.go` 和 `start.sh` 的源码与测试为准。第 10 节列出仍未实现的能力，不能在验收中被当作已解决。
 
 ## 1. 一句话边界
 
@@ -283,4 +283,4 @@ demo profile 下 `TRPC_SERVICE_ADMIN_API_KEY` 没有默认值，所以 `start.sh
 
 - [Admin API 与动态路由](admin-api.md)：端点、请求示例、路由顺序和错误码。
 - [Tool 与 Policy Runtime](tool-policy.md)：Tool Registry、Policy 交集、工具循环上限和 Tool 审计字段。
-- [验收矩阵](acceptance.md)：A01 / A05 / A19 / A22 / A23 与阶段性证据 I14。
+- [验收说明](acceptance.md)：设计映射、参考实现、验证结果与已知限制。

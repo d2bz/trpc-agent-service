@@ -2,7 +2,7 @@
 
 ## 1. 企业微信完整链路
 
-以下图示保留生产目标架构，含通用 Worker、Redis 唤醒、Memory 和完整 OTel；这些扩展不代表当前接线。当前企微专用 Consumer 已接通真实 Runner 和 PostgreSQL Inbox/Run/Outbox，并完成[真实正常单聊](wecom-text-slice.md#真实单聊验证)。Webhook 的持久受理后 HTTP 确认不能套到企微长连接。
+以下图示为生产目标架构，含通用 Worker、Redis 唤醒、Memory 和完整 OTel。当前企微与飞书通过公共 Consumer 接通真实 Runner 和 PostgreSQL Inbox/Run/Outbox；正常单聊证据见[验收说明](acceptance.md#验证结果)。Webhook 的持久受理后 HTTP 确认不能套到企微长连接。
 
 当前运行顺序是：受信任连接的单聊文本 → 静态 Binding/用户映射 → Store.Accept 持久受理 → Tenant/Binding 范围内 ClaimNextRun → 共享 Session Run 获取租约、Pin 和 Runtime → MarkRunStarted → Runner → 排空 Event 并筛选最终文本 → Close Handle → FinishRun 原子写终态与一个 Outbox → 最多一次 `finish=true` 回复 → 记录成功/失败/未知。Memory、Redis 通知及完整 OTel 仍为设计；当前没有实时增量、卡片或媒体回复。
 
@@ -122,7 +122,7 @@ sequenceDiagram
 
 ## 4. Worker 故障与重试
 
-以下恢复表属于生产目标，含未纳入交付的通用 Worker/Hold/Transcript 对账与 Redis 唤醒。当前企微 Consumer 只在可信 Tenant/Binding 范围内扫描：未启动任务可继续；`FirstExecutionStartedAt` 非空的中断任务明确失败，不重放模型或 Tool；旧连接目标和未知发送终态结束，不承诺跨重启最终送达。本地恢复测试与真实正常单聊证据分别见[企微文本切片](wecom-text-slice.md#验证结果)。
+以下恢复表属于生产目标，包含结果对账和 Redis 唤醒。当前公共 Consumer 只在可信 Tenant/Binding 范围扫描：未启动任务可继续，已启动的中断任务明确失败，不重放模型或 Tool；企微旧连接目标和未知发送终态结束，不承诺跨重启最终送达。恢复策略见 [IM 指南](im-channels.md#恢复与平台限制)。
 
 | 故障点 | 恢复方式 |
 | --- | --- |
