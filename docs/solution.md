@@ -126,6 +126,7 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 
 ### 5.8 故障恢复
 
+- 入口隔离：生产按 Gateway、Worker 和 Channel Binding 划分故障范围，使用独立资源预算、就绪检查和局部重启；共享后端故障仍可能跨入口传播。当前单进程中 IM 消费者终止会连带关闭其他入口，具体边界和恢复规则见[故障隔离设计](architecture.md#63-故障隔离与恢复设计)。
 - Worker 故障：Redis PEL 只认领尚未成功 claim PostgreSQL Run 的唤醒；claim 后由 PostgreSQL deadline 扫描器重置过期 `running` attempt，并重投长期 `accepted` 的 Run。只有显式可重放且具备业务幂等的 Tool 才能自动重试。
 - IM 重试：相同外部事件返回原 `request_id`，不创建第二个 Run。
 - 模型超时：取消 Context，排空 Runner Event Channel，保存终止状态并给出可重试回复。
@@ -166,6 +167,7 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 | 风险与触发条件 | 当前边界与残余风险 | 检测/降级与生产缓解方案 |
 | --- | --- | --- |
 | 同 Session 并发或暂停的旧 Worker 恢复写入 | 已有合作型租约与取消；上游 AppendEvent 无 fence/CAS，不能原子拒绝旧 writer；Redis failover 不在互斥保证内 | 监测续约失败、重叠 Run 与 Event 异常；协调失败拒绝新 Run。严格生产要求需支持写入准入的后端或上游接口 |
+| 单个 IM 消费者终止导致其他入口下线 | 当前同进程 HTTP、Admin API 和其他 IM 会一同停止，影响其服务的全部租户；未提供入口故障隔离，重启不保证未知任务完成 | 监测消费者终止日志、进程退出和队列积压；当前需修正故障并恢复整个进程。生产按角色及 Binding 隔离、局部重启并核对持久任务状态，未知执行不重跑；共享后端故障仍可跨入口传播，见[隔离设计](architecture.md#63-故障隔离与恢复设计) |
 | IM 重复、乱序或落库前进程退出 | 企微 Inbox 持久去重并按同 Session 受理顺序执行/回复，本地集成已验证；长连接未持久化帧仍不保证平台补投 | 监测重复数、连接中断、持久化错误和队列年龄；提示未受理消息重试。生产评估平台回放或持久接收层 |
 | Tool 执行成功但结果未知后重放 | 现有内置 Tool 无业务副作用；企微已启动但结果未知的 Run 明确失败，不自动重跑，不替外部系统提供幂等 | 未知结果转显式失败/人工对账；生产副作用 Tool 需业务操作键和结果查询，不能只依赖模型 tool_call_id |
 | 作用域缺失导致跨租户读写 | 当前配置、Session、Tool 和 Secret 边界有隔离测试；未来向量库/对象存储尚未接入，RLS 未启用 | 拒绝缺失租户与越权请求，监测拒绝事件；生产为向量过滤、对象路径、审计和缓存逐层验证作用域，可加 RLS |
