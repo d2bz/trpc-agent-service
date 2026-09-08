@@ -1,6 +1,6 @@
 # 身份、权限与密钥治理
 
-本文描述当前**已实现**的安全机制：控制面认证、角色模型、Security Manifest、租户 Entitlement 和 Runtime 构建顺序。所有描述以 `trpcservice/identity`、`trpcservice/security`、`trpcservice/secretref`、`trpcservice/web/admin.go`、`trpcservice/agent/agent.go` 和 `start.sh` 的源码与测试为准。未实现能力及其安全影响见第 10 节。
+本文第 1–9 节描述当前**已实现**的安全机制：控制面认证、角色模型、Security Manifest、租户 Entitlement 和 Runtime 构建顺序，以 `trpcservice/identity`、`trpcservice/security`、`trpcservice/secretref`、`trpcservice/web/admin.go`、`trpcservice/agent/agent.go` 和 `start.sh` 的源码与测试为准。未实现能力及其安全影响见第 10 节，生产治理的执行约束见第 11 节。
 
 ## 1. 一句话边界
 
@@ -20,15 +20,15 @@
 | 最短长度 | 16 | 32 |
 | Manifest `purpose` | `chat` | `platform_admin` / `tenant_admin` |
 
-两者是**不同的 Go 类型和不同的方法名**，`PlatformServer` 也用两个独立字段持有。因此"chat key 能不能调 Admin"不是某个 handler 里的一次比较，而是类型系统的结论：没有任何一个值能同时满足两个接口，一个 chat key 送到 Admin 面只会命中 admin 摘要表的 miss，返回 `401`。测试见 `identity.TestAdminAndChatAuthenticatorsAreDistinctTypes` 与 `web.TestAdminAuthenticatesBeforeRouting`。
+两个内置认证器使用不同的 Go 类型和方法名，`PlatformServer` 用独立字段和认证表区分入口。`security.Load` 在 Manifest 和 demo 模式下都拒绝不同凭据条目解析为同一个 key，因此 chat key 不在 Admin 认证表中，访问 Admin 返回 `401`。这是启动配置校验和运行时路由共同提供的保证；Go 类型可以同时实现两个接口，不能仅靠接口类型推出凭据隔离。测试见 `identity.TestAdminAndChatAuthenticatorsAreDistinctTypes` 与 `web.TestAdminAuthenticatesBeforeRouting`。
 
-Admin Key 的下限是 chat 的两倍，这是有意的：一个 chat key 只能和一个租户的一个 App 对话，一个 admin key 能创建租户、发布 Revision，并决定平台执行什么。已有 chat key 的下限不上调（会拒绝正在使用的凭据），admin key 是新的，所以从一开始就定在该在的位置。
+Chat Key 至少 16 个字符，绑定一个租户及其 `allowed_app_ids` 授权的 App 集合。Admin Key 至少 32 个字符，按 `platform_admin` 或 `tenant_admin` 角色允许创建租户或管理相应租户的 App/Revision；长度要求不替代随机性和安全保管。
 
 ### 2.1 凭据的长期存储与可传输性
 
-两个静态认证器都**只长期保存 key 的 SHA-256 摘要**，明文在构造过程中用完即弃：
+两个静态认证器的长期认证表只保存 key 的 SHA-256 摘要：
 
-- 长期 map 里不存在可被内存转储或误打印结构体泄漏的凭据。
+- 误打印认证表不会直接暴露明文 key；环境变量、请求头和构造期间的缓冲仍可能持有明文，Go 字符串也不保证可清零，因此不提供进程内存转储防泄漏保证。
 - 查表按摘要进行，消除了逐字节字符串比较的前缀时间信号。
 
 两个认证器都会在**构造时**拒绝无法可靠作为 Bearer 传输的 key（`identity/credential.go`）：
@@ -279,7 +279,31 @@ demo profile 下 `TRPC_SERVICE_ADMIN_API_KEY` 没有默认值，所以 `start.sh
 - **`config_digest` 是无密钥摘要。** 它防住的是"能写库但没有本二进制"的写者。同时能改行**并重算指纹**的写者可以改掉 `base_url` 并让本进程照常构建——`base_url` 不是可授权能力，没有任何 manifest 字段授予或收回一个 endpoint，所以 digest 是它唯一的防线。这条残余风险以数据库写权限为界，要关闭需要 keyed digest 或对 config 的签名，而不是在构建函数里再加一个检查（`agent.TestRuntimeDigestDoesNotDefendAgainstAWriterWhoCanRecomputeIt`）。
 - **传输安全。** 进程只服务明文 HTTP，因此只能绑定回环地址，且没有绕过开关。TLS 由外部反向代理终止。
 
-## 11. 相关文档
+## 11. 生产治理设计
+
+以下为目标设计，尚未接入当前静态认证、Tool callback 或三阶段遥测。
+
+### 11.1 策略与预算
+
+租户 Policy、IM Principal 对 App 的授权及其版本以 PostgreSQL 为权威源。Run 受理与执行前核对有效授权，Model 计费调用和危险 Tool 执行前再次检查当前版本；Revision 记录的 PolicyRef 不豁免运行期撤销。缓存只加速已验证版本的读取，无法确认版本、授权已撤销或策略库不可用时拒绝新的受控调用。已发出的外部请求不能由撤销追溯取消。
+
+预算使用共享账本，以 `(tenant_id, request_id, model_call_id)` 唯一标识一次逻辑模型调用。Plugin 在第一次外部请求前持久生成调用标识，原子检查租户余额并预占有界费用与 token；同一调用的内部重试复用记录，不重复预占。若重试本身可能再次计费，预占上界必须覆盖全部允许尝试，否则禁止该重试。结束后按各尝试的实际 usage 与价格版本进行一次幂等结算；结果未知时保留预占并对账，不能当作零费用释放。账本不可用时拒绝新的计费调用，不能依赖各 Worker 的本地计数继续放行。
+
+### 11.2 危险操作审批
+
+默认不在活跃 Run 中等待人工审批。Tool 前置检查发现缺少批准时不执行操作，登记待审批记录并结束本轮，排空 Event 后释放 Session 租约。用户完成审批后通过**新的 Run**引用该操作；这不是恢复或重跑原 Run，也不自动把原消息再次交给 Runner。
+
+审批记录绑定 Tenant、请求主体、Tool、规范化参数摘要、业务操作 ID 和有效期；只有同租户且具有该操作审批权限的主体能够批准，并记录批准者与策略版本。消费前重新核对当前授权、参数和期限，以 CAS 将批准从可用变为已消费，且只有成功者能提交业务操作。业务操作 ID 在审批和执行之间保持稳定；若消费后进程退出、提交超时或副作用结果未知，保持已消费状态并查询业务结果或人工对账，不恢复批准、不盲目再次执行。模型不能创建批准或通过改写参数绕过检查。
+
+### 11.3 Secret 与遥测出口
+
+生产 Secret Resolver 使用经过认证的工作负载身份访问 Secret Manager，先验证 Tenant 对 SecretRef 及用途的授权，再获取指定版本的值。凭据只能用于获准的模型、IM 或数据库端点，并结合出站网络策略约束目标。缓存键包含 Tenant、引用和版本；轮转时拒绝新引用旧版本，重建相关 Runtime 并排空旧引用，紧急撤销按策略取消活跃 Run，但不承诺撤回已经发送的请求。
+
+日志、Trace、审计和错误报告在导出前统一执行字段白名单及脱敏，只输出固定错误类别和必要内部关联标识；不直接透传供应商/SDK 原始错误、消息正文、Tool 参数或结果。第三方内部诊断默认关闭，必须启用时经过同一过滤边界。认证、Secret 解析或脱敏失败时拒绝相应调用或丢弃不安全记录并产生固定告警，不能回退输出原文。
+
+Collector 只接受内网中经过工作负载认证的写入，例如 mTLS；遥测查询后端按租户授权过滤，不以客户端传入的 tenant 标签代替鉴权。按租户策略配置采样、保留期、到期删除、队列长度与导出超时，队列满时丢弃遥测并告警。遥测可用性不决定业务执行结果，费用与审批事实仍保存在权威账本中。
+
+## 12. 相关文档
 
 - [Admin API 与动态路由](admin-api.md)：端点、请求示例、路由顺序和错误码。
 - [Tool 与 Policy Runtime](tool-policy.md)：Tool Registry、Policy 交集、工具循环上限和 Tool 审计字段。

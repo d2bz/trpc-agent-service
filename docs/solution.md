@@ -44,11 +44,11 @@
 
 ### 5.2 Agent 生命周期
 
-Agent App 是稳定业务身份；Agent Revision 是模型、Prompt、Tool、Skill、Knowledge、Policy 和后端引用的不可变快照。Worker 按 `(tenant, app, revision)` 懒加载并缓存 `Agent + Runner`，每次请求只创建新的 Invocation。新版本生成新对象，旧版本等待活动 Run 结束后安全淘汰。灰度时同一 Session 默认固定 Revision，避免前后两轮 Prompt 或 Tool 集合变化；紧急安全回滚可主动使 Pin 失效。Session 不绑定进程内对象，因此 Worker 重启后可恢复。
+Agent App 是稳定业务身份；Agent Revision 是模型、Prompt、Tool、Skill、Knowledge、Policy 和后端引用的不可变快照。Worker 按 `(tenant, app, revision)` 懒加载并缓存 `Agent + Runner`，每次请求只创建新的 Invocation。新版本生成新对象，旧版本等待活动 Run 结束后安全淘汰。灰度时同一 Session 默认固定 Revision，避免前后两轮 Prompt 或 Tool 集合变化；生产紧急回滚先阻断受影响 Revision，经明确操作建立新的 Session epoch，不静默修改旧 Pin，具体见[发布与 Pin 生命周期](architecture.md#41-agent-发布模型)。Session 不绑定进程内对象，因此 Worker 重启后可恢复。
 
 ### 5.3 无状态多节点
 
-不使用节点级 sticky session。所有 Worker 都能读取共享配置和 Session。同一 Session 默认串行执行：Redis 租约在 Run 入口做合作型互斥，第二个 Worker 收到 `409 session_busy`，失去租约立即取消 Run；持有者崩溃时租约按 TTL 过期，另一个 Worker 接管。租约同时产出的单调 token 只用于观测，**不参与写入准入**——上游 `AppendEvent` 没有 fence/CAS 入口，因此过期 Worker 的写入不会被后端原子拒绝，取消是尽力而为且最终一致的（见 [Session Run Lease](session-lease.md)）。不同 Session 并行执行，并受租户并发、token 和费用配额控制。
+不使用节点级 sticky session。所有 Worker 都能读取共享配置和 Session。同一 Session 默认串行执行：Redis 租约在 Run 入口做合作型互斥，HTTP 冲突返回 `409 session_busy`，生产异步 IM 按[持久延后规则](storage-and-consistency.md#61-入站)重新调度；失去租约立即取消 Run，持有者崩溃时租约按 TTL 过期，其他 Worker 仅接手符合恢复条件的任务。租约同时产出的单调 token 只用于观测，**不参与写入准入**——上游 `AppendEvent` 没有 fence/CAS 入口，因此过期 Worker 的写入不会被后端原子拒绝，取消是尽力而为且最终一致的（见 [Session Run Lease](session-lease.md)）。不同 Session 可并行执行；租户并发、token 和费用配额属于生产治理设计。
 
 ### 5.4 多后端与一致性
 
@@ -104,7 +104,7 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 | 输出前 | Guardrail 在最终回复或每个可发布流式片段离开服务前检查。需要全文才能判断的策略缓冲完整输出并降级为最终回复；已发送内容无法靠事后脱敏撤销 |
 | 审计 | 记录 allow/deny/approve/redact/limit 等决策与稳定错误分类，使用[审计字段](data-model.md#37-inboxrunoutbox-与-audit)。`latency_ms` 以毫秒记录延迟，费用或 Trace 尚不可得时明确为空/未知 |
 
-上表是治理设计。当前实现为静态身份与 SecretRef entitlement、Tool/Policy 交集、Tool callback 结构化审计和循环上限；用户级 IM 动态授权、预算预占结算、危险操作审批、输出 Guardrail 和持久 Audit Store 尚未实现。现有 Secret 边界及局限见[安全说明](security-and-governance.md)。
+上表是治理设计。策略权威来源、预算调用键和未知费用结算、审批期间结束 Run 及一次性消费规则见[生产治理执行约束](security-and-governance.md#11-生产治理设计)。当前实现为静态身份与 SecretRef entitlement、Tool/Policy 交集、Tool callback 结构化审计和循环上限；用户级 IM 动态授权、预算预占结算、危险操作审批、输出 Guardrail 和持久 Audit Store 尚未实现。
 
 ### 5.7 可观测性
 
@@ -124,12 +124,15 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 
 当前 `trpc.channel.stage.count` 统计阶段处理次数，`trpc.channel.stage.duration` 记录对应毫秒耗时。`execute` 的结果是本次执行决策，不能替代持久 Run 终态；`deliver` 还含发送前跳过和旧目标记录，计算实际投递率时须区分 outcome，不直接用全部阶段次数作分母。启用时 OTel 进程级错误处理器只输出固定诊断，避免 SDK 将 Collector 原文写入日志；它不安装全局 provider，但会影响进程中其他 OTel 错误的诊断详细度，关闭遥测时不安装。
 
+生产 Collector 使用内网认证写入与租户授权查询，按策略配置保留期、采样和有界导出队列；Secret 解析、第三方诊断及统一脱敏出口的约束见[Secret 与遥测出口](security-and-governance.md#113-secret-与遥测出口)。这些生产管控尚未实现，本地 debug Collector 不提供相同保证。
+
 ### 5.8 故障恢复
 
 - 入口隔离：生产按 Gateway、Worker 和 Channel Binding 划分故障范围，使用独立资源预算、就绪检查和局部重启；共享后端故障仍可能跨入口传播。当前单进程中 IM 消费者终止会连带关闭其他入口，具体边界和恢复规则见[故障隔离设计](architecture.md#63-故障隔离与恢复设计)。
-- Worker 故障：Redis PEL 只认领尚未成功 claim PostgreSQL Run 的唤醒；claim 后由 PostgreSQL deadline 扫描器重置过期 `running` attempt，并重投长期 `accepted` 的 Run。只有显式可重放且具备业务幂等的 Tool 才能自动重试。
+- Worker 故障：生产 Redis PEL 只认领尚未成功 claim PostgreSQL Run 的唤醒；claim 后由 PostgreSQL deadline 扫描器分类恢复。未启动任务可重排，已启动未知任务不自动重跑；只有能证明结果完整且属于本次执行时，才从持久 Event 重建回复。具体前提见[故障时序](sequence.md#4-worker-故障与重试)。
 - IM 重试：相同外部事件返回原 `request_id`，不创建第二个 Run。
-- 模型超时：取消 Context，排空 Runner Event Channel，保存终止状态并给出可重试回复。
+- 模型超时：取消 Context，排空 Runner Event Channel，保存终止状态并给出明确失败；若已有副作用或执行结果未知，不提示用户盲目重试。
+- Tool 失败：区分参数错误、权限拒绝、已确认临时故障、必需/可选工具及结果未知；有界重试和降级条件见[生产失败策略](tool-policy.md#31-生产失败策略)。
 - 数据库故障：有界重试；不能把生产 Session 静默切到 InMemory。
 - Memory/Knowledge 故障：按 Agent 策略降级并在 Trace 和回复元数据中标识。
 - 灰度与回滚：Run 开始时固定 Revision，回滚只改变新请求路由。
@@ -172,10 +175,10 @@ Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检
 | Tool 执行成功但结果未知后重放 | 现有内置 Tool 无业务副作用；企微已启动但结果未知的 Run 明确失败，不自动重跑，不替外部系统提供幂等 | 未知结果转显式失败/人工对账；生产副作用 Tool 需业务操作键和结果查询，不能只依赖模型 tool_call_id |
 | 作用域缺失导致跨租户读写 | 当前配置、Session、Tool 和 Secret 边界有隔离测试；未来向量库/对象存储尚未接入，RLS 未启用 | 拒绝缺失租户与越权请求，监测拒绝事件；生产为向量过滤、对象路径、审计和缓存逐层验证作用域，可加 RLS |
 | Worker 崩溃或 Outbox 未提交 | 企微要求持久 Session/Pin；未启动任务可恢复，已启动未知任务失败，尚无最终答案重建；HTTP 默认 InMemory 重启丢失 | 监测 Run 超期和未投递结果；生产按持久 Event 对账、attempt CAS 与 Outbox 恢复，禁止盲目重跑未知副作用 |
-| Summary/Memory 旧任务晚到 | 目前为设计，未提供派生存储；不可宣称已有版本检查 | 记录输入 Event 边界与索引延迟；旧版本丢弃/保留历史，可从源 Event 重建，用户可选择等待写后可见 |
-| 迁移切换后回退到旧源库 | 当前无迁移 Job；目标已有新写入时旧源不再完整 | 冻结 Session 并校验 Event ID、数量与摘要；写入未知时停止切换，对账补齐后回切，不允许静默回退 |
-| 慢模型/Tool 占满执行资源 | 有 Context 取消、Event 排空与 Tool 循环上限；企微有持久执行预算，当前单消费者串行，无租户预算或断路器 | 监测活跃 Run、耗时和取消后残留；生产增加分级超时、配额、舱壁和告警，后端故障不降级为易失存储 |
-| Secret 被日志、错误或上游地址带出 | 已有 SecretRef entitlement 与明确错误边界脱敏；base_url 无出站白名单，环境变量不是进程隔离，配置摘要不是签名 | 限制管理与出站网络权限，审计目标域名与授权变更；生产增加 Secret Manager、轮转及敏感日志检测 |
+| Summary/Memory 旧任务晚到或查询仍不可见 | 目前未提供派生存储；可见延迟同时受任务积压、索引和缓存影响，Upsert 不等于跨节点可检索 | 监测来源版本、任务年龄和查询水位；旧任务拒绝覆盖新版本，漏登可补扫。强模式须等待索引并校验读版本，不支持或超时则明确失败，见[可见性设计](storage-and-consistency.md#53-memory) |
+| 迁移切换后仍读旧后端或回退旧索引 | 当前无迁移路由与 Job；Runtime 固定 Bundle，旧源或旧索引在新增、修改、删除后可能不再完整 | 生产先具备按 Session 目录及索引版本的读路由，再冻结、排空、复制和校验；监测目录版本及查询差异。回退前确认同一数据快照，否则追平或停止回退，见[迁移设计](storage-and-consistency.md#7-后端迁移) |
+| 慢模型/Tool 或人工审批占满执行资源 | 有 Context 取消、Event 排空与 Tool 循环上限；企微有持久执行预算，当前单消费者串行，无租户预算、审批或断路器 | 监测活跃 Run、预占余额、等待年龄与取消残留；生产设置配额和分级超时，审批等待前结束 Run，预算账本不可用时拒绝新计费调用。未知费用仍需对账，后端故障不降级为易失存储 |
+| Secret 被日志、错误或上游地址带出 | 已有 SecretRef entitlement 与明确错误边界脱敏；base_url 无出站白名单，环境变量不是进程隔离，配置摘要不是签名 | 限制管理与出站权限，审计目标域名和授权变更，监测敏感日志；生产 Resolver、轮转与脱敏出口见[安全设计](security-and-governance.md#113-secret-与遥测出口)，撤销不追回已外发数据 |
 | IM 限流、发送超时或旧 req_id 失效 | 企微正常发送获真实 ACK；拒绝/未知/旧目标由本地测试验证，每条最终回复最多一次尝试，无完整限流器和最终送达保证 | 监测投递年龄、回执超时和 duplicate_risk；生产按平台能力决定配额、条件退避及对账，失效目标停止发送，发送失败不重跑 Agent |
 | Runtime/连接缓存持续增长 | 已有引用计数与关闭顺序；Runtime/Bundle 无完整 TTL/LRU，每租户 Profile 有上限，总租户数仍影响资源量 | 监测缓存数、活跃租约、连接和内存；生产按资源预算淘汰空闲对象，先拒绝新引用再等待活动引用退出 |
 | 遥测导出失败或标签基数失控 | 当前只采集白名单和有限标签，阶段依赖 request_id 关联；进程崩溃可丢未导出记录，指标不是持久账本 | 监测 Collector 队列、导出失败和内存；生产配置采样、保留期和容量，故障不影响业务执行与发送 |

@@ -68,6 +68,21 @@ tool, tool_call_id, phase, success, duration_ms, scope_valid
 
 租户、应用、主体、Session 和 Revision 只从可信 `identity.RunContext` 获取。审计结构不包含 arguments、result 或 error 文本；sink panic 被隔离，不会把日志故障变成 Tool 故障。开始时间通过每个 Tool 调用自己的 `context.Context` 传到 after callback，同名并发调用不会互相覆盖。
 
+### 3.1 生产失败策略
+
+以下分类由 Tool 包装层和策略执行器决定，尚未实现完整分类器。模型不能自行把拒绝或未知结果改成可重试，所有重试和参数修正共享当前 Run 的 deadline、工具轮数及调用预算。
+
+| 失败类别 | 下一动作与用户结果 |
+| --- | --- |
+| 参数校验失败，尚未执行 | 返回脱敏的字段错误；策略允许时最多让模型修正一次，仍失败则结束该操作 |
+| 身份、Policy 或审批拒绝 | 不执行，拒绝该操作并结束本轮；不允许模型换措辞或重复调用绕过拒绝 |
+| 已确认的临时依赖失败 | 仅在可证明未发生副作用，或业务系统支持稳定操作键去重时，在剩余 deadline 内最多重试一次；复用同一业务操作 ID |
+| 必需 Tool 已知失败或重试耗尽 | 默认结束 Run 并返回明确失败；不能生成成功结果或虚构业务状态 |
+| 显式标记为可选的 Tool 已知失败 | 策略允许时使用已有可信结果生成降级回复，明确缺失信息；不把可选策略套到必需操作 |
+| 超时或副作用结果未知 | 停止执行并记录未知，进入结果查询或人工对账；不自动重试 Tool 或重跑 Agent |
+
+审批不跨人工等待持有 Session 租约，具体消费规则见[生产治理设计](security-and-governance.md#112-危险操作审批)。当前内置 Tool、循环上限和审计回调的实现边界仍以下文为准。
+
 ## 4. 验证
 
 默认测试完全离线：本地 `httptest` OpenAI-compatible 上游在第一轮返回两个 `tool_calls`，第二轮检查框架回传的 assistant tool calls 和 `role=tool` 结果，再返回最终文本。测试从真实 OpenAI HTTP Adapter 的 `stream:true` SSE 路径断言最终响应，因此不是直接调用函数的伪链路。

@@ -102,9 +102,9 @@ Run Coordinator 使用 Redis Lua 脚本完成：
 1. `SET key owner_token NX PX lease_ttl` 获取租约。
 2. 获取租约时同时 `INCR` Session fence，得到单调 token。
 3. Worker 定期比较 owner token 后续约；续约的"未知"结果一律按失败处理，重试到安全边界后判定失去租约。
-4. 失去租约立刻取消 Run Context，并停止后续 Tool 与存储操作。
+4. 失去租约时取消 Run Context；协作方应停止后续操作，但取消不提供对 Tool 副作用或后端写入的原子阻止。
 5. 释放时只允许 owner token 匹配者删除锁，并且从不删除 fence 计数器。
-6. Run 结束或进程关闭时**不**删除锁，留给 TTL 过期，覆盖被取消 Runner 的收尾写入。
+6. 正常完成并排空 Event 后显式释放租约；请求取消、失租或关闭导致的异常收尾不主动删除锁，等待 TTL 过期，为取消后的写入保留缓冲时间，但不提供存储 fencing。
 
 **已实现的是第 1-6 步，并且它是一把合作型租约。**它把并发写者挡在 Run 入口：第二个 Worker 收到 `409 session_busy`，持有者失效后按 TTL 接管。实现见 [Session Run Lease](session-lease.md)。
 
@@ -128,7 +128,7 @@ idempotency_key = request_id + stable_operation_id
 
 ### 5.1 Event 与 State
 
-Runner 是一次 Invocation 内的事件顺序来源。Worker 只使用一个事件消费者，按收到顺序处理并持久化。`StateDelta` 必须通过 Session Backend 的 `AppendEvent` 语义与对应 Event 一起提交；不能先更新 State 再单独追加 Event。
+Runner 是一次 Invocation 内的事件顺序来源，并通过 Session Service 持久化 Event。Worker 只使用一个事件消费者，按收到顺序转发或收集结果，不把 Runner 已提交的 Event 再次追加。`StateDelta` 必须通过 Session Backend 的 `AppendEvent` 语义与对应 Event 一起提交；不能先更新 State 再单独追加 Event。
 
 PostgreSQL 后端使用事务同时更新 Session State 和插入 Event。Redis 后端使用原子操作维护 Session 数据。平台装饰器负责租户键校验、Telemetry 和审计，不绕开上游 Service 直接拼接后端命令。**装饰器不做租约检查**：上游 `AppendEvent` 没有 fence/CAS 入口，`WithAppendEventHook` 与写入之间不是原子的，在这里"检查租约"只会产生一层看着像准入控制、实际拦不住任何东西的代码（见 [§4.1](#41-默认规则)）。
 
@@ -144,9 +144,11 @@ session_id + filter_key + source_end_sequence + summary_version
 
 ### 5.3 Memory
 
-Memory 从已完成 Session/Run 的稳定 Event 中异步提取。Memory 写入 Outbox 使用 `(tenant_id, source_event_id, extractor_version)` 作为幂等键。成功提交后发布失效通知；其他 Worker 的 Memory 查询缓存使用短 TTL，因此在通知丢失时仍会最终看到新记忆。
+Memory 从已提交的稳定 Event 中提取。生产使用独立的 `derived_jobs` 表，以 `(tenant_id, job_kind, source_event_id, processor_version)` 去重，由后台任务生成 Memory/Summary；不复用必须绑定 IM 账号的回复 Outbox。Event 与派生任务不跨后端强行组成事务，后台按已完成 Run 的 Event 边界补扫漏登任务。任务记录来源边界、处理版本、状态和重试进度，失败不回滚原始 Event。
 
-强制“下一请求必须看见上一请求的新 Memory”的 Agent，可以在 Run 完成前同步等待 Memory Upsert；默认模式采用最终一致以降低响应延迟。
+默认模式为最终一致：Memory 提交并完成索引后发布失效通知，查询缓存使用短 TTL；可见延迟同时取决于任务积压、索引完成和缓存过期，不能只用缓存 TTL 给出上界。
+
+要求写后可检索的模式仅对明确支持该能力的后端启用：取得已提交 Event 边界后主动登记派生任务，不等待已完成 Run 的后台补扫；返回本轮成功前，等待提取、Upsert 和查询索引达到本轮来源版本。后续强读查询权威版本并绕过旧缓存及延迟副本，或验证缓存和索引水位不低于该版本。Upsert 成功本身不代表索引已可查询。后端无法证明水位时拒绝启用此模式；等待超时返回明确的未就绪结果，不静默降级成成功。可检索不保证每次相似度查询都会选中该记忆。以上派生任务与强读模式均未实现。
 
 ## 6. IM 消息幂等
 
@@ -162,7 +164,15 @@ PostgreSQL `UNIQUE (tenant_id, channel_binding_id, external_event_id)` 是唯一
 
 重复请求返回原 `request_id` 和已受理状态，不创建新 Run。没有稳定事件 ID 的平台，使用平台建议字段组成规范字符串后计算摘要，并记录碰撞与误判风险。
 
-首次 Inbox/Run 事务提交后，将 `run_id + traceparent` 投递到 Redis Streams。Consumer Group 的 PEL 只恢复 Worker 尚未成功 claim PostgreSQL Run 的唤醒；claim 成功后即 XACK。PostgreSQL 扫描器负责把 deadline 已过的 `running` attempt 重置为 `accepted`，并按 `last_dispatched_at` 重新投递长期 `accepted` 的 Run，包括曾成功 XADD 但通知丢失或被裁剪的情况。所有终态更新都以本 attempt 的 `claim_token` 做 CAS，旧 Worker 的迟到结果不得覆盖新 attempt。
+生产设计在首次 Inbox/Run 事务提交后，将 `run_id + traceparent` 投递到 Redis Streams。Consumer Group 的 PEL 只恢复 Worker 尚未成功 claim PostgreSQL Run 的唤醒；claim 成功后即 XACK。PostgreSQL 扫描器对 deadline 已过的 `running` attempt 分类恢复：确认未启动执行的才重排，已启动而结果未知的转对账或显式失败；并按 `last_dispatched_at` 重新投递长期 `accepted` 的 Run，包括曾成功 XADD 但通知丢失或被裁剪的情况。所有终态更新都以本 attempt 的 `claim_token` 做 CAS，旧 Worker 的迟到结果不得覆盖新 attempt。当前 SQL 回收可先将过期行置为 `accepted`，但公共消费者会检查持久执行开始标记并拒绝再次运行已启动任务，不能把回收状态等同于允许重跑。
+
+生产调度按以下规则组合租约、配额和顺序，尚未接入当前公共消费者：
+
+- Stream 按租户分区，调度器按租户轮转并限制待处理量；SQL 扫描同样携带租户作用域和条数上限，避免单个租户占满执行资源。
+- 只有同 Session 中 `accept_sequence` 最小的非终态 Run 才能 claim；同时检查 `status=accepted`、已到 `next_attempt_at`、Session 非 `migrating`，并取得租户执行额度和 Session 租约。不能用 Stream 到达顺序代替 SQL 中的受理顺序。
+- claim 前因租约忙、额度不足或前序未完成而暂缓时，条件更新仍为 `accepted` 的 Run，记录有上限的退避时间并清除已派发标记；提交成功后才能 XACK。此时没有 claim token，不调用仅适用于已认领 Run 的 Yield，也不消耗执行次数；已取得的额度或租约随本次未执行调度释放。
+- claim 成功后才 XACK；若已 claim 却尚未启动且必须让出，按 claim token Yield 并记录下一次可尝试时间。已经开始执行的未知任务不回到普通执行队列，恢复规则见[时序](sequence.md#4-worker-故障与重试)。
+- 前序完成或额度释放可以发送通知降低等待；后台每秒扫描到期且可执行的持久记录补发通知，通知丢失不丢任务。数据库状态更新未确认时不 ACK，由 PEL 和持久扫描共同恢复。排队超过租户配置的期限转显式失败，不能无限等待。
 
 ### 6.2 出站
 
@@ -185,12 +195,14 @@ planned → snapshotting → syncing → verifying → cutover → draining → 
 
 ### 7.1 Session：Redis 到 SQL
 
+迁移的前提是生产侧具备按 Session 路由的 `session.Service` 装饰器。新 Session 将 Revision 的默认 Profile 解析成具名、不可变的 Profile 写入目录；已存在 Session 的 `backend_profile_id` 优先于 Revision 默认值，迁移不改变 `pinned_revision_id`。每次 Run 在取得运行权后读取目录状态及 `storage_version`，拒绝 `migrating`，并固定本轮的目标 Bundle 租约直到 Event 排空。Runtime 仍按 `(tenant, app, revision)` 缓存 Agent 配置，但持有的是路由 Service，不能永久绑定某个 Session 的旧数据库；后端租约由本轮 Run 释放。当前 Runtime 直接持有构建时 Bundle，目录也没有迁移路由，因此不能仅更新一列就启用下述迁移。
+
 1. 新建目标 Backend Profile，验证连通性和能力。
-2. 新 Session 先切到目标后端；存量 Session 按批次迁移。
-3. 对单个 Session 获取运行租约并标记 `migrating`。
+2. 发布引用目标 Profile 的新 Revision，使新 Session 初始化到目标；存量 Session 保持原 Revision Pin，按批次迁移。
+3. 对单个 Session 获取运行权，条件标记 `migrating` 并停止该 Session 新 Run；等待活动 Run、派生写入和其他在途写入排空。
 4. 从源后端读取 State、Event 和 Summary 快照，按稳定 Event ID 幂等写入目标。
 5. 比较 Event 数量、摘要和抽样内容校验和。
-6. 原子更新 Session 目录中的 `backend_profile_id`。
+6. 在目录事务中校验原 `storage_version` 和 `migrating` 状态，原子更新 `backend_profile_id`、递增版本并恢复 `active`。下一 Run 重读目录后只能取得目标 Bundle，不回退旧 Runtime 的后端。
 7. 进入观察期。只有目标尚无新增写入、所有在途写入已停止且源目标校验一致时才允许切回源后端。一旦目标已接受新 Event 或写入结果未知，先冻结该 Session，对账补齐并重新校验后才能回切；不能静默读取旧源库。确认后再按保留策略清理源数据。
 
 迁移以 Session 为单位，不全局停机。迁移前必须等待活动 Run 和在途写入排空；合作型租约本身不能证明旧 writer 已停止，不满足静默期条件时停止切换。以上为迁移设计，当前没有迁移 Job、目录切换 API 或跨后端双写实现，不以此宣称在线迁移已可用。
@@ -199,11 +211,11 @@ planned → snapshotting → syncing → verifying → cutover → draining → 
 
 向量不直接搬运，因为 Embedding 模型、维度、距离算法和元数据过滤能力可能不同：
 
-1. 从 Object Storage/数据库读取原始知识文档。
-2. 使用固定解析器和目标 Embedding 配置生成新索引版本。
-3. 新旧索引并存，执行文档数、chunk 数和固定查询集对比。
-4. 原子切换 Knowledge Base 的 `active_index_version`。
-5. 观察期内保留旧索引，失败直接回滚指针。
+1. 选择知识库维护窗口，冻结该库文档新增、修改和删除，排空已有索引任务；查询继续使用旧索引。固定源文档版本、内容摘要和删除标记，不在本方案中引入在线双写。
+2. 从该快照读取源文档，使用固定解析器和目标 Embedding 配置生成新索引版本。索引版本同时绑定向量命名空间、Embedding 模型/维度和过滤规则，查询向量必须使用同一版本配置。
+3. 新旧索引并存，对固定快照执行文档数、chunk 数、删除状态、租户过滤和固定查询集校验。
+4. 条件校验快照版本未变，再原子切换 `active_index_version`。每个 Run 解析一次权威索引版本并固定本轮检索服务，缓存按该版本分区；不能让已缓存 Runtime 永久使用旧索引。保留旧索引直到旧读者结束。
+5. 观察期间保持文档写入冻结，仅当旧索引覆盖同一快照且配置有效时才可回退指针。恢复文档写入后，若发生新增、修改或删除，必须先把旧索引追平并重新校验，才能回退；无法校验时停止回退，不暴露过期或已删除内容。查询未通过则在解除冻结前回退，或保持维护状态并报告失败。
 
 ### 7.3 Migration Adapter
 
@@ -225,6 +237,6 @@ planned → snapshotting → syncing → verifying → cutover → draining → 
 1. 两个租户使用不同 Session Backend，使用相同外部用户名和 Session ID，数据仍完全隔离。
 2. 两个 Worker 同时收到同一 Session 消息，最终按顺序执行且后者能读取前者 Event。
 3. 同一个企业微信事件投递三次，只产生一个 Run 和一个业务 Tool 副作用。
-4. Memory 写入后，另一 Worker 在缓存 TTL 内或收到通知后可以检索。
+4. 默认 Memory 模式在派生任务、索引和缓存更新后跨 Worker 可检索；强读模式验证查询水位与缓存版本，未达要求时明确失败。
 5. 一个 Session 从 Redis 迁移到 PostgreSQL，迁移前后事件数和回答上下文一致。
 6. 知识库从本地向量索引重建到 PGVector，固定查询集结果达到约定阈值并可回滚。

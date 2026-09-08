@@ -94,6 +94,8 @@ sequenceDiagram
 
 Summary 是派生数据，必须记录输入 Event 边界。旧 Summary 生成任务晚到时，如果其边界小于当前版本，只保存历史版本或丢弃，不能覆盖更新的 Summary。
 
+图中 Memory 为默认异步模式，任务由独立 `derived_jobs` 持久登记并由后台补扫。启用写后可检索模式时，必须在成功完成 Run 和产生成功回复之前等待 Memory/索引达到要求版本，并约束后续读路径，不能只等待 Upsert；条件见[Memory 可见性](storage-and-consistency.md#53-memory)。
+
 ## 3. 同一 Session 同时收到两条消息
 
 ```mermaid
@@ -118,6 +120,8 @@ sequenceDiagram
 
 上图是同 Session 顺序执行的目标示意，不表示租约对象直接传给下一请求。生产队列还需容量和等待上限；当前 HTTP 拿不到租约时返回 `409 session_busy`，企微以 PostgreSQL 受理序逐条执行并先结束前一条回复的发送处理，再执行下一条。
 
+生产 IM 的租约忙、超配额和前序未完成不会转换成发给平台的 HTTP 409；持久延迟记录、XACK 时机、到期补扫和按 `accept_sequence` claim 的条件见[生产调度规则](storage-and-consistency.md#61-入站)。
+
 当前企微 Consumer 已验证同 Session 顺序，以及 Web 占用同一 Session 租约后在预算内等待继续；每次仍须独立获取租约，不提供通用有界队列或跨 Session 并行。租约只在 Run 入口互斥，不阻止旧 Worker 的存储写入，见 [Session Run Lease](session-lease.md)。
 
 ## 4. Worker 故障与重试
@@ -127,13 +131,15 @@ sequenceDiagram
 | 故障点 | 恢复方式 |
 | --- | --- |
 | PostgreSQL claim 前 | Redis PEL 认领未确认唤醒；扫描器也会重新投递长期 `accepted` 的 Run |
-| claim 后、Runner 调用前 | Run deadline 扫描器把过期 `running` attempt 重置为 `accepted`；旧 `claim_token` 随即失效 |
-| Runner 已开始但结果未知 | 先对账 Session Event；仅当 Revision 无 Tool，或全部 Tool 明确声明可重放且具备跨 attempt 的业务幂等时，才允许自动续跑 |
+| claim 后、确认尚未启动执行 | Run deadline 扫描器条件检查持久执行开始标记，将未启动的过期 `running` attempt 重置为 `accepted`；旧 `claim_token` 随即失效 |
+| Runner 已开始但结果未知 | 先检查完整结果证据；无法确认时终止并记录未知，不自动续跑。无 Tool 或 Tool 可重放本身不足以证明重跑不会重复追加用户历史 |
 | Tool 结果未知且不满足重放条件 | Run 以 `tool_outcome_unknown` 失败并进入人工/显式错误处理；不能仅凭 Session 中还只有用户 Event 判断可重跑 |
 | Session 已有最终结果、Run/Outbox 未提交 | 从已持久化结果对账并生成 Outbox，不重跑 Agent；终态仍须通过当前 `claim_token` CAS 提交 |
 | 回复请求超时、结果未知 | 仅在平台支持时查询状态或使用幂等接口；企微回复引用跨连接有效性未核实，不默认重试成功。目标失效时记录失败，不能改为重跑 Agent |
 
 生产设计中 Redis PEL 只覆盖“Worker 尚未成功 claim PostgreSQL Run”的唤醒窗口，claim 后由 PostgreSQL deadline 扫描器接管。当前专用 Consumer 不使用 Redis PEL、Waker 或通用 Scanner；同数据库对象重建测试不等于真实平台故障验证，也没有实现“已有最终 Session 结果但 Outbox 未提交”窗口的答案重建。
+
+结果重建以完整租户/Session 作用域、持久 `request_id` 和 Event 的 `InvocationID` 为关联依据，并核验完整终态及 Tool 调用/结果配对。上游支持 `agent.WithRequestID` 并在 Event 保留 RequestID，但 InvocationID 由 Runner 创建，不能假设调用前可自行指定。归属、完整性或来源顺序不能证明时保持失败，不拼接不同 Invocation 的结果，也不重新调用 Runner；未来允许同一业务请求多次实际执行前，必须另行建立持久执行级 ID 映射和历史处理契约。当前参考实现仍采用未知执行失败策略。
 
 ## 5. HTTP 流式链路差异
 

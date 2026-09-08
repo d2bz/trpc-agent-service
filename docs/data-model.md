@@ -79,7 +79,7 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 
 ### 3.3 Backend Profile
 
-`backend_profiles` 保存租户可复用的 Session 存储配置。Profile ID 本身就是版本：同一 `(tenant_id, id)` 永远只对应一份内容，控制面只有 Create/Get/List，没有 Update/Delete；切换存储必须创建新 ID 并由新 Revision 引用。
+`backend_profiles` 保存租户可复用的 Session 存储配置。Profile ID 本身就是版本：同一 `(tenant_id, id)` 永远只对应一份内容，控制面只有 Create/Get/List，没有 Update/Delete。当前通过新 Revision 引用新 Profile 为新 Session 选择后端；生产迁移还需要按 Session 的目录路由，存量 Session 切换后端不改变其 Revision Pin，见[迁移前提](storage-and-consistency.md#71-sessionredis-到-sql)。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -99,7 +99,7 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 | `id/tenant_id/agent_app_id` | 所属租户和目标 App |
 | `channel_type` | `wecom/feishu/http/...` |
 | `transport` | `wecom_bot_ws/feishu_webhook/feishu_ws/...`，明确协议模式 |
-| `external_account_id` | 企业应用、公众号或 Bot 标识的哈希/非敏感 ID |
+| `external_account_id` | 包含平台账号命名空间的全局确定性编码或摘要，不以内部租户加盐，以便跨租户唯一约束识别同一外部账号 |
 | `credential_secret_ref` | 长连接 Bot Secret 或应用凭据的服务端引用，不保存明文 |
 | `verify_secret_ref/crypto_secret_ref` | 验签和解密密钥引用 |
 | `config` | 长度限制、回调模式、限速、群聊策略 |
@@ -120,7 +120,8 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 | `sessions.framework_app_name` | `t/{tenant_id}/a/{agent_app_id}` |
 | `sessions.framework_user_id` | 单聊/群内成员模式使用用户身份；共享群模式使用合成群身份 |
 | `sessions.framework_session_id` | Tenant/App/Binding + 模式、用户或群/成员、话题、epoch 的摘要，见 [Session 命名](architecture.md#54-session-命名) |
-| `sessions.backend_profile_id` | 当前 Session 后端 |
+| `sessions.backend_profile_id` | 生产目录路由中的有效 Session 后端，优先于 Revision 的新会话默认配置 |
+| `sessions.storage_version` | 生产迁移切换时递增，用于条件更新及拒绝陈旧路由 |
 | `sessions.pinned_revision_id` | 灰度期间固定的 Agent Revision；紧急回滚可失效 |
 | `sessions.epoch` | `/new` 或空闲切分后的会话世代 |
 | `sessions.status` | `active/migrating/archived/deleted` |
@@ -143,6 +144,8 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 
 `session_summaries` 使用唯一键 `(tenant_id, session_id, filter_key, source_end_sequence, summary_version)`，其中 `source_end_sequence` 表示 Summary 覆盖到哪个 Event，防止旧任务覆盖新结果。
 
+以上 `backend_profile_id/storage_version/status` 迁移路由以及 epoch 换代均为目标目录字段，当前目录只提供既有 Pin 契约。`sequence_no` 是平台按稳定 `event_id` 和已确认提交顺序建立的幂等投影，不假定上游所有后端都有该列；无法确定顺序或来源边界时，不覆盖已有 Summary，也不据此自动重建执行结果。
+
 当前企微只使用 `direct`，`thread_id=""`、epoch 固定 `0`；真实 PostgreSQL Session、Pin 和配置 Repository 已通过全部 Runtime/Session 对象重建后历史与 Pin 保留的测试。群聊、epoch 换代及 Summary 表不属于当前实现。
 
 ### 3.6 Memory、Knowledge 与 Artifact
@@ -151,6 +154,7 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 - `knowledge_bases`：保存租户、名称、Embedding 配置、Vector Backend、索引版本和状态。
 - `knowledge_documents`：保存源文件、内容摘要、解析版本、Embedding 版本、索引状态和 Artifact 引用。向量库只保存 chunk 和向量，源文档仍可用于重建索引。
 - `artifacts`：保存租户、对象键、内容类型、大小、摘要、加密/扫描状态、保留时间和访问策略。对象键必须以租户 ID 分区。
+- `derived_jobs`：生产后台的 Memory/Summary 派生任务，保存租户、任务类型、源 Event/Run、来源边界、处理器版本、状态及重试进度。它不是 IM 回复 Outbox，也不要求 Channel Binding；完成 Run 的补扫负责修复任务未登记的窗口。
 
 ### 3.7 Inbox、Run、Outbox 与 Audit
 

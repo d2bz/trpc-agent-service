@@ -139,7 +139,7 @@ curl -X POST \
   http://127.0.0.1:8080/admin/v1/tenants/team-a/apps/assistant/revisions/revision-1/publish
 ```
 
-Revision 配置在创建时计算 SHA-256 `config_digest`，之后没有修改接口。更新配置必须创建新 Revision。再次发布一个历史 `published` Revision 会把它设为默认版本并递增 App 的 `routing_version`，形成可审计的回滚操作。Runtime 在构建时会**重新计算并精确核验** `config_digest`，空 digest 算不匹配、不算豁免；对不上的 Revision 不会被服务（见第 3.2 节）。
+Revision 配置在创建时计算 SHA-256 `config_digest`，之后没有修改接口。更新配置必须创建新 Revision。再次发布一个历史 `published` Revision 会把它设为默认版本并递增 App 的 `routing_version`；当前没有记录本次回滚操作人与历史流水的独立审计存储。Runtime 在构建时会**重新计算并精确核验** `config_digest`，空 digest 算不匹配、不算豁免；对不上的 Revision 不会被服务（见第 3.2 节）。
 
 ### 3.1 Tool 与 Policy
 

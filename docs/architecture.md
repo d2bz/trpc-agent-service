@@ -138,6 +138,8 @@ revision-8: 10%
 
 路由结果在 Session 第一个 Run 开始时确定，写入 `sessions.pinned_revision_id`，每个 Run 同时记录实际 `revision_id`。同一 Session 默认持续使用该版本，直到会话 epoch 结束；新 Session 按最新路由规则选择。紧急安全回滚可以显式使指定 Revision 的 Session Pin 失效，正常回滚不修改历史 Run。
 
+生产换代由持久会话目录执行：用户显式 `/new`，或租户启用的空闲阈值到期且没有活动 Run 时，事务内归档旧会话并递增 epoch，新会话再选择当前发布版本。默认不自动换代，旧 Inbox 的重复消息仍关联原 Run/Session。常规退役 Revision 前必须确认没有有效 Pin 和活动 Runtime 引用；仍有 Pin 时保持可用，不因新版本发布就回收旧版本。紧急禁用先拒绝新 Run，后续换代需显式操作和审计，不静默把旧 Session 改到另一 Revision。当前 IM epoch 固定为 0，没有换代或退役 API，存量会话继续使用原版本是明确边界。
+
 ### 4.2 配置传播
 
 PostgreSQL 是配置真相源。Worker 使用“通知 + 版本检查”更新本地缓存：
@@ -211,9 +213,11 @@ Runtime Manager 使用以下缓存键：
 
 缓存按空闲 TTL、最大对象数、估算内存和租户配额淘汰。淘汰时先禁止新 Run，等待引用计数归零，再调用 `Runner.Close()`。需要请求级 Prompt、模型或独立沙箱时，使用 tRPC-Agent-Go 的 `AgentFactory` 按 Run 创建 Agent。
 
+此缓存键固定 Agent 配置，不应阻止生产存储迁移。目标 Runtime 使用按 Session 目录解析后端的 Service，既有 Session 的目录选择优先于 Revision 默认 Profile；Knowledge 检索也在每个 Run 固定当前索引版本，底层缓存按版本分区。当前 Runtime 直接持有构建时 Session Bundle，尚未具备这些间接路由能力；迁移的前置条件、租约所有权和切换规则见[后端迁移](storage-and-consistency.md#7-后端迁移)。
+
 ### 5.4 Session 命名
 
-tRPC-Agent-Go 的 Session Key 是 `AppName + UserID + SessionID`。以下三种模式中，当前企微已实现 `direct`，固定 `thread_id=""`、`epoch="0"`，派生与隔离测试见 [`wecom/wecom_test.go`](../trpcservice/channels/wecom/wecom_test.go)；`group`、`group_member` 和 epoch 换代仍为设计。
+tRPC-Agent-Go 的 Session Key 是 `AppName + UserID + SessionID`。以下为企微 `direct` 与群聊扩展的键公式；当前企微固定 `thread_id=""`、`epoch="0"`，派生与隔离测试见 [`wecom/wecom_test.go`](../trpcservice/channels/wecom/wecom_test.go)；`group`、`group_member` 和 epoch 换代仍为设计。飞书同属逻辑上的 `direct`，但使用含外部 App/企业和 chat_id 的独立版本化公式，其中 `p2p` 是哈希中的平台协议标识，具体见[实际键规则](im-channels.md#账号用户与会话)。两种公式不能混用，公共层不假定各平台的摘要字节相同。
 
 ```text
 AppName = t/{tenant_id}/a/{agent_app_id}
@@ -290,14 +294,14 @@ Gateway 和 Worker 都保持无状态。运行中的 HTTP/SSE 连接只绑定当
 
 以下通用 Worker 的并行与重放策略描述生产目标。当前公共文本 Consumer 仍按单绑定串行处理各 Session，只恢复尚未启动的任务；已启动但结果未知的 Run 明确失败，企微旧连接投递目标失败，发送失败不重跑 Agent。未实现答案重建和跨连接补发，详见[恢复边界](im-channels.md#恢复与平台限制)。
 
-- 同一 Session 默认串行执行。Run Coordinator 使用 Redis 租约锁，锁值是随机 owner token，由 Worker 续约；失去租约立即取消 `context.Context`，第二个 Worker 在 Run 入口收到 `409 session_busy`。**这把租约是合作型的**：它把并发写者挡在入口，但不阻止已经在运行的写者继续写。获取租约时 `INCR` 出的单调 token 目前只是观测句柄，**不参与 Session 写入准入**——上游 `session.Service.AppendEvent` 没有 fence/CAS 参数，`WithAppendEventHook` 与后端写入之间也不是原子的，因此"装饰器在写入前拒绝落后 token"在当前上游接口下做不出来，不能称为 enforcement fencing。实现与边界见 [Session Run Lease](session-lease.md)。
+- 同一 Session 默认串行执行。Run Coordinator 使用 Redis 租约锁，锁值是随机 owner token，由 Worker 续约；失去租约立即取消 `context.Context`。HTTP 冲突返回 `409 session_busy`，生产异步 IM 按持久延后规则调度，不能直接丢弃唤醒。**这把租约是合作型的**：它把并发写者挡在入口，但不阻止已经在运行的写者继续写。获取租约时 `INCR` 出的单调 token 目前只是观测句柄，**不参与 Session 写入准入**——上游 `session.Service.AppendEvent` 没有 fence/CAS 参数，`WithAppendEventHook` 与后端写入之间也不是原子的，因此"装饰器在写入前拒绝落后 token"在当前上游接口下做不出来，不能称为 enforcement fencing。实现与边界见 [Session Run Lease](session-lease.md)。
 - 不同 Session 可并行执行。同一租户和 Agent 还受并发数、token 和费用配额约束。
 - Runner 返回的 Event Channel 必须由唯一消费者持续读取，直到关闭或完成取消后的排空，防止 goroutine 泄漏。
-- 入站消息、Run 和出站回复都有稳定幂等键。模型推理是否可重试取决于 Tool 能力声明；具有副作用的 Tool 只有在接收跨 attempt 稳定的业务幂等键后才可自动重放。
+- 入站消息、Run 和出站回复都有稳定幂等键。已启动且结果未知的 Run 不自动重跑；Tool 业务幂等只是未来重放设计的必要条件，不能替代 Session 历史和执行归属检查，详见[恢复前提](sequence.md#4-worker-故障与重试)。
 - PostgreSQL/Redis 短暂不可用时停止接收新的有状态 Run；不把生产请求静默降级到 InMemory。
 - Worker 退出时先停止领取新任务，取消或等待活动 Run，在宽限期内排空 Event 和写入最终状态。
 
-Runner Event Channel 始终由一个消费者负责。客户端断开只触发取消，不让消费函数提前返回：
+Runner Event Channel 始终由一个消费者负责。Session 持久化由 Runner 完成，以下伪代码仅转发 Event；客户端断开触发取消，消费函数仍排空通道：
 
 ```go
 runCtx, cancel := context.WithCancel(ctx)
@@ -309,12 +313,15 @@ if err != nil {
 }
 
 go func() {
-    <-clientDisconnected
-    cancel()
+    select {
+    case <-clientDisconnected:
+        cancel()
+    case <-runCtx.Done():
+    }
 }()
 
 for evt := range events { // 取消后仍持续读取，直到 Runner 关闭通道
-    if err := persistAndForward(runCtx, evt); err != nil {
+    if err := forwardEvent(runCtx, evt); err != nil {
         cancel()
     }
 }
