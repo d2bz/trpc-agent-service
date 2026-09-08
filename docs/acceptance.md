@@ -58,14 +58,14 @@ IM 四项说明要求已单独[收口](im-acceptance-closure.md)：消息转换�
 | A26 | 灰度与租户级回滚 | [发布模型](architecture.md#41-agent-发布模型) | 已实现 HTTP 发布、默认版本切换、旧版本回滚，以及 Session Revision Pin：发布和回滚都不会改变已开始的会话；`postgres` profile 下 Pin 与控制面同库，重启和多进程都能读到同一个 Pin（见 I10），权重灰度待实现 | partial |
 | A27 | 容量评估 | [容量估算](solution.md#6-容量估算方法) | 待用压测数据替换示例值 | planned |
 | A28 | 最小与生产部署方案 | [节点部署](architecture.md#6-节点部署)、[本地运行](local-deployment.md) | 已验证单进程网页启动/HTTP/SSE/停止、私密环境文件启动及临时 schema 下的 PostgreSQL 启动；已有数据库 Compose 配置和本地 Collector 配置通过校验。多角色、Kubernetes、生产部署与真实 Bot 遥测组合仍为设计或待联调 | partial |
-| D01 | 架构方案，原题建议 2000-4000 字 | [正式提交方案](submission-2026-08-27.md) | 1.0 中文正文 3288 字，历史提交前检查已完成；当前交付待复核 | partial |
-| D02 | 系统架构图 | [正式架构图](submission-2026-08-27.md#3-总体架构) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
-| D03 | 核心时序图 | [正式时序图](submission-2026-08-27.md#4-核心消息链路) | Mermaid CLI 11.12.0 渲染与视觉检查通过 | partial |
+| D01 | 架构方案，原题建议 2000-4000 字 | [当前方案](solution.md)、[交付入口](delivery.md) | 当前七项设计内容已复核；8 月 27 日 3288 字稿保留为历史版本，当前详细方案明确设计与实现边界 | done |
+| D02 | 系统架构图 | [当前架构图](architecture.md#2-系统架构图) | 9 月 7 日 Mermaid CLI 11.12.0 渲染与视觉检查通过，见[记录](verification-2026-09-07.md#4-实际验证) | done |
+| D03 | 核心时序图 | [当前企微时序](sequence.md#1-企业微信完整链路) | 9 月 7 日长连接目标时序已渲染检查；当前实现不包含图中的全部生产组件 | done |
 | D04 | 数据模型 | [数据模型](data-model.md) | ER 图由 Mermaid CLI 11.12.0 渲染通过；原题允许表结构或 JSON Schema，不要求全部数据库迁移 | partial |
 | D05 | 同步和幂等策略 | [存储与一致性](storage-and-consistency.md) | Session Run Lease、Revision Pin、Storage Router 的并发与关闭测试已实现；I17 选定的 Inbox/Outbox 本地文本链路已验收，其余原实验未纳入，Memory/Summary 和迁移一致性仍为设计 | partial |
 | D06 | 多后端适配方案 | [后端路由与取舍](storage-and-consistency.md#1-统一后端路由) | Session 三种 Adapter、不可变租户 BackendProfile、生产 Router 和动态 InMemory/PostgreSQL/Redis Factory 已实现；Memory/Knowledge/Artifact 后端与完整能力矩阵仍待实现 | partial |
-| D07 | 至少 8 个风险与缓解 | [风险清单](submission-2026-08-27.md#8-主要风险与应对) | 12 项已记录并完成复核 | partial |
-| D08 | GitHub 实现代码 | 当前仓库 | 已有最小可运行链路；当前提交版本、仓库入口和复现证据待确认，原题不要求完整平台功能 | partial |
+| D07 | 至少 8 个风险与缓解 | [当前风险清单](solution.md#9-主要风险) | 12 项已记录并完成复核，含当前边界、残余风险、检测/降级与生产缓解；不要求全部缓解方案实现 | done |
+| D08 | GitHub 实现代码 | [交付版本与发布状态](delivery.md#发布状态) | 29a6b90 的参考实现及复现证据已收口，远端仍为 ab64d81，待推送；原题不要求完整平台功能 | partial |
 | F01 | 明确上游复用与平台新增 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) | 已固定上游依赖并验证 LLMAgent、Runner、Session、OpenAI Server，以及 `model/openai` 的 OpenAI-compatible 模型构造；其余平台职责以设计和明确实现范围分别验收 | partial |
 
 ## 阶段性实现证据

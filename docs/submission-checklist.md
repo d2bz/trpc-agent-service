@@ -6,7 +6,7 @@
 | --- | --- |
 | 题目源仓库 | `liuzengh/trpc-agent-service` |
 | 参赛仓库 | `d2bz/trpc-agent-service` |
-| 历史工作分支 | `feature/d2bz`（当前提交前重新核对） |
+| 当前交付分支 | `feature/d2bz`（2026-09-08 已核对；组织者姓名口径仍需提交者确认） |
 | 方案版本 | `1.0` |
 | 方案提交日期 | 2026-08-27 |
 | 最终验收日期 | 2026-09-11 |
@@ -33,7 +33,7 @@
 - [x] 企业微信真实正常单聊已有[独立证据](wecom-text-slice.md#真实单聊验证)；重复投递、发送失败与恢复仍以本地协议集成为证据。
 - [x] `f5ed53c` 的可选企微三阶段 OTel 已完成[本地验收](observability-slice.md#验证结果)，以 `request_id` 关联，未验证真实 Bot 遥测，不宣称完整连续 Trace。
 - [x] 本轮[可复现本地部署](local-deployment.md#本轮验证)的构建、网页 8 项 HTTP/SSE、环境文件、临时 PostgreSQL schema 启动与 Collector 配置校验通过；没有新增真实 Bot 遥测证据。
-- [ ] 在选定交付提交上执行以下适用检查并保存结果；本清单列出命令不代表已经执行通过。
+- [x] 选定代码 `f5ed53c` 已通过全仓默认 race/vet/build 和真实 PostgreSQL 企微协议集成；`29a6b90` 无 Go/依赖变更且部署验收通过。本轮只改交付文档，未重复跑业务测试；证据入口见[交付材料](delivery.md#实现与证据)。下列命令供复现，不代表所有可选门控已执行。
 
 ```bash
 git status --short --branch
@@ -60,10 +60,10 @@ TRPC_SERVICE_POSTGRES_DSN='postgres://trpc:trpc-local-dev@127.0.0.1:55432/trpc_s
 TRPC_SERVICE_REDIS_URL='redis://:trpc-local-dev@127.0.0.1:56379/0' \
 go test -race -count=1 -timeout 900s ./...
 
-docker compose -f deploy/docker-compose.session.yml down -v
+docker compose -f deploy/docker-compose.session.yml stop
 ```
 
-集成测试可重复执行，两次运行互不干扰。Compose 里的口令是本地开发占位值，服务只绑定 `127.0.0.1`，不是生产 secret。语义差异与未实现边界见 [Session 后端 Spike](session-backend.md)。
+集成测试使用临时 schema。Compose 里的口令是本地开发占位值，服务只绑定 `127.0.0.1`，不是生产 secret；测试结束只在没有其他使用者时停服务，保留已有数据卷。语义差异与未实现边界见 [Session 后端 Spike](session-backend.md)。
 
 启动后至少验证：
 
@@ -72,7 +72,7 @@ docker compose -f deploy/docker-compose.session.yml down -v
 3. 响应头带回 `X-Session-ID` 和 `X-Agent-Revision-ID`，用回传的 Session ID 可续接同一段对话。
 4. Admin API 带 `Authorization: Bearer $(cat data/admin-api-key)` 和 `Content-Type: application/json` 可以创建 Tenant、App、Revision 并发布；不带该请求头返回 `401`，且 `start.sh` 的输出里只有 key 文件的路径、没有 key 本身。
 5. 发布新 Revision 后，已开始的 Session 仍返回旧版本，新建 Session 才用新版本。
-6. `./stop.sh` 正常停止服务并清理 PID 文件。
+6. `./stop.sh` 发出停止信号并清理 PID 文件，确认旧进程和端口退出后再启动。
 
 ## 4. Git 检查
 
@@ -82,7 +82,7 @@ docker compose -f deploy/docker-compose.session.yml down -v
 - [x] 个人 Fork 存在 `origin/feature/d2bz`。
 - [x] 8 月 27 日提交 commit 已推送，且本地与远端 SHA 一致。
 - [ ] 当前交付的分支、commit 和 GitHub 入口已核对，所需代码已推送。参赛入口为 `d2bz/trpc-agent-service` 的 `feature/d2bz`；本地已验收 `f5ed53c` 及后续部署切片尚待确认推送，不能将本地提交视为远端可用。
-- [ ] 当前工作区和待提交差异已检查，无运行日志、PID、二进制、覆盖率文件或密钥进入 Git。原工作区的未提交 Channel 实验继续保留；当前部署切片在独立工作树中进行，不将原实验自动纳入交付。
+- [x] 2026-09-08 已核对候选的受控文件路径：没有私密环境文件、运行日志/PID、二进制或覆盖率文件；待推送新增文本的高置信凭据模式检查未命中。此为有限发布检查，不宣称全量 Secret 审计。原工作区 5 个 tracked 修改及 untracked Channel 实验完整保留，未纳入交付；独立工作树基线为干净 29a6b90。
 - [ ] 提交平台所需的仓库、分支、文档入口和演示说明已经填写。
 
 ## 5. 当前实现边界
