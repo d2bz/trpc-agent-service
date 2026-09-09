@@ -2,7 +2,7 @@
 
 基于 [tRPC-Agent-Go](https://github.com/trpc-group/trpc-agent-go) v1.11.2 的平台架构与 Go 参考实现。通过统一的租户配置、版本发布、会话管理和 IM 适配，让网页、企业微信与飞书共享真实的 Agent 执行链路。
 
-[快速开始](#快速开始) · [设计方案](docs/solution.md) · [文档索引](docs/delivery.md) · [实现与验证](docs/acceptance.md)
+[快速开始](#快速开始) · [本地部署](docs/local-deployment.md) · [生产部署设计](docs/production-deployment.md) · [设计方案](docs/solution.md) · [文档索引](docs/delivery.md) · [实现与验证](docs/acceptance.md)
 
 ## 当前能力
 
@@ -207,6 +207,7 @@ TRPC_SERVICE_ADDR=127.0.0.1:18080 ./start.sh
 
 | 内容 | 文档 |
 | --- | --- |
+| 部署方案 | [本地运行](docs/local-deployment.md)、[生产部署设计](docs/production-deployment.md)（目标架构，尚非可执行部署包） |
 | 主设计文档 | [平台方案](docs/solution.md) |
 | 系统架构图与组件职责 | [总体架构](docs/architecture.md) |
 | 完整消息时序 | [核心时序](docs/sequence.md) |

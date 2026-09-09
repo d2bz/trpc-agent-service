@@ -15,6 +15,7 @@
 ## 运行与扩展
 
 - [本地部署](local-deployment.md)
+- [生产部署设计](production-deployment.md)
 - [IM 接入与社区扩展](im-channels.md)
 - [Admin API 与动态路由](admin-api.md)
 - [身份、权限与密钥治理](security-and-governance.md)

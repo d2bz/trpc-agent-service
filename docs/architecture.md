@@ -257,38 +257,11 @@ trpc-service --role=all
 
 ### 6.2 生产推荐部署
 
-```text
-Load Balancer
-├── Gateway Deployment × N
-├── Channel Deployment × N
-├── Worker Deployment × N
-└── Background Job Deployment × N
-
-共享服务
-├── PostgreSQL HA
-├── Redis HA
-├── PGVector 或独立 Vector DB
-├── S3-compatible Object Storage
-└── OpenTelemetry Collector
-```
-
-Gateway 和 Worker 都保持无状态。运行中的 HTTP/SSE 连接只绑定当前节点；连接断开不丢失已提交的 Event，客户端可以按 `request_id` 查询结果。IM 请求先写 PostgreSQL Inbox，再投递 Redis Stream 并应答平台回调。Worker 故障后由 Consumer Group 认领未确认消息；定时扫描器也会重新投递 Inbox 中超时的非终态任务。
+生产目标按 Gateway、Worker、Channel 和后台任务拆分部署，共享持久配置、Session 与任务状态。Channel 按不同 Binding 分片，每个 Bot 保持一个活动连接。完整拓扑、共享后端、配置前提、容量与发布回滚见[生产部署设计](production-deployment.md)。角色拆分尚未实现，不能直接增加当前单进程副本作为替代。
 
 ### 6.3 故障隔离与恢复设计
 
-**当前实现。** 网页、Admin API、企微和飞书共用一个进程。任一 IM 消费者发生终止性错误时，[启动入口](../cmd/trpc-service/main.go)会关闭 HTTP，再停止其他通道、Runtime 和存储，因此故障会影响同进程全部入口及其租户。单次模型失败、发送拒绝或发送结果未知会记录为对应 Run/Outbox 的结果，不等同于消费者终止。当前 `/healthz` 只表示 HTTP 服务可响应，不表示 Bot 已连接或可以持久受理；没有按通道隔离的监督与重启机制。
-
-**生产目标。** 以下隔离、探针、资源配额和自动恢复属于部署设计，尚未实现。Gateway、Worker 和 Channel 分别部署；Channel 按 Binding 或明确的 Binding 组划分进程，分组内共享故障范围。每个 Bot 保持一个活动连接，按不同 Binding 分片扩容，不直接增加同一 Bot 的连接副本。企微受理与回复由同一连接所有者处理，旧连接的回复目标不能交给任意新实例补发。
-
-| 故障范围 | 隔离和降级 | 检测与恢复 |
-| --- | --- | --- |
-| 单个 Channel 连接或消费者终止 | 只停止该进程内 Binding 的受理与投递；其他 Channel、Gateway、Worker 保持运行。已受理消息保留在 Inbox，未持久受理不报告成功 | 按 Binding 监测连接状态、受理失败、队列年龄和进程重启次数。连接类故障有界退避重连或重启；凭据、权限和配置错误告警并等待修正，避免重启循环 |
-| 单个 Worker 崩溃或耗尽资源 | 独立 CPU/内存、并发和数据库连接预算限制影响范围；停止该 Worker 领取任务，由其他健康 Worker 继续领取可执行任务 | 监测进程存活、活跃 Run、处理延迟和超期任务；恢复先核对持久执行标记与终态，不能因进程重启就重跑 Agent/Tool |
-| 共享 PostgreSQL、Redis 或模型供应商不可用 | 进程隔离不能消除共享依赖故障；按依赖能力暂停相关受理或执行，有界排队和超时，不把持久 Session 降级为 InMemory | 监测依赖错误率、连接池等待与队列积压；依赖恢复后逐步放量。共享库容量和供应商级故障仍可能同时影响多个入口 |
-
-存活检查只判断本进程能否继续工作；就绪检查判断该角色能否履行职责，Channel 还需检查连接和持久受理能力。单个 Bot 不可用不得触发无关 Gateway 的存活检查失败。进程监督器负责局部重启，业务错误与外部依赖短暂故障通过就绪状态、超时和告警处理，避免整个部署反复重启。上述检查不以当前 `/healthz` 代替。
-
-恢复以 PostgreSQL Inbox/Run/Outbox 为依据。停止组件时先停止受理或领取，再取消并排空正在处理的 Event、保存可确认的终态。当前参考实现只恢复尚未开始执行的任务；已启动但结果未知的 Run 明确失败，发送结果未知不自动重发，发送失败不重跑 Agent。生产恢复同样不得盲目重放；增加重试前必须具备结果查询、业务幂等与平台支持，企微旧连接目标按失效处理。未落库消息、已经发生的 Tool 副作用和发送未知结果仍有残余风险，详见[恢复边界](im-channels.md#恢复与平台限制)与[风险清单](risks.md)。
+当前 IM 消费者终止会关闭同进程的 HTTP、Admin 和其他 IM。生产按角色及 Binding 隔离资源、就绪检查与重启；共享后端故障仍可能影响多个入口，未知执行不自动重跑。故障范围、探针语义和恢复规则集中见[故障隔离与恢复](production-deployment.md#6-故障隔离与恢复)。
 
 ## 7. 并发与故障边界
 

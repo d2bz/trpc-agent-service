@@ -12,6 +12,7 @@
 | SQL、Redis、向量库、对象存储的数据放置与同步 | [存储与一致性](storage-and-consistency.md) |
 | 完整消息时序与 request_id/trace_id 关联 | [核心消息时序](sequence.md) |
 | 并发、故障恢复、隔离与资源治理风险 | [十三项生产风险](risks.md) |
+| 最小可运行与生产推荐部署 | [本地部署](local-deployment.md)、[生产部署设计](production-deployment.md)；生产角色与编排尚未实现 |
 | 框架复用能力与平台新增职责 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) |
 
 ## 参考实现范围
