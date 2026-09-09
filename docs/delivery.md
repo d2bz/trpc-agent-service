@@ -13,7 +13,7 @@
 | 同步与幂等策略 | [存储与一致性](storage-and-consistency.md)，含并发、派生数据、入站去重、恢复与迁移 |
 | 多后端方案 | [数据放置](storage-and-consistency.md#2-数据放置)，覆盖 SQL、Redis、向量库、对象存储 |
 | 风险与缓解 | [十三项生产风险](risks.md)，说明触发条件、当前边界、监测/降级和生产缓解 |
-| GitHub 实现代码 | [源码仓库](https://github.com/d2bz/trpc-agent-service/tree/feature/d2bz)，分支 `feature/d2bz`；代码入口为 `cmd/trpc-service` 与 `trpcservice` |
+| GitHub 实现代码 | [源码仓库](https://github.com/d2bz/trpc-agent-service/tree/Wang-Pengfei)，分支 `Wang-Pengfei`；代码入口为 `cmd/trpc-service` 与 `trpcservice` |
 
 ## 运行与验证
 
