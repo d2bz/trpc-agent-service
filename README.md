@@ -21,10 +21,10 @@ Memory/Summary、知识与附件路由、在线迁移、群聊和媒体、完整
 
 需要 **Go 1.24.1 或以上**、Git、Bash 和 curl。首次克隆和构建需要网络获取代码与 Go 模块；构建完成后，默认网页演示不依赖外部模型、数据库或前端资源服务。
 
-从项目仓库的 `Wang-Pengfei` 分支获取源码：
+从项目仓库的 `feature/Wang-Pengfei` 分支获取源码：
 
 ```bash
-git clone --branch Wang-Pengfei https://github.com/d2bz/trpc-agent-service.git
+git clone --branch feature/Wang-Pengfei https://github.com/d2bz/trpc-agent-service.git
 cd trpc-agent-service
 
 ./build.sh
