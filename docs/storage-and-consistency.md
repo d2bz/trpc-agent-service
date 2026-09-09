@@ -160,7 +160,7 @@ Memory 从已提交的稳定 Event 中提取。生产使用独立的 `derived_jo
 inbound:{channel_binding_id}:{external_event_id}
 ```
 
-PostgreSQL `UNIQUE (tenant_id, channel_binding_id, external_event_id)` 是唯一的持久去重事实源。受信任的 Adapter 消息在一个事务内插入或命中 Inbox，并为首次事件创建 `accepted` Run；重复请求读取原 `request_id`，不创建第二个 Run。Webhook 只有事务提交后才返回成功确认；长连接的推送与回执边界见[IM 设计](solution.md#55-im-接入差异)。Redis 不在数据库提交前做 `SET NX` 去重，否则会出现“Redis 写成功、SQL 事务失败、平台重投又被 Redis 拦截”的丢消息窗口。
+PostgreSQL `UNIQUE (tenant_id, channel_binding_id, external_event_id)` 是唯一的持久去重事实源。受信任的 Adapter 消息在一个事务内插入或命中 Inbox，并为首次事件创建 `accepted` Run；重复请求读取原 `request_id`，不创建第二个 Run。Webhook 只有事务提交后才返回成功确认；长连接的推送与回执边界见[IM 设计](im-channels.md#协议细节与扩展设计)。Redis 不在数据库提交前做 `SET NX` 去重，否则会出现“Redis 写成功、SQL 事务失败、平台重投又被 Redis 拦截”的丢消息窗口。
 
 重复请求返回原 `request_id` 和已受理状态，不创建新 Run。没有稳定事件 ID 的平台，使用平台建议字段组成规范字符串后计算摘要，并记录碰撞与误判风险。
 

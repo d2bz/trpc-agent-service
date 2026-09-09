@@ -6,13 +6,13 @@
 
 | 主题 | 内容入口 |
 | --- | --- |
-| 架构设计文档 | [平台方案](solution.md)，含租户、拓扑、生命周期、IM、治理、安全、容量与故障恢复 |
+| 架构设计文档 | [平台方案](solution.md)，主文集中说明目标、架构与关键决策；协议、数据、治理和风险细节见专项文档 |
 | 系统架构图 | [总体架构](architecture.md#2-系统架构图)，展示 Gateway、Worker、Channel、Storage、治理与 Telemetry |
 | 核心消息时序图 | [企业微信完整链路](sequence.md#1-企业微信完整链路)，含 Runner、Tool、Session/Memory、回复与 request/trace 关联 |
 | 数据模型 | [实体及 ER 图](data-model.md)，含 tenant、agent、binding、session、event、memory、summary、audit |
 | 同步与幂等策略 | [存储与一致性](storage-and-consistency.md)，含并发、派生数据、入站去重、恢复与迁移 |
 | 多后端方案 | [数据放置](storage-and-consistency.md#2-数据放置)，覆盖 SQL、Redis、向量库、对象存储 |
-| 风险与缓解 | [十三项生产风险](solution.md#9-主要风险)，说明触发条件、当前边界、监测/降级和生产缓解 |
+| 风险与缓解 | [十三项生产风险](risks.md)，说明触发条件、当前边界、监测/降级和生产缓解 |
 | GitHub 实现代码 | [源码仓库](https://github.com/d2bz/trpc-agent-service/tree/feature/d2bz)，分支 `feature/d2bz`；代码入口为 `cmd/trpc-service` 与 `trpcservice` |
 
 ## 运行与验证

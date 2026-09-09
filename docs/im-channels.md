@@ -1,6 +1,6 @@
 # IM 接入与社区扩展
 
-企业微信智能机器人和飞书企业自建应用均通过 `channels.TextAdapter` 接入公共文本消费者。当前支持单进程、每类通道一个静态绑定、单聊纯文本和一条最终回复。配置见[本地部署](local-deployment.md)，验证范围见[实现与验证](acceptance.md)。群聊、Webhook、媒体、卡片、撤回及生产重试方案见[IM 差异设计](solution.md#55-im-接入差异)。
+企业微信智能机器人和飞书企业自建应用均通过 `channels.TextAdapter` 接入公共文本消费者。当前支持单进程、每类通道一个静态绑定、单聊纯文本和一条最终回复。配置见[本地部署](local-deployment.md)，验证范围见[实现与验证](acceptance.md)。群聊、Webhook、媒体、卡片、撤回及生产重试方案见[IM 差异设计](im-channels.md#协议细节与扩展设计)。
 
 ## 职责与依赖
 
@@ -71,7 +71,7 @@ Session   = "d-" + H(["im-session-v1", tenant, app, binding, feishu_app, tenant_
 
 飞书 Token 与回复共用公共消费者的 15 秒发送 Context。其回复 UUID 由完整绑定与原消息派生，平台去重窗口有限；当前只有一个回复分片，未来若拆分必须把分片身份纳入去重键。停止时先取消并等待连接和消费者，再关闭 Runtime、Session、数据库与遥测。
 
-图片/文件、混合消息、卡片和撤回不进入当前执行链路。生产媒体由 Adapter 下载/解密、验证大小和类型、保存受租户保护的附件引用；撤回需关联原消息并保留 Audit，不自动撤销已执行 Tool。限频、回复有效期和跨连接恢复按平台能力核实，详细方案见[IM 差异](solution.md#55-im-接入差异)。
+图片/文件、混合消息、卡片和撤回不进入当前执行链路。生产媒体由 Adapter 下载/解密、验证大小和类型、保存受租户保护的附件引用；撤回需关联原消息并保留 Audit，不自动撤销已执行 Tool。限频、回复有效期和跨连接恢复按平台能力核实，详细方案见[IM 差异](im-channels.md#协议细节与扩展设计)。
 
 ## 社区接入契约
 
@@ -98,3 +98,39 @@ type TextAdapter interface {
 新增 Telegram 等通道时，在独立包使用官方协议库实现四个方法，使用合法小写 `ChannelType` 标识。通过启动代码注入现有 Store、Session Run 和 Revision 检查，无需复制公共消费者、修改数据库结构或增加平台分支。平台特有群聊/媒体能力应有显式契约，不应丢弃附件后把剩余文本送给 Runner。
 
 验证至少覆盖正常收发、重复消息、绑定错配、代表性发送失败和取消；复用 [`text` 集成测试](../trpcservice/channels/text/e2e_integration_test.go) 的公共链路结构。模拟平台测试与真实平台证据分别记录。
+
+## 协议细节与扩展设计
+
+| 能力 | 企业微信智能机器人长连接 | 飞书事件订阅 |
+| --- | --- | --- |
+| 入站方式 | 主动连接 `wss://openws.work.weixin.qq.com`，发送 `aibot_subscribe`；接收 `aibot_msg_callback` | 当前采用自建应用官方 Go SDK 长连接；HTTPS Webhook 保留为扩展设计 |
+| 安全 | Bot ID/Secret 认证；校验事件 `aibotid` 与受信任连接绑定一致，不用自建应用 access token | App ID/Secret 认证查询企业身份；核对事件 App/企业和 sender 企业，静态绑定内部 Tenant/App；Webhook 签名/Token 方案见下文 |
+| 入站确认 | 推送帧没有 HTTP 响应；只有 Inbox 事务提交后才在平台内部标记受理，不假定断连后必然补投 | SDK 在处理器返回后 ACK；持久受理成功才返回 nil，回调串行受理且有限等待，停止时排空；验证范围见实现与验证 |
+| 幂等与回复关联 | `body.msgid` 作入站事件键；`headers.req_id` 用于回复关联，不等同于平台 `request_id` | `im.message.receive_v1` 按 `message_id` 在 Binding 内去重，不能只依赖 `event_id`；message/chat/thread 标识用于回复定位 |
+| 身份与会话 | `from.userid`、`chattype`、群聊 `chatid`，机器人账号先绑定 Tenant/App | App、Chat、User、Thread 共同决定绑定和会话作用域 |
+| 文本回复 | `aibot_respond_msg` 透传 `req_id`，以固定 `stream.id` 发送最终文本；收到成功回执再确认 Outbox | Bot 消息 API 按 message/chat ID 回复；平台流式/卡片更新能力与普通文本分开 |
+| 限制与失败 | 官方 SDK 的流式文本上限为 20,480 字节；按具体消息类型限制输出，同一 `req_id` 串行发送，超时记录结果未知 | 当前采用保守 4096 UTF-8 字节最终文本；单次 HTTP 回复，未知不重发；生产按消息类型配置限频/退避 |
+| 扩展与撤回 | 图片/文件需下载解密和媒体上传，卡片、欢迎语、主动发送有独立协议；当前均未实现 | 图片/文件、富文本、交互卡片和撤回分别映射事件与出站动作，未支持时明确拒绝或记录 |
+| 当前状态 | 单静态 Binding、单聊纯文本已实现，真实正常收发已验证；增量流、群聊、媒体、卡片和撤回仍为设计 | [飞书接入](im-channels.md)已实现，身份预检、本地协议与 PostgreSQL 集成通过；真实连接及两轮正常单聊收发已验证 |
+
+协议依据为[企微官方 SDK README](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/README.md) 和 [WebSocket 实现](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)，2026-09-07 核对；这里只参考协议，不将 Node SDK 引入 Go 服务。自建应用 Webhook 的 `msg_signature`/AES、HTTP 200 和 access token 发送流程是另一种接入模式，不与智能机器人长连接混用。未核实的平台回复有效期、跨连接重试能力和限频数值保持待联调，不能据 SDK 的本地请求超时推定平台保证。
+
+当前企微超长文本按 UTF-8 字节截断并带 `[truncated]` 标记，只发送一次 `finish=true`，不是逐字流式。生产限频设计在外部账号作用域分配配额、保持同会话顺序，按消息/API 类型配置额度，对已确认可重试的限流采用有上限的指数退避并遵守平台有效等待值；当前没有限频调度器，也不因发送失败自动重发。媒体下载/解密、受租户保护的附件引用和出站上传由 Adapter 负责；当前不支持的消息不进入 Runner。各项降级和待核实边界见[平台限制](im-channels.md#恢复与平台限制)。
+
+**飞书 HTTPS 回调扩展设计，未实现。** 当前实际接入采用[官方长连接](im-channels.md)，以下 Webhook 方案继续用于通道差异和扩展设计。入口拟为 `POST /channels/feishu/{account_id}/events`，每个飞书应用只登记一个回调 URL。路径中的账号 ID 仅定位服务端已登记的候选 Binding 和凭据引用（Verification Token、可选 Encrypt Key、预期 App ID 及允许的飞书 tenant_key），不是租户认证结果；不依赖请求体声明的 App/Tenant 去寻找任意密钥。
+
+处理顺序如下，所有鉴权前解析和解密都不触发 Inbox、Runner 或业务路由：
+
+1. 按入口定位候选凭据，限制请求体大小并保留原始 body 字节。根据服务端配置解析明文或解密 `encrypt` 包装，识别事件类型；配置了 Encrypt Key 却收到普通明文事件时拒绝降级。解析出的身份此时仍不可信。
+2. `url_verification` 是独立分支：必要解密后校验顶层 `token` 与该账号的 Verification Token 一致，再在官方要求的 1 秒内返回 `{"challenge":"原值"}`；不创建 Run。官方 challenge 示例没有 App ID/tenant_key，不要求这些字段，也不把普通事件的签名要求套到 challenge 上。
+3. 普通事件配置了 Encrypt Key 时，必须用 `X-Lark-Request-Timestamp`、`X-Lark-Request-Nonce`、Key 和**原始 body** 按顺序计算 SHA-256，并核对 `X-Lark-Signature`；缺失或不匹配即拒绝。不能对重新序列化或解密后的 JSON 验签。签名计算本身不依赖解密，可在签名头齐备时提前执行；仅解密成功不能跳过验签。
+4. 普通事件未配置 Encrypt Key 时，仍须校验 Verification Token，不允许因 SDK 跳过签名就放行。对本设计采用的 v2.0 消息事件，无论是否加密都显式核对 `header.token`、`header.app_id` 和已登记的 `header.tenant_key`；App/租户不符或无法唯一定位有效 Binding 即拒绝。通过后才按受信任的 Binding 及 Chat/User/Thread 映射平台 Tenant、App、Session，并校验允许的事件类型。
+5. 消息内容通过验证后，以 Binding 内的 `message_id` 持久去重，Inbox 提交成功或命中已提交记录后再确认受理；不等待 Agent 执行完成。签名校验不替代持久去重，Token 和原始消息体也不写入日志。
+
+以上依据为 2026-09-07 核对的飞书官方[Webhook 配置与 challenge](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/choose-a-subscription-mode/send-notifications-to-developers-server)、[事件安全校验与解密](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/encrypt-key-encryption-configuration-case)和[接收消息事件](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/events/receive)。官方 Go SDK 固定版本 [`b059ee1` 的 Dispatcher](https://github.com/larksuite/oapi-sdk-go/blob/b059ee1824d45444306559b5c33c3f268c0de10d/event/dispatcher/dispatcher.go)会先解析/解密、对 challenge 跳过签名、无 Encrypt Key 时直接跳过签名，并仅在 challenge 分支校验 Token；普通事件的 Token/App/租户绑定校验仍由平台负责，不能只构造 SDK Dispatcher 就宣称完成认证。
+
+**撤回策略尚未实现。** 设计上，收到已验证的撤回事件时，记录对原消息和 Run 的关联，不删除已经提交的 Audit 或 Session Event；撤回也不自动抵消已执行的 Tool。通道支持撤回机器人回复时，经 Outbox 提交撤回动作，否则按租户策略忽略或发送更正说明。当前支持的消息类型见[IM 接入指南](im-channels.md)。
+
+设计上两个 Adapter 共享统一 InboundEnvelope 和 Outbox，重复投递由 PostgreSQL Inbox 唯一约束裁决，Redis 不参与权威去重。企微出站目标保存版本、Binding、收到的 `req_id`、会话引用和稳定 `stream.id`；飞书按原始 `message_id` 回复，目标携带完整绑定作用域，不随 WebSocket 换代失效。敏感引用不写日志。ACK 超时或连接断开不算成功，也不重跑 Agent；生产扩展只有确认平台允许且目标仍有效时才重试，否则记录结果未知或投递失败。当前企微每条最终回复最多一次发送尝试，未知结果保留 `duplicate_risk` 且不重发，连接换代后旧目标失败。平台不提供幂等保证时，稳定 ID 仅用于关联，不能宣称发送 exactly-once。
+
+单聊按 Binding 与可信用户映射 Session，群聊按 Binding、群和显式线程划分，规则见[Session 命名](architecture.md#54-session-命名)。当前部署限制同一 Bot 一个活动实例。企微连接可能互相替换，断线重连停止旧连接的待回执等待；飞书多个连接可能分摊事件，SDK 回调并发不保证原始时间顺序。Inbox 提交前的进程故障可能丢失尚未持久化的帧；飞书虽有超时重推，也不能作为无限恢复保证。监测连接与持久化失败、明确提示用户重试，生产可评估平台回放能力或本地持久接收层。该残余风险不因采用长连接而自动消失。

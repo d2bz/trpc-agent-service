@@ -1,6 +1,6 @@
 # 实现与验证
 
-本文列出设计覆盖、代码实现和验证范围。目标架构中尚未实现的能力单独标明；完整风险与缓解方案见[方案](solution.md#9-主要风险)。
+本文列出设计覆盖、代码实现和验证范围。目标架构中尚未实现的能力单独标明；完整风险与缓解方案见[风险清单](risks.md)。
 
 ## 设计覆盖
 
@@ -8,10 +8,10 @@
 | --- | --- |
 | 多租户、节点化部署、数据同步、多后端、IM、治理监控和故障恢复 | [方案](solution.md)、[架构](architecture.md) |
 | tenant、agent、binding、session、event、memory、summary、audit 关系 | [数据模型](data-model.md) |
-| 企业微信与飞书的协议及接入差异 | [企微与飞书差异](solution.md#55-im-接入差异)、[接入指南](im-channels.md) |
+| 企业微信与飞书的协议及接入差异 | [企微与飞书差异](im-channels.md#协议细节与扩展设计)、[接入指南](im-channels.md) |
 | SQL、Redis、向量库、对象存储的数据放置与同步 | [存储与一致性](storage-and-consistency.md) |
 | 完整消息时序与 request_id/trace_id 关联 | [核心消息时序](sequence.md) |
-| 并发、故障恢复、隔离与资源治理风险 | [十三项生产风险](solution.md#9-主要风险) |
+| 并发、故障恢复、隔离与资源治理风险 | [十三项生产风险](risks.md) |
 | 框架复用能力与平台新增职责 | [能力基线](project-foundation.md#6-上游能力基线与平台新增职责) |
 
 ## 参考实现范围
@@ -64,7 +64,7 @@ PostgreSQL/Redis 后端与双 Worker 的可选验证命令见 [Session 后端](s
 
 ## 已知限制
 
-以下为当前实现的明确边界，生产采用前应结合[风险清单](solution.md#9-主要风险)评估：
+以下为当前实现的明确边界，生产采用前应结合[风险清单](risks.md)评估：
 
 - **入口共用进程，尚无故障隔离。** IM 消费者终止会关闭 HTTP、Admin API 和其他 IM；单次模型或投递失败不等同于消费者终止。`/healthz` 不表示 Bot 就绪。按角色与 Binding 隔离、局部重启和健康检查属于[生产设计](architecture.md#63-故障隔离与恢复设计)，未在当前代码中实现。
 - **合法凭据可以制造无界 Session。** Session 目录与 Session Service 都没有配额、TTL 或 LRU，一个有效 key 可以用无限多的 `X-Session-ID` 无限增长。默认 profile 下耗的是进程内存；`postgres` profile 下耗的是磁盘，且上游默认软删、不回收，只是把失败从 OOM 换成了库涨满。

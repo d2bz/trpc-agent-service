@@ -5,6 +5,7 @@
 ## 架构与数据
 
 - [平台方案](solution.md)
+- [生产风险与缓解措施](risks.md)
 - [总体架构与系统图](architecture.md)
 - [核心消息时序](sequence.md)
 - [数据模型与 ER 图](data-model.md)

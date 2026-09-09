@@ -303,6 +303,18 @@ demo profile 下 `TRPC_SERVICE_ADMIN_API_KEY` 没有默认值，所以 `start.sh
 
 Collector 只接受内网中经过工作负载认证的写入，例如 mTLS；遥测查询后端按租户授权过滤，不以客户端传入的 tenant 标签代替鉴权。按租户策略配置采样、保留期、到期删除、队列长度与导出超时，队列满时丢弃遥测并告警。遥测可用性不决定业务执行结果，费用与审批事实仍保存在权威账本中。
 
+### 11.4 治理执行阶段
+
+Runner 的 Plugin、Guardrail 和 Callbacks 承载请求级策略。执行前检查 IM 用户权限、Tool 白名单、预算和敏感输入；危险 Tool 进入人工审批；执行后进行输出脱敏和审计。密钥配置只保存 `secret_ref`，日志、Trace、错误和审计不记录明文密钥。Tool 必须显式声明是否可重放；具有副作用且允许自动重放的 Tool 使用跨模型 attempt 稳定的业务操作键，不能把可能重生的上游 `tool_call_id` 当成跨 attempt 保证。
+
+| 治理阶段 | 生产决策与失败行为 |
+| --- | --- |
+| 入站 | 根据已验证 Tenant/Principal/Binding 检查用户是否可访问 App；缺失身份或权限拒绝，不允许模型决定租户或授权 |
+| Model 前后 | Plugin 在调用前按租户预算原子预占本次有界额度，超额拒绝；完成后按供应商 usage 与版本化价格表结算。调用结果未知时保留预占并进入对账，不把未知费用当作零 |
+| Tool 前 | Callback 以租户已授权 Policy 的交集裁决 Tool；危险操作的批准绑定 Tenant、主体、操作、参数摘要和有效期。参数变化、审批拒绝或过期均不执行，不以聊天中的一句确认直接放行 |
+| 输出前 | Guardrail 在最终回复或每个可发布流式片段离开服务前检查。需要全文才能判断的策略缓冲完整输出并降级为最终回复；已发送内容无法靠事后脱敏撤销 |
+| 审计 | 记录 allow/deny/approve/redact/limit 等决策与稳定错误分类，使用[审计字段](data-model.md#37-inboxrunoutbox-与-audit)。`latency_ms` 以毫秒记录延迟，费用或 Trace 尚不可得时明确为空/未知 |
+
 ## 12. 相关文档
 
 - [Admin API 与动态路由](admin-api.md)：端点、请求示例、路由顺序和错误码。

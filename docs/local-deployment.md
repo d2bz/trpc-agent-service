@@ -134,10 +134,40 @@ docker run --rm --name trpc-otel-local \
 
 仅启用网页不会产生这三个阶段的记录，当前观测接入公共文本消费者，可随企微或飞书启用；已有观测集成证据使用模拟平台，未宣称真实 Bot 到 Collector 已实测。收到单聊并完成回复后，在 Collector 终端查看 `channel.accept`、`channel.execute`、`channel.deliver`，用 `trpc.request_id` 关联；阶段可能属于不同 Trace。计数名为 `trpc.channel.stage.count`，耗时名为 `trpc.channel.stage.duration`，单位 `ms`。Span 通常批量导出，指标默认约每 60 秒导出，也会在正常退出时刷新。此 debug exporter 仅为本地观察，不提供查询 UI 或持久历史。
 
-Collector 失败不改变业务执行/发送结果，队列满或进程崩溃可丢遥测；指标不能作为持久账本。遥测只采集白名单，启用时 OTel 错误诊断统一为固定文字，完整细分 Trace 与生产 Collector 权限、保留期、容量策略见[目标设计](solution.md#57-可观测性)。停止 Collector 可按 Ctrl-C 或在另一终端运行 `docker stop trpc-otel-local`。
+Collector 失败不改变业务执行/发送结果，队列满或进程崩溃可丢遥测；指标不能作为持久账本。遥测只采集白名单，启用时 OTel 错误诊断统一为固定文字，完整细分 Trace 与生产 Collector 权限、保留期、容量策略见[目标设计](local-deployment.md#生产观测设计)。停止 Collector 可按 Ctrl-C 或在另一终端运行 `docker stop trpc-otel-local`。
 
 ## 观测边界
 
 三个阶段使用独立 SDK TracerProvider/MeterProvider，不注册全局 provider，也不启用上游自动捕获模型/工具内容的 tracing。Span 只记录内部 Tenant/App/Binding、request/run/outbox、固定阶段/结果/错误类别、attempt 和耗时；不记录 Principal、Session、外部账号/消息、正文、目标载荷、工具参数或原始错误。指标标签仅为静态租户/App及有限阶段分类，不使用请求 ID。
 
 启用观测时会安装进程级 `otel.SetErrorHandler`，将导出器诊断统一为固定文本；这会同时减少其他 OTel 诊断的详情。导出使用有界队列和超时，失败不改变业务结果或尝试次数，关闭在业务排空后 flush。阶段关联依赖持久 request_id，不承诺同一连续父子 Trace，指标也不是持久账本。
+
+## 生产观测设计
+
+目标设计中 OpenTelemetry Span 覆盖 Channel、Gateway、Run、Model、Tool、Session、Memory 和 Outbox。核心指标包括每租户请求量、并发 Run、模型/Tool/后端延迟、错误率、IM 投递成功率、token、费用和队列等待时间。审计记录包含 `tenant_id`、`channel`、`user_id`、`session_id`、`agent_name`、`tool_name`、`decision`、`latency`、`error_type`、`cost` 和 `trace_id`。
+
+| 指标 | 采集点和统计口径 |
+| --- | --- |
+| 新请求与重复入站 | Inbox 首次提交计一个新请求，重复命中单独计数；持久化内部重试不能重复增加受理次数 |
+| 阶段、模型、Tool、后端与排队耗时 | 各阶段起止点记录带明确单位的直方图，区分等待与实际调用；失败样本保留 outcome，不能只统计成功耗时。当前阶段指标使用毫秒 `ms` |
+| IM 投递结果 | 平台明确成功 ACK / 实际发送尝试数为成功率；拒绝、未知、目标过期分开。Outbox 状态写入重试不是新发送，ACK 不表示用户已读 |
+| 错误率与并发 | 错误阶段数 / 同阶段处理总数；活跃 Run 为已开始且未结束数量，不能将排队数计作运行并发 |
+| token 与租户成本 | 模型返回的 usage 按输入/输出及供应商语义记录，以模型与价格版本计算费用；缺失 usage 或价格时标记未知，不填零。跨租户查询由受控成本明细按租户聚合 |
+
+完整 Trace 为目标设计：受理端创建上下文，将 W3C `traceparent` 随 Inbox/Run/Outbox 持久化，Worker/发送器恢复上下文，Runner、Model、Tool 与存储适配器传递同一 Context；异步派生 Memory 使用父上下文或 Span Link 关联。当前表结构没有持久 Trace 上下文字段。
+
+当前[可选观测](local-deployment.md#观测边界)使用独立 provider，在受理、执行、发送三个阶段生成 Span、次数与耗时，以持久 `request_id` 关联；阶段可能属于不同 Trace，尚未实现跨队列连续父子 Trace、Model/Tool/Session/Memory 细分采集或成本统计。指标标签只用有限阶段、通道、结果类别及静态绑定的内部租户/App；request/user/session 等高基数 ID 不进入指标。观测只采集白名单，上游自动 tracing 保持关闭，具体结果见[实现与验证](acceptance.md#验证结果)。
+
+当前 `trpc.channel.stage.count` 统计阶段处理次数，`trpc.channel.stage.duration` 记录对应毫秒耗时。`execute` 的结果是本次执行决策，不能替代持久 Run 终态；`deliver` 还含发送前跳过和旧目标记录，计算实际投递率时须区分 outcome，不直接用全部阶段次数作分母。启用时 OTel 进程级错误处理器只输出固定诊断，避免 SDK 将 Collector 原文写入日志；它不安装全局 provider，但会影响进程中其他 OTel 错误的诊断详细度，关闭遥测时不安装。
+
+生产 Collector 使用内网认证写入与租户授权查询，按策略配置保留期、采样和有界导出队列；Secret 解析、第三方诊断及统一脱敏出口的约束见[Secret 与遥测出口](security-and-governance.md#113-secret-与遥测出口)。这些生产管控尚未实现，本地 debug Collector 不提供相同保证。
+
+## 容量估算
+
+容量以实测 P95 模型延迟、平均 Tool 次数和消息大小校准。初始估算示例：
+
+- 单 Worker 允许 100 个并发 Run，平均一轮 15 秒，则理论吞吐约 `100 / 15 = 6.7 RPS`；按 60% 安全水位规划约 4 RPS。
+- 峰值 20 RPS 时，Worker 数量至少为 `ceil(20 / 4) = 5`，再增加 1 个故障冗余，共 6 个。
+- 每轮平均写入 6 个 Event，则 Session Backend 峰值写 QPS 约 `20 × 6 = 120`，按两倍突发准备 240 QPS。
+- 每轮输入输出合计 4,000 token，20 RPS 时模型消耗约 `80,000 token/s`，必须按租户和模型供应商设置预算与限速。
+- IM 回调按日均峰值系数 10 估算，Inbox 和 Gateway 保留至少两倍突发余量。以上数值是容量规划假设，不是实测吞吐；部署前需通过压测校准。

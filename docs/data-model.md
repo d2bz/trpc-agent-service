@@ -107,7 +107,7 @@ Revision 不包含密钥值，只引用 Secret 和 Backend Profile。每个 Run 
 
 目标 `external_principals` 使用唯一键 `(tenant_id, channel_binding_id, principal_type, external_id_hash)` 映射内部 `principal_id`。当前企微不建此表，直接以 Tenant、Binding、用户类型和外部用户 ID 的规范数组摘要派生 Principal；跨通道身份不自动合并。
 
-外部账号需编码完整平台命名空间；目标唯一约束为 `(channel_type, external_account_id)`，避免跨租户重复绑定。当前企微由服务端静态配置唯一 Tenant/App/Binding/Bot，Secret 仅引用 `env:TRPC_SERVICE_WECOM_BOT_SECRET`，并核对受信任连接上事件的 Bot 标识；已有真实单聊收发。动态 Binding 管理及跨进程账号注册唯一性尚未实现。飞书 Webhook 路径只定位候选凭据，须完成[签名、Token 和应用身份校验](solution.md#55-im-接入差异)后确定绑定，仍属设计。
+外部账号需编码完整平台命名空间；目标唯一约束为 `(channel_type, external_account_id)`，避免跨租户重复绑定。当前企微由服务端静态配置唯一 Tenant/App/Binding/Bot，Secret 仅引用 `env:TRPC_SERVICE_WECOM_BOT_SECRET`，并核对受信任连接上事件的 Bot 标识；已有真实单聊收发。动态 Binding 管理及跨进程账号注册唯一性尚未实现。飞书 Webhook 路径只定位候选凭据，须完成[签名、Token 和应用身份校验](im-channels.md#协议细节与扩展设计)后确定绑定，仍属设计。
 
 ### 3.5 Session、Event 与 Summary
 
