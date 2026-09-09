@@ -40,6 +40,7 @@ flowchart TB
         Policy[Plugin / Guardrail / Policy]
         Outbox[Reply Outbox]
         Router[Storage Router / Adapter]
+        Jobs[Background Jobs / Recovery]
     end
 
     subgraph Framework[tRPC-Agent-Go v1.11.2]
@@ -55,6 +56,7 @@ flowchart TB
         Vector[(PGVector / Vector DB)]
         Object[(S3-compatible Storage)]
         Secrets[Secret Manager]
+        Streams[(Redis Streams)]
     end
 
     subgraph Observe[可观测性]
@@ -80,8 +82,6 @@ flowchart TB
     Agents --> Tools
     Runner --> StateAPI
 
-    Runtime --> PG
-    Runtime --> Redis
     Runtime --> Secrets
     StateAPI --> Router
     Router --> Redis
@@ -91,6 +91,11 @@ flowchart TB
 
     Worker --> Outbox
     Outbox --> Channel
+    Inbox -. wakeup .-> Streams
+    Streams -. notify .-> Worker
+    Jobs --> PG
+    Jobs --> Streams
+    Jobs --> Router
     Channel --> WeCom
     Channel --> Feishu
 
