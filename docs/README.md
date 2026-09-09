@@ -22,7 +22,3 @@
 - [Tool 与 Policy Runtime](tool-policy.md)
 - [Session 后端](session-backend.md)
 - [Session Run Lease](session-lease.md)
-
-## 需求参考
-
-- [题目与需求参考](requirements.md)
